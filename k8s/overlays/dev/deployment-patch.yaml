@@ -1,0 +1,18 @@
+# Smaller resource footprint for dev — fits comfortably on a single
+# Standard_B2s node (2 vCPU / 4 GiB) shared with prod.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telco-agent
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "768Mi"

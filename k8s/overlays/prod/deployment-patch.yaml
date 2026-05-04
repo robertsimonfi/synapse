@@ -1,0 +1,17 @@
+# Roomier resource footprint for prod.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telco-agent
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"

@@ -47,6 +47,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -79,3 +81,25 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  trigger-dev-deploy:
+    name: Auto-deploy to dev
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      actions: write
+    steps:
+      - name: Trigger deploy-aks (dev)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = context.sha.substring(0, 7);
+            await github.rest.actions.createWorkflowDispatch({
+              owner:       context.repo.owner,
+              repo:        context.repo.repo,
+              workflow_id: 'deploy-aks.yml',
+              ref:         'main',
+              inputs: { environment: 'dev', image_tag: `sha-${sha}` }
+            });
+            core.info(`Triggered deploy-aks.yml for environment=dev, image_tag=sha-${sha}`);

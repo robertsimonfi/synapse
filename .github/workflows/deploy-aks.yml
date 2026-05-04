@@ -1,0 +1,126 @@
+name: Deploy to AKS
+
+# Triggered:
+#   - Automatically by ci.yml after a successful build (environment=dev)
+#   - Manually for prod (or any env) via workflow_dispatch
+#
+# Prod is gated by the GitHub Environment "prod" — set required reviewers
+# under: Settings → Environments → prod → Required reviewers.
+#
+# Required GitHub secrets (all created by infra/azure-setup.sh):
+#   AZURE_CREDENTIALS         — service-principal JSON (--sdk-auth output)
+#   AZURE_RESOURCE_GROUP      — e.g. rg-telco-agent
+#   AKS_CLUSTER_NAME          — e.g. aks-telco-agent
+#   ACR_NAME                  — e.g. acrtelcoagent42
+#   ACR_LOGIN_SERVER          — e.g. acrtelcoagent42.azurecr.io
+#   ANTHROPIC_API_KEY         — your Anthropic API key
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, prod]
+        default: dev
+      image_tag:
+        description: "Image tag from GHCR (e.g. sha-abc1234, latest)"
+        required: true
+        default: latest
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.image_tag }} to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}    # ← prod environment requires manual approval
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # Server-side copy from GHCR → ACR. No rebuild, no local pull.
+      # `--force` lets us re-import if a tag already exists.
+      - name: Import image GHCR → ACR
+        run: |
+          az acr import \
+            --name "${{ secrets.ACR_NAME }}" \
+            --source "ghcr.io/${{ github.repository }}:${{ inputs.image_tag }}" \
+            --image "telco-agent:${{ inputs.image_tag }}" \
+            --force
+
+      - name: Get AKS credentials
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          cluster-name:   ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Resolve LoadBalancer IP for nip.io hostnames
+        id: lb
+        run: |
+          LB_IP=$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
+                    -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          if [ -z "$LB_IP" ]; then
+            echo "ERROR: could not resolve ingress LoadBalancer IP. Did infra/azure-setup.sh complete?"
+            exit 1
+          fi
+          echo "lb_ip=$LB_IP" >> "$GITHUB_OUTPUT"
+          echo "Using LB IP: $LB_IP"
+
+      - name: Render manifests (substitute LB IP + pin image)
+        env:
+          LB_IP:        ${{ steps.lb.outputs.lb_ip }}
+          NS:           telco-agent-${{ inputs.environment }}
+          IMAGE_REF:    ${{ secrets.ACR_LOGIN_SERVER }}/telco-agent:${{ inputs.image_tag }}
+          OVERLAY_DIR:  k8s/overlays/${{ inputs.environment }}
+        run: |
+          # 1. Substitute the placeholder LB IP into the env-specific ingress patch.
+          sed -i "s/__LB_IP__/${LB_IP}/g" "${OVERLAY_DIR}/ingress-patch.yaml"
+
+          # 2. Pin the deployed image to the exact tag we just imported.
+          (cd "${OVERLAY_DIR}" && \
+            kustomize edit set image "telco-agent=${IMAGE_REF}")
+
+          # 3. Render & show what will be applied (handy in run logs).
+          kubectl kustomize "${OVERLAY_DIR}" > /tmp/manifests.yaml
+          echo "── Rendered manifests ──"
+          grep -E '^(apiVersion|kind|  name:|  namespace:|  - host:|        image:)' /tmp/manifests.yaml || true
+
+      - name: Ensure namespace exists
+        env:
+          NS: telco-agent-${{ inputs.environment }}
+        run: |
+          kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
+
+      - name: Create / refresh Anthropic secret
+        env:
+          NS: telco-agent-${{ inputs.environment }}
+        run: |
+          kubectl -n "${NS}" create secret generic telco-agent-secrets \
+            --from-literal=ANTHROPIC_API_KEY='${{ secrets.ANTHROPIC_API_KEY }}' \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply manifests
+        run: kubectl apply -f /tmp/manifests.yaml
+
+      - name: Wait for rollout
+        env:
+          NS: telco-agent-${{ inputs.environment }}
+        run: |
+          kubectl -n "${NS}" rollout status deployment/telco-agent --timeout=5m
+
+      - name: Show endpoint
+        env:
+          LB_IP: ${{ steps.lb.outputs.lb_ip }}
+          ENV:   ${{ inputs.environment }}
+        run: |
+          URL="http://${ENV}.${LB_IP}.nip.io"
+          echo ""
+          echo "✓ Deployed to: ${URL}"
+          echo "  Health:      ${URL}/health"
+          echo "  Swagger:     ${URL}/docs"
+          echo ""
+          echo "::notice title=Deployed::${URL}/docs"

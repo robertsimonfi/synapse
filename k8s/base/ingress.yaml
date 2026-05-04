@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: telco-agent
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "2m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+spec:
+  ingressClassName: nginx
+  rules:
+    # Hostname is patched per-environment in the overlays:
+    #   dev  → dev.<lb-ip>.nip.io
+    #   prod → prod.<lb-ip>.nip.io
+    # The literal __LB_IP__ token is replaced at deploy time by the workflow.
+    - host: PATCHED_BY_OVERLAY
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: telco-agent
+                port:
+                  number: 80

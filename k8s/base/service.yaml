@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: telco-agent
+spec:
+  type: ClusterIP            # Exposed externally via the Ingress, not directly.
+  selector:
+    app.kubernetes.io/name: telco-agent
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+      protocol: TCP

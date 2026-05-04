@@ -1,0 +1,18 @@
+# Hostname uses nip.io: dev.<lb-ip>.nip.io resolves to the LB IP automatically.
+# The deploy workflow substitutes __LB_IP__ with the actual ingress LoadBalancer IP.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: telco-agent
+spec:
+  rules:
+    - host: dev.__LB_IP__.nip.io
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: telco-agent
+                port:
+                  number: 80
