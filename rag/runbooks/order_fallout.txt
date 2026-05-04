@@ -1,0 +1,55 @@
+RUNBOOK: Order Fallout Resolution
+Category: BSS / Order Management
+Domain: BSS
+Last Updated: 2024-01
+
+== OVERVIEW ==
+An order fallout occurs when an order submitted through any channel (online, retail, API, telesales)
+fails to complete processing in one or more downstream systems. Fallouts must be triaged,
+root-caused, and resolved within defined SLA windows based on severity.
+
+== COMMON ERROR CODES ==
+
+PROV_001 - HLR Activation Timeout
+  Cause: The Home Location Register did not respond within the configured timeout.
+  Resolution Steps:
+    1. Check HLR system health in NOC dashboard.
+    2. Verify network connectivity between Order Management and HLR.
+    3. If HLR is degraded, hold order and retry after HLR recovery (auto-retry enabled).
+    4. If retry limit exceeded (>3), escalate to Network Provisioning team.
+    5. Update ORDER_FALLOUT status to IN_PROGRESS during investigation.
+
+BSS_002 - Duplicate Order Detected
+  Cause: A previous order for the same customer/product is still in PENDING or IN_PROGRESS state.
+  Resolution Steps:
+    1. Query ORDER_HEADER for same customer_id + order_type within last 24 hours.
+    2. If duplicate is stale (>4 hours, no update), cancel the older order.
+    3. Re-trigger the current order.
+    4. If both orders are legitimate, verify with customer via CRM note.
+
+NET_004 - No Available MSISDN in Pool
+  Cause: The number management system has no free numbers in the requested NPA-NXX range.
+  Resolution Steps:
+    1. Check MSISDN inventory levels for the requested area code.
+    2. Request pool replenishment from Number Management team (SLA: 2 hours).
+    3. Offer the customer an alternative area code if agreed.
+    4. Update order with new MSISDN once assigned.
+
+BSS_007 - Product Dependency Missing
+  Cause: A required prerequisite product is not active on the customer's account.
+  Resolution Steps:
+    1. Check PRODUCT_DEPENDENCY table for the ordered product.
+    2. Verify SERVICE_SUBSCRIPTION for required products.
+    3. If missing dependency is a simple add-on, auto-provision it and retry.
+    4. If complex dependency, contact customer to confirm the add.
+
+== SLA TARGETS ==
+  CRITICAL: Resolve within 2 hours
+  HIGH:     Resolve within 8 hours
+  MEDIUM:   Resolve within 24 hours
+  LOW:      Resolve within 72 hours
+
+== ESCALATION PATH ==
+  Level 1: BSS Support Team
+  Level 2: Order Management Engineering
+  Level 3: VP of BSS Operations

@@ -1,0 +1,30 @@
+# Default: text files are normalized to LF in the repo,
+# checked out with the platform's native line endings (autocrlf-friendly).
+* text=auto eol=lf
+
+# Force LF for files that are read by Linux tools — never let Windows checkout
+# inject CRLF here, or they break inside the container.
+*.sh        text eol=lf
+*.py        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.toml      text eol=lf
+*.json      text eol=lf
+Dockerfile  text eol=lf
+*.dockerfile text eol=lf
+.dockerignore text eol=lf
+.gitignore  text eol=lf
+.gitattributes text eol=lf
+
+# Binary — never touch
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary
+*.db        binary
+*.sqlite    binary
+*.sqlite3   binary
+*.p12       binary
+*.sso       binary

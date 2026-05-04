@@ -1,0 +1,67 @@
+RUNBOOK: Network Alarm Correlation and Response
+Category: OSS / Network Operations
+Domain: NETWORK
+Last Updated: 2024-01
+
+== OVERVIEW ==
+Network alarms indicate degraded or failed network elements that may cause service disruptions
+for subscribers. Alarms must be correlated with active orders and subscriptions to assess
+customer impact and prioritize response.
+
+== ALARM TYPES AND RESPONSE ==
+
+NODE_DOWN — Network element completely unreachable
+  Severity: CRITICAL
+  Immediate Actions:
+    1. Identify element type (eNB, gNB, MME, SGW, OCS) and region from NETWORK_ALARM.
+    2. Query AFFECTED_SUBS count — if > 1000, declare Major Incident, notify P1 team.
+    3. Check for redundant nodes; activate failover if available.
+    4. Hold all new orders affecting the impacted region.
+    5. Proactively send SMS notification to impacted subscribers.
+
+HIGH_LATENCY — Degraded response times on network element
+  Severity: MAJOR
+  Resolution Steps:
+    1. Identify the network element and check for upstream congestion.
+    2. Monitor PROVISIONING_LOG for increased DURATION_MS on affected system.
+    3. Throttle new provisioning requests to the element.
+    4. Engage vendor TAC if hardware-related.
+
+CAPACITY — Element approaching capacity threshold (>85%)
+  Severity: MAJOR / MINOR
+  Resolution Steps:
+    1. Check USAGE_RECORD volume trends for the affected element.
+    2. Initiate traffic offload to neighboring nodes.
+    3. Submit capacity expansion request to Network Engineering.
+    4. Monitor every 15 minutes until below 70%.
+
+LINK_FAILURE — Network link between elements is down
+  Severity: CRITICAL / MAJOR
+  Resolution Steps:
+    1. Identify failed link endpoints.
+    2. Activate backup/redundant path if available.
+    3. Notify Transport team for physical layer investigation.
+    4. ETA to restore: typically 2–4 hours for fiber cuts.
+
+== IMPACT CORRELATION ==
+  When a network alarm is raised, correlate with:
+  - Active orders in ORDER_HEADER with STATUS = 'IN_PROGRESS' in the affected region.
+  - PROVISIONING_LOG failures with matching SYSTEM_NAME / region.
+  - SERVICE_SUBSCRIPTION with MSISDN in the affected cell coverage area.
+  - INCIDENT_TICKET: auto-create or link existing tickets.
+
+== ALARM LIFECYCLE ==
+  ACTIVE → ACKNOWLEDGED (NOC acknowledges within 5 min for CRITICAL)
+  ACKNOWLEDGED → CLEARED (element recovered, auto-detection or manual)
+  ACTIVE → SUPPRESSED (planned maintenance window)
+
+== SLA FOR RESTORATION ==
+  CRITICAL: 2 hours
+  MAJOR:    4 hours
+  MINOR:    24 hours
+  WARNING:  Best effort
+
+== ESCALATION PATH ==
+  Level 1: Network Operations Center (NOC)
+  Level 2: Network Engineering
+  Level 3: CTO Office (for outages > 4 hours affecting > 10,000 subscribers)

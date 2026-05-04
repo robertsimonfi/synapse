@@ -1,0 +1,60 @@
+# VCS
+.git/
+.gitignore
+.gitattributes
+
+# Python build / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual envs (we re-install inside the image)
+.venv/
+venv/
+env/
+
+# Local state — must NOT be baked into the image
+*.db
+*.sqlite
+*.sqlite3
+agent/.agent_memory/
+rag/.chromadb/
+
+# Secrets — never copy into images
+.env
+*.env
+!.env.example
+wallet/
+*.p12
+*.sso
+
+# IDE / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Docs / CI not needed at runtime
+README.md
+DEPLOY.md
+docs/
+.github/
+tests/
+
+# Docker artifacts
+Dockerfile
+.dockerignore
+docker-compose*.yml

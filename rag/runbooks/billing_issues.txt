@@ -1,0 +1,49 @@
+RUNBOOK: Billing Issue Resolution
+Category: BSS / Billing
+Domain: BILLING
+Last Updated: 2024-01
+
+== OVERVIEW ==
+Billing issues arise from failed invoice generation, incorrect charges, payment failures,
+or credit limit breaches. These directly impact customer experience and revenue assurance.
+
+== COMMON ERROR CODES ==
+
+BILL_003 - Credit Limit Exceeded
+  Cause: The customer's outstanding balance plus the new charge exceeds their credit limit.
+  Resolution Steps:
+    1. Query BILLING_ACCOUNT for customer's CREDIT_LIMIT and CURRENT_BALANCE.
+    2. Check BILLING_INVOICE for overdue invoices.
+    3. If customer has overdue invoices, attempt automated payment via stored payment method.
+    4. If payment succeeds, release the order.
+    5. If customer is enterprise, escalate to Account Manager for credit review.
+    6. Consider temporary credit limit increase for VIP/Enterprise customers.
+    7. Log action in INCIDENT_TICKET with CATEGORY = 'BILLING'.
+
+BILL_009 - Payment Method Declined
+  Cause: Credit card, ACH, or other payment method was rejected by payment gateway.
+  Resolution Steps:
+    1. Check BILLING_ACCOUNT for current payment method.
+    2. Retry payment after 30 minutes (transient gateway issues).
+    3. If retry fails, notify customer via email/SMS to update payment method.
+    4. Suspend service after 7-day grace period if no payment update.
+    5. Update BILLING_ACCOUNT status to COLLECTIONS if unresolved after 30 days.
+
+BILL_INV_ERR - Invoice Generation Failure
+  Cause: Missing charges, orphaned subscriptions, or rating engine failure.
+  Resolution Steps:
+    1. Verify all USAGE_RECORD entries for the billing period are rated (IS_RATED = 1).
+    2. Re-run rating engine for unrated records.
+    3. Check for BILLING_CHARGE entries without a linked BILLING_INVOICE.
+    4. Re-trigger invoice generation after resolving gaps.
+    5. Validate invoice totals against sum of BILLING_CHARGE records.
+
+== REVENUE ASSURANCE CHECKS ==
+  - Compare sum(BILLING_CHARGE.AMOUNT) vs BILLING_INVOICE.SUBTOTAL monthly.
+  - Flag invoices where TOTAL_AMOUNT = 0 but subscriptions are ACTIVE.
+  - Alert on USAGE_RECORD entries older than 48h with IS_RATED = 0.
+
+== ESCALATION PATH ==
+  Level 1: Billing Operations
+  Level 2: Revenue Assurance Engineering
+  Level 3: CFO Office (for disputes > $10,000)

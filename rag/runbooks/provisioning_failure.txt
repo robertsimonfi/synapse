@@ -1,0 +1,58 @@
+RUNBOOK: Provisioning Failure Resolution
+Category: OSS / Provisioning
+Domain: PROVISIONING / OSS
+Last Updated: 2024-01
+
+== OVERVIEW ==
+Provisioning failures occur when downstream network systems (HLR, OCS, EPC, IMS, PCRF, HSS)
+fail to activate, modify, or deactivate a service. Each system has specific failure modes.
+
+== SYSTEM-SPECIFIC ERRORS ==
+
+HLR (Home Location Register) — 2G/3G voice and SMS
+  PROV_001 - Activation Timeout (see order_fallout runbook)
+  PROV_HLR_DUP - IMSI already registered
+    Resolution: Check SERVICE_SUBSCRIPTION for duplicate IMSI. Deregister stale entry.
+
+OCS (Online Charging System) — Prepaid quota management
+  PROV_006 - OCS Quota Assignment Failed
+    Cause: OCS unreachable or subscriber profile not found.
+    Resolution Steps:
+      1. Verify OCS health via PROVISIONING_LOG (look for SYSTEM_NAME='OCS' recent failures).
+      2. Check that CUSTOMER has ACCOUNT_TYPE = 'PREPAID'.
+      3. Retry quota assignment after OCS recovery.
+      4. If OCS is healthy, check for corrupted subscriber profile and recreate.
+
+EPC (Evolved Packet Core) — 4G data bearer
+  PROV_010 - EPC Bearer Creation Failed
+    Cause: SGW/PGW unavailable, APN misconfiguration, or IP pool exhaustion.
+    Resolution Steps:
+      1. Check NETWORK_ALARM for active EPC/SGW/PGW alarms in the affected region.
+      2. If network alarm exists, wait for network recovery before retrying.
+      3. Verify APN configuration matches PRODUCT_CATALOG entry.
+      4. If IP pool exhausted, escalate to Network Engineering immediately (CRITICAL).
+
+IMS (IP Multimedia Subsystem) — VoLTE / Voice over 4G
+  PROV_IMS_001 - IMS Registration Failed
+    Cause: HSS profile missing or SIP credentials not provisioned.
+    Resolution Steps:
+      1. Verify HSS subscriber profile exists.
+      2. Re-provision SIP credentials.
+      3. Trigger IMS re-registration.
+
+== PROVISIONING LOG ANALYSIS ==
+  Key query pattern: Find all FAILED/TIMEOUT logs for an order:
+    WHERE ORDER_ID = :order_id AND STATUS IN ('FAILED','TIMEOUT')
+
+  Look for partial provisioning: some systems SUCCESS, others FAILED.
+  This creates inconsistent state — must rollback successful steps before retry.
+
+== RETRY POLICY ==
+  Auto-retry: 3 attempts with exponential backoff (30s, 2m, 10m)
+  After 3 failures: Create INCIDENT_TICKET with PRIORITY = P2, notify NOC.
+  After 6 hours unresolved: Escalate to P1.
+
+== ESCALATION PATH ==
+  Level 1: Provisioning Engineering
+  Level 2: OSS Platform Team
+  Level 3: Network Operations Center (NOC) Director

@@ -1,0 +1,20 @@
+# Core
+anthropic>=0.28.0
+
+# Vector DB / RAG
+chromadb>=0.5.0
+
+# API
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0
+
+# Database
+oracledb>=2.3.0        # Oracle (production)
+# sqlite3 is part of Python stdlib — no install needed for local dev
+
+# Seed data generation
+faker>=25.0.0
+
+# Utilities
+python-dotenv>=1.0.0

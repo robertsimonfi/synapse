@@ -1,0 +1,37 @@
+# Local-dev compose: brings the API up with persistent volumes for SQLite + ChromaDB.
+# For production, replace SQLite with managed Postgres/Oracle and the local
+# Chroma volumes with a managed vector store (pgvector, Pinecone, AI Search).
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telco-agent:local
+    container_name: telco-agent-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Override the in-repo defaults so state lives on the mounted volume.
+      DB_TYPE: sqlite
+      SQLITE_PATH: /data/telco_dev.db
+      RAG_CHROMA_PATH: /data/chromadb
+      AGENT_MEMORY_PATH: /data/agent_memory
+      # Auto-seed + ingest on first boot if the volume is empty.
+      AUTO_SEED: "true"
+      AUTO_INGEST: "true"
+    volumes:
+      - telco_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  telco_data:
+    driver: local
