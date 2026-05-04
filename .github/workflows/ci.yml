@@ -37,7 +37,7 @@ jobs:
           ANTHROPIC_API_KEY: dummy-not-used-in-tests
           DB_TYPE: sqlite
           SQLITE_PATH: ./telco_test.db
-        run: pytest -q
+        run: python -m pytest -q
 
   build-and-push:
     name: Build & push image
