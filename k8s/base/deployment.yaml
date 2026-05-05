@@ -42,6 +42,11 @@ spec:
                 secretKeyRef:
                   name: telco-agent-secrets
                   key: ANTHROPIC_API_KEY
+            - name: TELCO_AGENT_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: telco-agent-secrets
+                  key: TELCO_AGENT_API_KEYS
           volumeMounts:
             - name: data
               mountPath: /data

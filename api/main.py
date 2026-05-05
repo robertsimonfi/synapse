@@ -8,7 +8,7 @@ Endpoints:
   POST /memory/ingest    — Re-ingest runbooks into ChromaDB
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
@@ -16,6 +16,7 @@ import uvicorn
 
 from agent.agent import FalloutInput, run_agent, resolution_to_dict
 from agent.memory import memory_stats
+from api.security import require_api_key
 from rag.knowledge_base import ingest_runbooks
 
 app = FastAPI(
@@ -93,20 +94,20 @@ def health():
 
 
 @app.get("/memory/stats", response_model=MemoryStatsResponse, tags=["Memory"])
-def get_memory_stats():
+def get_memory_stats(_: str = Depends(require_api_key)):
     """Return statistics about the agent's self-critique memory store."""
     return memory_stats()
 
 
 @app.post("/memory/ingest", tags=["Memory"])
-def ingest_knowledge_base(force: bool = False):
+def ingest_knowledge_base(force: bool = False, _: str = Depends(require_api_key)):
     """Re-ingest all runbooks into the RAG ChromaDB collection."""
     count = ingest_runbooks(force=force)
     return {"status": "ok", "chunks_ingested": count}
 
 
 @app.post("/resolve", response_model=ResolveResponse, tags=["Agent"])
-def resolve_fallout(request: ResolveRequest):
+def resolve_fallout(request: ResolveRequest, _: str = Depends(require_api_key)):
     """
     Submit a Telco fallout for AI-powered root cause analysis and resolution.
 

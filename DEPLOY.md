@@ -101,6 +101,18 @@ Add them at: **Settings → Secrets and variables → Actions → New repository
 
 Now the prod deploy workflow will pause and wait for your approval click.
 
+### Per-environment API keys
+
+Inside **each** environment (Settings → Environments → dev, then prod):
+**Add secret** → `TELCO_AGENT_API_KEYS` → paste a comma-separated list of
+keys clients will use in the `X-API-Key` header. Generate one with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Different keys per env so a leaked dev key can't touch prod.
+
 ---
 
 ## 5. First deploy
@@ -124,6 +136,27 @@ The script prints the exact URLs at the end.
 
 For prod: same workflow, pick `environment: prod` — GitHub will prompt for
 your approval before the deploy proceeds.
+
+### Calling the API
+
+`/health` is public (used by the LB probe). Everything else requires the
+`X-API-Key` header set to one of the values from `TELCO_AGENT_API_KEYS`:
+
+```bash
+curl -X POST https://prod.42-ds.net/resolve \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: <one-of-your-keys>" \
+  -d '{
+        "order_id": 5,
+        "error_code": "PROV_001",
+        "error_message": "HLR activation timeout",
+        "domain": "PROVISIONING",
+        "severity": "HIGH"
+      }'
+```
+
+Without a key → `401 Unauthorized`. Wrong key → also `401`. If the server
+has no keys configured at all → `503 Service Unavailable` (fail-closed).
 
 ---
 
