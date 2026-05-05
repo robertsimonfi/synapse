@@ -81,6 +81,19 @@ helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
   --set "controller.service.annotations.service\.beta\.kubernetes\.io/azure-load-balancer-health-probe-request-path=/healthz" \
   --wait --timeout 5m
 
+# 5b. Install cert-manager (auto-renewed Let's Encrypt certs for ingress hosts).
+echo "▶ Installing cert-manager..."
+helm repo add jetstack https://charts.jetstack.io >/dev/null 2>&1 || true
+helm repo update >/dev/null
+helm upgrade --install cert-manager jetstack/cert-manager \
+  --namespace cert-manager --create-namespace \
+  --set crds.enabled=true \
+  --version v1.16.1 \
+  --wait --timeout 5m
+
+echo "▶ Applying ClusterIssuers (Let's Encrypt staging + prod)..."
+kubectl apply -f "$(dirname "$0")/cluster-issuers.yaml"
+
 echo ""
 echo "▶ Waiting for LoadBalancer IP (this can take a minute)..."
 for i in {1..30}; do

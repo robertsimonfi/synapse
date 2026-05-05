@@ -67,33 +67,17 @@ jobs:
           resource-group: ${{ secrets.AZURE_RESOURCE_GROUP }}
           cluster-name:   ${{ secrets.AKS_CLUSTER_NAME }}
 
-      - name: Resolve LoadBalancer IP for nip.io hostnames
-        id: lb
-        run: |
-          LB_IP=$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
-                    -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-          if [ -z "$LB_IP" ]; then
-            echo "ERROR: could not resolve ingress LoadBalancer IP. Did infra/azure-setup.sh complete?"
-            exit 1
-          fi
-          echo "lb_ip=$LB_IP" >> "$GITHUB_OUTPUT"
-          echo "Using LB IP: $LB_IP"
-
-      - name: Render manifests (substitute LB IP + pin image)
+      - name: Render manifests (pin image)
         env:
-          LB_IP:        ${{ steps.lb.outputs.lb_ip }}
           NS:           telco-agent-${{ inputs.environment }}
           IMAGE_REF:    ${{ secrets.ACR_LOGIN_SERVER }}/telco-agent:${{ inputs.image_tag }}
           OVERLAY_DIR:  k8s/overlays/${{ inputs.environment }}
         run: |
-          # 1. Substitute the placeholder LB IP into the env-specific ingress patch.
-          sed -i "s/__LB_IP__/${LB_IP}/g" "${OVERLAY_DIR}/ingress-patch.yaml"
-
-          # 2. Pin the deployed image to the exact tag we just imported.
+          # Pin the deployed image to the exact tag we just imported.
           (cd "${OVERLAY_DIR}" && \
             kustomize edit set image "telco-agent=${IMAGE_REF}")
 
-          # 3. Render & show what will be applied (handy in run logs).
+          # Render & show what will be applied (handy in run logs).
           kubectl kustomize "${OVERLAY_DIR}" > /tmp/manifests.yaml
           echo "── Rendered manifests ──"
           grep -E '^(apiVersion|kind|  name:|  namespace:|  - host:|        image:)' /tmp/manifests.yaml || true
@@ -123,10 +107,9 @@ jobs:
 
       - name: Show endpoint
         env:
-          LB_IP: ${{ steps.lb.outputs.lb_ip }}
-          ENV:   ${{ inputs.environment }}
+          ENV: ${{ inputs.environment }}
         run: |
-          URL="http://${ENV}.${LB_IP}.nip.io"
+          URL="https://${ENV}.42-ds.net"
           echo ""
           echo "✓ Deployed to: ${URL}"
           echo "  Health:      ${URL}/health"

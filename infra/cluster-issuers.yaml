@@ -1,0 +1,40 @@
+# Let's Encrypt ClusterIssuers used by cert-manager.
+# Apply once per cluster:  kubectl apply -f infra/cluster-issuers.yaml
+#
+# - letsencrypt-staging  — fake certs, generous rate limits. Use first to
+#   prove the pipeline works without burning real-cert quota.
+# - letsencrypt-prod     — real, browser-trusted certs. Rate-limited to
+#   50 certs per registered domain per week.
+#
+# Both use the HTTP-01 challenge via the NGINX ingress class. This requires
+# the domain to point at the ingress LB IP and port 80 to be open (it is).
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: simonfi.robi@gmail.com
+    privateKeySecretRef:
+      name: letsencrypt-staging-account
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: simonfi.robi@gmail.com
+    privateKeySecretRef:
+      name: letsencrypt-prod-account
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
