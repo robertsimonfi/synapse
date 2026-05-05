@@ -105,11 +105,12 @@ KV_RBAC=$(az keyvault show -n "$KV" -g "$RG" --query properties.enableRbacAuthor
 
 if [[ "$KV_RBAC" == "true" ]]; then
   for pid in "$DEV_PRINCIPAL_ID" "$PROD_PRINCIPAL_ID"; do
+    # Not using || true — a silent failure here causes the pod to get 403 at mount time.
     az role assignment create \
       --role "Key Vault Secrets User" \
       --assignee-object-id "$pid" \
       --assignee-principal-type ServicePrincipal \
-      --scope "$KV_ID" -o none 2>/dev/null || true
+      --scope "$KV_ID" -o none
   done
   echo "  ✓ RBAC: 'Key Vault Secrets User' granted to both MIs"
 else
