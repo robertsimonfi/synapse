@@ -71,9 +71,14 @@ if ! command -v helm >/dev/null 2>&1; then
 fi
 helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx >/dev/null 2>&1 || true
 helm repo update >/dev/null
+# NOTE: The annotation below is REQUIRED on AKS. Without it, the Azure Load
+# Balancer probes "/" (default) and gets a 404 from NGINX, marks all backends
+# unhealthy, and silently drops every external connection. With it, the LB
+# probes "/healthz" (NGINX's built-in liveness endpoint) and routing works.
 helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
   --namespace ingress-nginx --create-namespace \
   --set controller.service.type=LoadBalancer \
+  --set "controller.service.annotations.service\.beta\.kubernetes\.io/azure-load-balancer-health-probe-request-path=/healthz" \
   --wait --timeout 5m
 
 echo ""
