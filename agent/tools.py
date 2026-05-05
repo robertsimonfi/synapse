@@ -141,6 +141,23 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "name": "get_usage_trends",
+        "description": (
+            "Get monthly usage breakdown for a customer across DATA, VOICE, and SMS "
+            "for the last N months. Returns totals per month and usage type, plus "
+            "roaming session counts to detect international activity and bill shock. "
+            "Use this to compare consumption against plan limits and spot trends."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["customer_id"],
+            "properties": {
+                "customer_id": {"type": "integer", "description": "Numeric customer ID"},
+                "months":      {"type": "integer", "description": "Months to look back (default 6)"},
+            },
+        },
+    },
 ]
 
 # ── Tool execution ─────────────────────────────────────────────────────────────
@@ -277,6 +294,29 @@ def execute_tool(name: str, inputs: dict) -> str:
             "JOIN PRODUCT_CATALOG p ON p.PRODUCT_ID = pd.REQUIRED_PRODUCT_ID "
             "WHERE pd.PRODUCT_ID = :product_id",
             {"product_id": inputs["product_id"]},
+        )
+        return rows_to_json(rows)
+
+    elif name == "get_usage_trends":
+        from datetime import datetime, timedelta
+        months  = inputs.get("months", 6)
+        cutoff  = (datetime.now() - timedelta(days=months * 30)).strftime("%Y-%m-%d")
+        rows = query(
+            "SELECT "
+            "  TO_CHAR(u.START_TIME, 'YYYY-MM') AS month, "
+            "  u.USAGE_TYPE, "
+            "  ROUND(SUM(u.QUANTITY), 3) AS total_quantity, "
+            "  u.UNIT, "
+            "  ROUND(SUM(u.RATED_AMOUNT), 2) AS total_rated_amount, "
+            "  SUM(CASE WHEN u.ROAMING_COUNTRY IS NOT NULL AND u.ROAMING_COUNTRY != '' "
+            "           THEN 1 ELSE 0 END) AS roaming_sessions "
+            "FROM USAGE_RECORD u "
+            "JOIN SERVICE_SUBSCRIPTION s ON s.SUBSCRIPTION_ID = u.SUBSCRIPTION_ID "
+            "WHERE s.CUSTOMER_ID = :customer_id "
+            "  AND u.START_TIME >= :cutoff "
+            "GROUP BY TO_CHAR(u.START_TIME, 'YYYY-MM'), u.USAGE_TYPE, u.UNIT "
+            "ORDER BY month DESC, u.USAGE_TYPE",
+            {"customer_id": inputs["customer_id"], "cutoff": cutoff},
         )
         return rows_to_json(rows)
 
