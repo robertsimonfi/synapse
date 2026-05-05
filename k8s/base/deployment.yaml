@@ -25,7 +25,11 @@ spec:
       containers:
         - name: api
           image: telco-agent    # Replaced by overlay/CI: kustomize edit set image telco-agent=<full-uri>
-          imagePullPolicy: IfNotPresent
+          # Always pull. Without this, deploying with a mutable tag like :latest
+          # silently runs whatever's cached on the node — bit us once already in
+          # prod when an old :latest was sitting on the node and IfNotPresent
+          # never re-pulled the fixed image.
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8000
