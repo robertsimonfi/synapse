@@ -13,13 +13,12 @@ name: Deploy to AKS
 #   AKS_CLUSTER_NAME          — e.g. aks-telco-agent
 #   ACR_NAME                  — e.g. acrtelcoagent42
 #   ACR_LOGIN_SERVER          — e.g. acrtelcoagent42.azurecr.io
-#   ANTHROPIC_API_KEY         — your Anthropic API key
 #
-# Per-environment secrets (set under Settings → Environments → {dev,prod}):
-#   TELCO_AGENT_API_KEYS      — comma-separated list of valid X-API-Key values
-#                               for the /resolve, /memory/* endpoints.
-#                               Different per env so a leaked dev key can't
-#                               touch prod.
+# Secrets are NO LONGER managed here. They live in Azure Key Vault (kv-telco-agent)
+# and are synced into the telco-agent-secrets K8s Secret by the CSI Secret Store
+# driver using Workload Identity. Ensure the following AKV secrets exist:
+#   ANTHROPIC-API-KEY         — Anthropic API key
+#   TELCO-AGENT-API-KEYS      — comma-separated X-API-Key values (different per env)
 
 on:
   workflow_dispatch:
@@ -93,17 +92,6 @@ jobs:
           NS: telco-agent-${{ inputs.environment }}
         run: |
           kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
-
-      - name: Create / refresh app secrets
-        env:
-          NS: telco-agent-${{ inputs.environment }}
-        run: |
-          # TELCO_AGENT_API_KEYS comes from the GitHub Environment-scoped
-          # secret, so dev and prod each get their own keys automatically.
-          kubectl -n "${NS}" create secret generic telco-agent-secrets \
-            --from-literal=ANTHROPIC_API_KEY='${{ secrets.ANTHROPIC_API_KEY }}' \
-            --from-literal=TELCO_AGENT_API_KEYS='${{ secrets.TELCO_AGENT_API_KEYS }}' \
-            --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Apply manifests
         run: kubectl apply -f /tmp/manifests.yaml
