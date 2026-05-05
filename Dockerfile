@@ -33,7 +33,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH" \
     APP_HOME=/app \
-    DATA_DIR=/data
+    DATA_DIR=/data \
+    # ChromaDB's embedding func writes ONNX models under $HOME/.cache. Point it
+    # at the PVC so (a) the non-root `app` user has write perms and (b) the
+    # ~25MB model survives pod restarts instead of re-downloading every time.
+    HOME=/data \
+    XDG_CACHE_HOME=/data/.cache
 
 # Runtime libs only (no compilers). libgomp1 is needed by onnxruntime (chromadb).
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -55,7 +60,7 @@ COPY --chown=app:app db/      ./db/
 COPY --chown=app:app docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 RUN chmod +x /usr/local/bin/entrypoint.sh \
-    && mkdir -p ${DATA_DIR}/chromadb ${DATA_DIR}/agent_memory \
+    && mkdir -p ${DATA_DIR}/chromadb ${DATA_DIR}/agent_memory ${DATA_DIR}/.cache \
     && chown -R app:app ${DATA_DIR}
 
 # Persistent state lives outside the image — mount a volume here in compose/prod.
