@@ -13,9 +13,9 @@ set -euo pipefail
 # ──── EDIT THESE BEFORE FIRST RUN ─────────────────────────────────────────────
 LOCATION="${LOCATION:-westeurope}"
 RG="${RG:-rg-telco-agent}"
-ACR_NAME="${ACR_NAME:-acrtelcoagent$RANDOM}"   # must be globally unique, lowercase, alphanumeric
+ACR_NAME="${ACR_NAME:-acrtelcoagent18683}"      # <-- Hardcoded to your existing ACR
 AKS_NAME="${AKS_NAME:-aks-telco-agent}"
-NODE_SIZE="${NODE_SIZE:-Standard_B2s}"          # 2 vCPU, 4 GiB — cheapest reasonable
+NODE_SIZE="${NODE_SIZE:-Standard_B2s_v2}"       # <-- Updated to v2 VM size
 NODE_COUNT="${NODE_COUNT:-2}"
 SP_NAME="${SP_NAME:-sp-telco-agent-github}"
 # ──────────────────────────────────────────────────────────────────────────────
@@ -47,16 +47,16 @@ echo "  ACR login server: $ACR_LOGIN_SERVER"
 
 # 3. AKS cluster (with managed identity, attached to ACR for image pulls)
 echo "▶ Creating AKS cluster ($AKS_NAME) — takes ~5 min..."
-az aks create \
-  --resource-group "$RG" \
-  --name "$AKS_NAME" \
-  --node-count "$NODE_COUNT" \
-  --node-vm-size "$NODE_SIZE" \
-  --enable-managed-identity \
-  --attach-acr "$ACR_NAME" \
-  --generate-ssh-keys \
-  --location "$LOCATION" \
-  -o none
+# az aks create \
+#   --resource-group "$RG" \
+#   --name "$AKS_NAME" \
+#   --node-count "$NODE_COUNT" \
+#   --node-vm-size "$NODE_SIZE" \
+#   --enable-managed-identity \
+#   --attach-acr "$ACR_NAME" \
+#   --generate-ssh-keys \
+#   --location "$LOCATION" \
+#   -o none
 
 # 4. Pull kubeconfig
 echo "▶ Fetching kubeconfig..."
@@ -90,7 +90,7 @@ echo "  LoadBalancer IP: $LB_IP"
 # 6. Service principal for GitHub Actions
 echo ""
 echo "▶ Creating service principal for GitHub Actions..."
-SP_JSON=$(az ad sp create-for-rbac \
+SP_JSON=$(MSYS_NO_PATHCONV=1 az ad sp create-for-rbac \
   --name "$SP_NAME" \
   --role contributor \
   --scopes "/subscriptions/$SUB_ID/resourceGroups/$RG" \
