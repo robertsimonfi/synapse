@@ -14,7 +14,10 @@ from pydantic import BaseModel, Field
 from typing import Optional
 import uvicorn
 
-from agent.agent import FalloutInput, run_agent, resolution_to_dict
+from agent.agent import (
+    FalloutInput, run_agent, resolution_to_dict,
+    Customer360Input, run_customer_360,
+)
 from agent.memory import memory_stats
 from api.security import require_api_key
 from rag.knowledge_base import ingest_runbooks
@@ -86,6 +89,29 @@ class MemoryStatsResponse(BaseModel):
     collection:     str
 
 
+class Customer360Request(BaseModel):
+    customer_id: int            = Field(..., description="Customer ID to build 360 profile for")
+    query:       Optional[str]  = Field(None, description="Specific question e.g. 'Why is my bill high?'")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "customer_id": 7,
+                "query": "Why did my bill increase last month?",
+            }
+        }
+
+
+class Customer360Response(BaseModel):
+    customer_id:               int
+    profile_summary:           dict
+    active_services:           list
+    billing_health:            dict
+    usage_analysis:            dict
+    open_issues:               dict
+    proactive_recommendations: list
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
@@ -154,6 +180,37 @@ def resolve_fallout(request: ResolveRequest, _: str = Security(require_api_key))
         confidence=resolution.confidence,
         critique_quality=critique.get("quality"),
         critique_lesson=critique.get("lesson"),
+    )
+
+
+@app.post("/customer-360", response_model=Customer360Response, tags=["Agent"])
+def customer_360(request: Customer360Request, _: str = Security(require_api_key)):
+    """
+    Build a comprehensive Customer 360 profile for a given customer ID.
+
+    The agent will:
+    1. Gather customer profile, active subscriptions, and billing account details
+    2. Retrieve recent invoices and detect billing trends or anomalies
+    3. Analyse monthly usage (DATA/VOICE/SMS) and flag roaming activity
+    4. Check open incident tickets to assess churn risk
+    5. Return structured insights and proactive recommendations
+    """
+    try:
+        summary = run_customer_360(Customer360Input(
+            customer_id=request.customer_id,
+            query=request.query or "",
+        ))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
+
+    return Customer360Response(
+        customer_id=summary.customer_id,
+        profile_summary=summary.profile_summary,
+        active_services=summary.active_services,
+        billing_health=summary.billing_health,
+        usage_analysis=summary.usage_analysis,
+        open_issues=summary.open_issues,
+        proactive_recommendations=summary.proactive_recommendations,
     )
 
 

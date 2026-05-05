@@ -29,6 +29,13 @@ def _adapt_sql(sql: str) -> str:
         sql,
         flags=re.IGNORECASE,
     )
+    # TO_CHAR(col, 'YYYY-MM')  →  strftime('%Y-%m', col)
+    sql = re.sub(
+        r"TO_CHAR\s*\(\s*([^,)]+?)\s*,\s*'YYYY-MM'\s*\)",
+        r"strftime('%Y-%m', \1)",
+        sql,
+        flags=re.IGNORECASE,
+    )
     return sql
 
 
