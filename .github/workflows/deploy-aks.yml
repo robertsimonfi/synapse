@@ -44,16 +44,23 @@ jobs:
 
       # Server-side copy from GHCR → ACR. No rebuild, no local pull.
       # `--force` lets us re-import if a tag already exists.
-      - name: Import image GHCR → ACR
+      - name: Import image GHCR → ACR (Docker natively)
         run: |
-          az acr import \
-            --name "${{ secrets.ACR_NAME }}" \
-            --source "ghcr.io/${{ github.repository }}:${{ inputs.image_tag }}" \
-            --image "telco-agent:${{ inputs.image_tag }}" \
-            --username "${{ github.actor }}" \
-            --password "${{ secrets.GITHUB_TOKEN }}" \
-            --force
-            
+          # 1. Log into GitHub Container Registry
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          
+          # 2. Log into Azure Container Registry
+          az acr login --name "${{ secrets.ACR_NAME }}"
+          
+          # 3. Pull the image from GitHub
+          docker pull ghcr.io/${{ github.repository }}:${{ inputs.image_tag }}
+          
+          # 4. Retag the image for Azure
+          docker tag ghcr.io/${{ github.repository }}:${{ inputs.image_tag }} ${{ secrets.ACR_LOGIN_SERVER }}/telco-agent:${{ inputs.image_tag }}
+          
+          # 5. Push the image into Azure
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/telco-agent:${{ inputs.image_tag }}
+          
       - name: Get AKS credentials
         uses: azure/aks-set-context@v4
         with:
