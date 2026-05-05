@@ -50,8 +50,10 @@ jobs:
             --name "${{ secrets.ACR_NAME }}" \
             --source "ghcr.io/${{ github.repository }}:${{ inputs.image_tag }}" \
             --image "telco-agent:${{ inputs.image_tag }}" \
+            --username "${{ github.actor }}" \
+            --password "${{ secrets.GITHUB_TOKEN }}" \
             --force
-
+            
       - name: Get AKS credentials
         uses: azure/aks-set-context@v4
         with:
