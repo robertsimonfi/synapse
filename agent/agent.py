@@ -405,6 +405,9 @@ def _parse_summary(text: str) -> dict:
         raw = match.group(0)
     else:
         raw = match.group(1).strip()
+        # Strip markdown code fence that Claude sometimes wraps around JSON
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
