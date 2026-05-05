@@ -10,6 +10,7 @@ Endpoints:
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field
 from typing import Optional
 import uvicorn
@@ -24,6 +25,27 @@ app = FastAPI(
     description="AI-powered BSS/OSS fallout detection, root cause analysis, and resolution.",
     version="1.0.0",
 )
+
+
+def _custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    schema.setdefault("components", {})["securitySchemes"] = {
+        "ApiKeyAuth": {"type": "apiKey", "in": "header", "name": "X-API-Key"}
+    }
+    # Apply globally so every protected endpoint shows the lock icon.
+    schema["security"] = [{"ApiKeyAuth": []}]
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _custom_openapi
 
 app.add_middleware(
     CORSMiddleware,
