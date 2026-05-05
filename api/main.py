@@ -8,9 +8,8 @@ Endpoints:
   POST /memory/ingest    — Re-ingest runbooks into ChromaDB
 """
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Security
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field
 from typing import Optional
 import uvicorn
@@ -25,27 +24,6 @@ app = FastAPI(
     description="AI-powered BSS/OSS fallout detection, root cause analysis, and resolution.",
     version="1.0.0",
 )
-
-
-def _custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    schema = get_openapi(
-        title=app.title,
-        version=app.version,
-        description=app.description,
-        routes=app.routes,
-    )
-    schema.setdefault("components", {})["securitySchemes"] = {
-        "ApiKeyAuth": {"type": "apiKey", "in": "header", "name": "X-API-Key"}
-    }
-    # Apply globally so every protected endpoint shows the lock icon.
-    schema["security"] = [{"ApiKeyAuth": []}]
-    app.openapi_schema = schema
-    return schema
-
-
-app.openapi = _custom_openapi
 
 app.add_middleware(
     CORSMiddleware,
@@ -116,20 +94,20 @@ def health():
 
 
 @app.get("/memory/stats", response_model=MemoryStatsResponse, tags=["Memory"])
-def get_memory_stats(_: str = Depends(require_api_key)):
+def get_memory_stats(_: str = Security(require_api_key)):
     """Return statistics about the agent's self-critique memory store."""
     return memory_stats()
 
 
 @app.post("/memory/ingest", tags=["Memory"])
-def ingest_knowledge_base(force: bool = False, _: str = Depends(require_api_key)):
+def ingest_knowledge_base(force: bool = False, _: str = Security(require_api_key)):
     """Re-ingest all runbooks into the RAG ChromaDB collection."""
     count = ingest_runbooks(force=force)
     return {"status": "ok", "chunks_ingested": count}
 
 
 @app.post("/resolve", response_model=ResolveResponse, tags=["Agent"])
-def resolve_fallout(request: ResolveRequest, _: str = Depends(require_api_key)):
+def resolve_fallout(request: ResolveRequest, _: str = Security(require_api_key)):
     """
     Submit a Telco fallout for AI-powered root cause analysis and resolution.
 
