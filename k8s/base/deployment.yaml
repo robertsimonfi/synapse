@@ -16,7 +16,9 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: telco-agent
+        azure.workload.identity/use: "true"
     spec:
+      serviceAccountName: telco-agent-workload
       securityContext:
         runAsNonRoot: true
         runAsUser: 999          # Matches the `app` user baked into the image.
@@ -50,6 +52,9 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: secrets-store
+              mountPath: /mnt/secrets-store
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /health
@@ -78,3 +83,9 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: telco-agent-data
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: telco-agent-akv

@@ -6,6 +6,7 @@ namespace: telco-agent-dev
 resources:
   - ../../base
   - namespace.yaml
+  - secret-provider.yaml
 
 # Image is set at deploy time by the workflow:
 #   kustomize edit set image telco-agent=<acr>.azurecr.io/telco-agent:sha-<commit>

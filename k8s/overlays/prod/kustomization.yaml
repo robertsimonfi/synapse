@@ -6,6 +6,7 @@ namespace: telco-agent-prod
 resources:
   - ../../base
   - namespace.yaml
+  - secret-provider.yaml
 
 images:
   - name: telco-agent
