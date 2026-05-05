@@ -110,6 +110,7 @@ class Customer360Response(BaseModel):
     usage_analysis:            dict
     open_issues:               dict
     proactive_recommendations: list
+    debug_raw_reasoning:       Optional[str] = None   # temporary — remove after debugging
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -211,6 +212,7 @@ def customer_360(request: Customer360Request, _: str = Security(require_api_key)
         usage_analysis=summary.usage_analysis,
         open_issues=summary.open_issues,
         proactive_recommendations=summary.proactive_recommendations,
+        debug_raw_reasoning=summary.raw_reasoning,
     )
 
 
