@@ -77,6 +77,11 @@ class ResolveResponse(BaseModel):
     confidence:          str
     critique_quality:    Optional[str] = None
     critique_lesson:     Optional[str] = None
+    # Phase 6 metadata
+    routing_domain:      Optional[str] = None
+    routing_confidence:  Optional[float] = None
+    critic_violations:   Optional[list[str]] = None
+    policy_violations:   Optional[list[str]] = None
 
 
 class HealthResponse(BaseModel):
@@ -180,6 +185,10 @@ def resolve_fallout(request: ResolveRequest, _: str = Security(require_api_key))
         confidence=resolution.confidence,
         critique_quality=critique.get("quality"),
         critique_lesson=critique.get("lesson"),
+        routing_domain=resolution.routing_domain,
+        routing_confidence=resolution.routing_confidence,
+        critic_violations=resolution.critic_violations or None,
+        policy_violations=resolution.policy_violations or None,
     )
 
 

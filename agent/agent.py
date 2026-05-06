@@ -3,27 +3,34 @@ Telco Fallout Resolution Agent — main orchestrator.
 
 Flow:
   1. Receive an error input (order_id, error_code, description, etc.)
-  2. Retrieve relevant runbook context via RAG (ChromaDB)
-  3. Retrieve past lessons via memory loop (ChromaDB)
-  4. Run Claude with tool_use to investigate the DB
-  5. Return structured resolution: classification, root cause, recommended actions
-  6. Run self-critique and store lesson if quality can be improved
+  2. Route to the correct Expert domain via IntentRouter (Haiku, fast)
+  3. Retrieve relevant runbook context via RAG (ChromaDB)
+  4. Retrieve past lessons via memory loop (ChromaDB)
+  5. Run Claude with tool_use to investigate the DB (expert tool subset)
+  6. Internal Critic reviews the draft — triggers one revision pass if needed
+  7. PolicyEngine validates any credit/discount actions against hard rules
+  8. Return structured resolution with routing, critic, and policy metadata
+  9. Run self-critique and store lesson if quality can be improved
 """
 
 import json
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field, asdict
+from datetime import date, datetime
 
 import anthropic
 
 from agent.tools import TOOL_DEFINITIONS, execute_tool
 from agent.memory import retrieve_memories, format_memories, self_critique_and_store
+from agent.router import IntentRouter, ExpertDomain, EXPERT_CONFIGS
+from agent.critic import InternalCritic
+from agent.policy import PolicyEngine, PolicyContext, extract_actions_from_text
 from rag.knowledge_base import retrieve as rag_retrieve, format_context, ingest_runbooks
 
 # Ensure runbooks are indexed on first run
 ingest_runbooks()
 
-MODEL     = os.getenv("CLAUDE_MODEL",     "claude-opus-4-6")
+MODEL      = os.getenv("CLAUDE_MODEL",      "claude-opus-4-6")
 MODEL_C360 = os.getenv("CLAUDE_MODEL_C360", "claude-sonnet-4-6")
 
 
@@ -43,16 +50,23 @@ class FalloutInput:
 @dataclass
 class FalloutResolution:
     """Structured resolution output."""
-    classification: dict       # domain, severity, issue_type
-    root_cause:     str
+    classification:      dict       # domain, severity, issue_type
+    root_cause:          str
     recommended_actions: list[str]
     runbook_references:  list[str]
-    confidence:     str        # HIGH, MEDIUM, LOW
-    raw_reasoning:  str
-    critique:       dict | None = None
+    confidence:          str        # HIGH, MEDIUM, LOW
+    raw_reasoning:       str
+    critique:            dict | None = None
+    # Phase 6 metadata
+    routing_domain:      str = "GENERAL"
+    routing_confidence:  float = 0.0
+    critic_violations:   list[str] = field(default_factory=list)
+    policy_violations:   list[str] = field(default_factory=list)
 
 
-def build_system_prompt(rag_context: str, memory_context: str) -> str:
+def build_system_prompt(
+    rag_context: str, memory_context: str, expert_addendum: str = ""
+) -> str:
     return f"""You are a Telco Fallout Resolution Agent for a major US carrier (T-Mobile style BSS/OSS).
 
 Your job is to:
@@ -66,7 +80,7 @@ Your job is to:
 {rag_context}
 
 {memory_context}
-
+{expert_addendum}
 Guidelines:
 - Always call at minimum 2-3 tools to build a complete picture before concluding.
 - Correlate provisioning failures with active network alarms when relevant.
@@ -95,6 +109,11 @@ Resolution JSON format:
 def run_agent(fallout_input: FalloutInput) -> FalloutResolution:
     """
     Main agent entry point. Returns a FalloutResolution.
+
+    Phase 6 additions:
+      - IntentRouter classifies intent → selects Expert tool subset + prompt addendum
+      - InternalCritic reviews draft → triggers one revision pass on violations
+      - PolicyEngine validates credit/discount actions against hard business rules
     """
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
@@ -105,59 +124,71 @@ def run_agent(fallout_input: FalloutInput) -> FalloutResolution:
         f"{fallout_input.free_text}"
     ).strip()
 
-    # 1. RAG — retrieve runbook context
-    rag_chunks  = rag_retrieve(issue_desc, top_k=4)
-    rag_context = format_context(rag_chunks)
+    # 1. Route — classify intent to pick the right Expert
+    routing = IntentRouter(client).classify(
+        error_code=fallout_input.error_code,
+        domain=fallout_input.domain,
+        error_message=fallout_input.error_message,
+        free_text=fallout_input.free_text,
+    )
+    expert_cfg = EXPERT_CONFIGS[routing.domain]
+    active_tool_names = expert_cfg["tools"]  # None = all tools
+    active_tools = (
+        TOOL_DEFINITIONS
+        if active_tool_names is None
+        else [t for t in TOOL_DEFINITIONS if t["name"] in active_tool_names]
+    )
+
+    # 2. RAG — retrieve runbook context
+    rag_chunks   = rag_retrieve(issue_desc, top_k=4)
+    rag_context  = format_context(rag_chunks)
     runbook_refs = list({c["source"] for c in rag_chunks})
 
-    # 2. Memory — retrieve past lessons
+    # 3. Memory — retrieve past lessons
     memories       = retrieve_memories(issue_desc, top_k=3)
     memory_context = format_memories(memories)
 
-    # 3. Build system prompt
-    system = build_system_prompt(rag_context, memory_context)
+    # 4. Build system prompt with expert addendum
+    system = build_system_prompt(rag_context, memory_context, expert_cfg["system_addendum"])
 
-    # 4. Build user message
-    user_message = f"""Please investigate and resolve the following Telco fallout:
-
-Error Code:    {fallout_input.error_code or 'Unknown'}
-Error Message: {fallout_input.error_message or 'Not provided'}
-Domain:        {fallout_input.domain or 'Unknown'}
-Severity:      {fallout_input.severity}
-Order ID:      {fallout_input.order_id or 'Not provided'}
-Order Number:  {fallout_input.order_number or 'Not provided'}
-Customer ID:   {fallout_input.customer_id or 'Not provided'}
-Additional Context: {fallout_input.free_text or 'None'}
-
-Use the available tools to investigate, then provide your structured resolution."""
-
+    # 5. Build user message
+    user_message = (
+        f"Please investigate and resolve the following Telco fallout:\n\n"
+        f"Error Code:    {fallout_input.error_code or 'Unknown'}\n"
+        f"Error Message: {fallout_input.error_message or 'Not provided'}\n"
+        f"Domain:        {fallout_input.domain or 'Unknown'}\n"
+        f"Severity:      {fallout_input.severity}\n"
+        f"Order ID:      {fallout_input.order_id or 'Not provided'}\n"
+        f"Order Number:  {fallout_input.order_number or 'Not provided'}\n"
+        f"Customer ID:   {fallout_input.customer_id or 'Not provided'}\n"
+        f"Additional Context: {fallout_input.free_text or 'None'}\n\n"
+        "Use the available tools to investigate, then provide your structured resolution."
+    )
     messages = [{"role": "user", "content": user_message}]
 
-    # 5. Agentic tool-use loop
-    raw_reasoning_parts = []
-    max_iterations      = 10
+    # 6. Agentic tool-use loop
+    raw_reasoning_parts: list[str] = []
+    last_response = None
+    max_iterations = 10
 
     for _ in range(max_iterations):
-        response = client.messages.create(
+        last_response = client.messages.create(
             model=MODEL,
             max_tokens=4096,
             system=system,
-            tools=TOOL_DEFINITIONS,
+            tools=active_tools,
             messages=messages,
         )
-
-        # Collect text content
-        for block in response.content:
+        for block in last_response.content:
             if hasattr(block, "text"):
                 raw_reasoning_parts.append(block.text)
 
-        if response.stop_reason == "end_turn":
+        if last_response.stop_reason == "end_turn":
             break
 
-        if response.stop_reason == "tool_use":
-            # Process all tool calls
+        if last_response.stop_reason == "tool_use":
             tool_results = []
-            for block in response.content:
+            for block in last_response.content:
                 if block.type == "tool_use":
                     result = execute_tool(block.name, block.input)
                     tool_results.append({
@@ -165,19 +196,72 @@ Use the available tools to investigate, then provide your structured resolution.
                         "tool_use_id": block.id,
                         "content":     result,
                     })
-
-            # Append assistant turn + tool results
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": tool_results})
+            messages.append({"role": "assistant", "content": last_response.content})
+            messages.append({"role": "user",      "content": tool_results})
         else:
             break
 
-    raw_reasoning = "\n".join(raw_reasoning_parts)
-
-    # 6. Parse resolution JSON from <resolution>...</resolution> tags
+    raw_reasoning   = "\n".join(raw_reasoning_parts)
     resolution_data = _parse_resolution(raw_reasoning)
 
-    # 7. Self-critique and store lesson
+    # 7. Internal Critic — review draft before HITL submission
+    critic = InternalCritic(client)
+    critic_violations = critic.review(
+        root_cause=resolution_data.get("root_cause", ""),
+        recommended_actions=resolution_data.get("recommended_actions", []),
+        confidence=resolution_data.get("confidence", "LOW"),
+        reasoning_excerpt=raw_reasoning,
+        issue_context=issue_desc,
+    )
+
+    if critic_violations and last_response is not None:
+        # Append the final assistant turn then inject critic feedback for one revision pass
+        messages.append({"role": "assistant", "content": last_response.content})
+        messages.append({"role": "user", "content": critic.format_feedback(critic_violations)})
+
+        for _ in range(5):
+            last_response = client.messages.create(
+                model=MODEL,
+                max_tokens=2048,
+                system=system,
+                tools=active_tools,
+                messages=messages,
+            )
+            for block in last_response.content:
+                if hasattr(block, "text"):
+                    raw_reasoning_parts.append(block.text)
+
+            if last_response.stop_reason == "end_turn":
+                break
+            if last_response.stop_reason == "tool_use":
+                tool_results = []
+                for block in last_response.content:
+                    if block.type == "tool_use":
+                        result = execute_tool(block.name, block.input)
+                        tool_results.append({
+                            "type":        "tool_result",
+                            "tool_use_id": block.id,
+                            "content":     result,
+                        })
+                messages.append({"role": "assistant", "content": last_response.content})
+                messages.append({"role": "user",      "content": tool_results})
+            else:
+                break
+
+        raw_reasoning   = "\n".join(raw_reasoning_parts)
+        resolution_data = _parse_resolution(raw_reasoning)
+
+    # 8. Policy Engine — validate credit/discount actions against hard rules
+    policy_violations: list[str] = []
+    if fallout_input.customer_id:
+        policy_context = _build_policy_context(fallout_input.customer_id)
+        if policy_context:
+            proposed = extract_actions_from_text(
+                resolution_data.get("recommended_actions", [])
+            )
+            policy_violations = PolicyEngine().validate_all(proposed, policy_context)
+
+    # 9. Self-critique and store lesson
     critique = self_critique_and_store(
         anthropic_client=client,
         issue_description=issue_desc,
@@ -194,6 +278,45 @@ Use the available tools to investigate, then provide your structured resolution.
         confidence=resolution_data.get("confidence", "LOW"),
         raw_reasoning=raw_reasoning,
         critique=critique,
+        routing_domain=routing.domain.value,
+        routing_confidence=routing.confidence,
+        critic_violations=critic_violations,
+        policy_violations=policy_violations,
+    )
+
+
+def _build_policy_context(customer_id: int) -> PolicyContext | None:
+    """Fetch the minimal customer+billing data needed for PolicyEngine validation."""
+    from agent.db import query_one
+
+    row = query_one(
+        "SELECT c.ACCOUNT_TYPE, c.CREATED_DATE, c.CREDIT_SCORE, "
+        "ba.CURRENT_BALANCE, ba.CREDIT_LIMIT "
+        "FROM CUSTOMER c "
+        "LEFT JOIN BILLING_ACCOUNT ba ON ba.CUSTOMER_ID = c.CUSTOMER_ID "
+        "WHERE c.CUSTOMER_ID = :customer_id",
+        {"customer_id": customer_id},
+    )
+    if not row:
+        return None
+
+    created = row.get("created_date")
+    if isinstance(created, str):
+        try:
+            created = datetime.fromisoformat(created).date()
+        except ValueError:
+            created = date.today()
+    elif isinstance(created, datetime):
+        created = created.date()
+
+    tenure_days = (date.today() - created).days if isinstance(created, date) else 0
+
+    return PolicyContext(
+        customer_tenure_days=tenure_days,
+        account_type=str(row.get("account_type") or "POSTPAID"),
+        current_balance=float(row.get("current_balance") or 0.0),
+        credit_limit=float(row.get("credit_limit") or 0.0),
+        credit_score=row.get("credit_score"),
     )
 
 
