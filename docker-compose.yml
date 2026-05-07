@@ -1,37 +1,187 @@
-# Local-dev compose: brings the API up with persistent volumes for SQLite + ChromaDB.
-# For production, replace SQLite with managed Postgres/Oracle and the local
-# Chroma volumes with a managed vector store (pgvector, Pinecone, AI Search).
+# Synapse — full local-dev stack.
+#
+# Services:
+#   mongodb    — Action state store (Phase 1)
+#   rabbitmq   — Job queue between API and Thinker (Phase 3)
+#   api        — FastAPI: resolve, HITL endpoints, Prometheus /metrics
+#   thinker    — Async agent consumer: RabbitMQ → Claude → MongoDB proposals
+#   executor   — Polls MongoDB for APPROVED actions and executes them
+#   prometheus — Scrapes /metrics from the API
+#   ui         — Streamlit Operator Portal (HITL review dashboard)
+#
+# For production: replace SQLite with managed Oracle/Postgres, local ChromaDB
+# with a managed vector store (pgvector, AI Search), and scale thinker/executor
+# as independent Deployments on AKS.
 
 services:
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  mongodb:
+    image: mongo:7.0
+    container_name: synapse-mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: synapse
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: synapse-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # Management UI → http://localhost:15672 (guest/guest)
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: synapse
+      RABBITMQ_DEFAULT_PASS: synapse
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: synapse-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    restart: unless-stopped
+
+  # ── Application ─────────────────────────────────────────────────────────────
+
   api:
     build:
       context: .
       dockerfile: Dockerfile
     image: telco-agent:local
-    container_name: telco-agent-api
+    container_name: synapse-api
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
-      # Override the in-repo defaults so state lives on the mounted volume.
       DB_TYPE: sqlite
       SQLITE_PATH: /data/telco_dev.db
       RAG_CHROMA_PATH: /data/chromadb
       AGENT_MEMORY_PATH: /data/agent_memory
-      # Auto-seed + ingest on first boot if the volume is empty.
       AUTO_SEED: "true"
       AUTO_INGEST: "true"
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB: synapse
+      RABBITMQ_URL: amqp://synapse:synapse@rabbitmq/
+      ACTION_EXPIRY_HOURS: "4"
+      EXPIRY_CHECK_INTERVAL_MINUTES: "15"
     volumes:
       - telco_data:/data
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s
       timeout: 5s
-      start_period: 20s
+      start_period: 25s
       retries: 3
+    restart: unless-stopped
+
+  thinker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telco-agent:local
+    container_name: synapse-thinker
+    command: ["python", "-m", "worker.thinker"]
+    env_file:
+      - .env
+    environment:
+      DB_TYPE: sqlite
+      SQLITE_PATH: /data/telco_dev.db
+      RAG_CHROMA_PATH: /data/chromadb
+      AGENT_MEMORY_PATH: /data/agent_memory
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB: synapse
+      RABBITMQ_URL: amqp://synapse:synapse@rabbitmq/
+      THINKER_QUEUE: resolve_jobs
+      THINKER_PREFETCH: "5"
+    volumes:
+      - telco_data:/data
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  executor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telco-agent:local
+    container_name: synapse-executor
+    command: ["python", "-m", "worker.executor"]
+    environment:
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB: synapse
+      EXECUTOR_POLL_INTERVAL: "10"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telco-agent:local
+    container_name: synapse-ui
+    command:
+      - "streamlit"
+      - "run"
+      - "ui/operator_portal.py"
+      - "--server.port=8501"
+      - "--server.address=0.0.0.0"
+      - "--server.headless=true"
+    ports:
+      - "8501:8501"
+    environment:
+      API_BASE_URL: http://api:8000
+    env_file:
+      - .env
+    depends_on:
+      api:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
   telco_data:
+    driver: local
+  mongo_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  prometheus_data:
     driver: local

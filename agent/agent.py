@@ -56,12 +56,17 @@ class FalloutResolution:
     runbook_references:  list[str]
     confidence:          str        # HIGH, MEDIUM, LOW
     raw_reasoning:       str
+    action_proposals:    list[dict] = None   # structured HITL proposals for MongoDB
     critique:            dict | None = None
     # Phase 6 metadata
     routing_domain:      str = "GENERAL"
     routing_confidence:  float = 0.0
     critic_violations:   list[str] = field(default_factory=list)
     policy_violations:   list[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        if self.action_proposals is None:
+            self.action_proposals = []
 
 
 def build_system_prompt(
@@ -102,11 +107,20 @@ Resolution JSON format:
     "Action 3 — ..."
   ],
   "runbook_references": ["order_fallout.txt", "provisioning_failure.txt"],
-  "confidence": "HIGH|MEDIUM|LOW"
+  "confidence": "HIGH|MEDIUM|LOW",
+  "action_proposals": [
+    {{
+      "action_type": "retry_provisioning|update_billing|create_ticket|escalate|notify_customer|update_subscription|cancel_order",
+      "action_description": "One concise sentence describing what this action does and why.",
+      "action_payload": {{"key": "value pairs an executor needs to carry out this action (e.g. system, msisdn, order_id)"}},
+      "predicted_before_state": {{"field": "current observed value from the data you retrieved"}},
+      "predicted_after_state": {{"field": "expected value once the action succeeds"}}
+    }}
+  ]
 }}"""
 
 
-def run_agent(fallout_input: FalloutInput) -> FalloutResolution:
+def run_agent(fallout_input: FalloutInput, correlation_id: str | None = None) -> FalloutResolution:
     """
     Main agent entry point. Returns a FalloutResolution.
 
@@ -277,6 +291,7 @@ def run_agent(fallout_input: FalloutInput) -> FalloutResolution:
         runbook_references=resolution_data.get("runbook_references", runbook_refs),
         confidence=resolution_data.get("confidence", "LOW"),
         raw_reasoning=raw_reasoning,
+        action_proposals=resolution_data.get("action_proposals", []),
         critique=critique,
         routing_domain=routing.domain.value,
         routing_confidence=routing.confidence,
