@@ -16,6 +16,10 @@ HITL action management:
   POST /actions/{id}/reject        — Operator rejects an action (reason required)
   GET  /actions/{id}/audit         — Full audit trail for an action
 
+Phase 7 — Proactive Engagement:
+  GET  /engagements                — List engagement log entries
+  POST /webhooks/customer-reply    — Inbound customer reply from SMS/Email gateway
+
 Observability:
   GET  /metrics                    — Prometheus metrics (scraped by Prometheus)
 """
@@ -25,6 +29,7 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Security
@@ -523,6 +528,126 @@ async def get_audit_trail_endpoint(action_id: str, _: str = Security(require_api
 
     events = await get_audit_trail(action_id)
     return [_audit_to_out(e) for e in events]
+
+
+# ── Phase 7: Engagement endpoints ─────────────────────────────────────────────
+
+
+class EngagementOut(BaseModel):
+    id:                   str
+    action_id:            str
+    correlation_id:       str
+    customer_id:          Optional[str]
+    channel:              str
+    template_used:        str
+    message_body:         str
+    recipient_masked:     str
+    sent_at:              Optional[str]
+    status:               str
+    customer_response:    str
+    response_text:        Optional[str]
+    response_received_at: Optional[str]
+    created_at:           str
+
+
+class CustomerReplyRequest(BaseModel):
+    correlation_id: str  = Field(..., description="Links reply to the original engagement")
+    reply_text:     str  = Field(..., description="Raw text of the customer's reply")
+    channel:        str  = Field("SMS", description="SMS | EMAIL | WHATSAPP")
+    from_address:   Optional[str] = Field(None, description="Phone/email of sender (for audit)")
+
+
+def _engagement_to_out(e) -> EngagementOut:
+    return EngagementOut(
+        id=e.id,
+        action_id=e.action_id,
+        correlation_id=e.correlation_id,
+        customer_id=e.customer_id,
+        channel=e.channel.value,
+        template_used=e.template_used,
+        message_body=e.message_body,
+        recipient_masked=e.recipient_masked,
+        sent_at=e.sent_at.isoformat() if e.sent_at else None,
+        status=e.status.value,
+        customer_response=e.customer_response.value,
+        response_text=e.response_text,
+        response_received_at=e.response_received_at.isoformat() if e.response_received_at else None,
+        created_at=e.created_at.isoformat(),
+    )
+
+
+@app.get("/engagements", response_model=list[EngagementOut], tags=["Engagement"])
+async def list_engagements_endpoint(
+    action_id:   Optional[str] = None,
+    customer_id: Optional[str] = None,
+    limit:       int = 100,
+    _: str = Security(require_api_key),
+):
+    """List engagement log entries, optionally filtered by action or customer."""
+    _require_mongo()
+    from db.mongo import list_engagements
+    logs = await list_engagements(limit=min(limit, 500), action_id=action_id, customer_id=customer_id)
+    return [_engagement_to_out(e) for e in logs]
+
+
+@app.post("/webhooks/customer-reply", tags=["Engagement"])
+async def customer_reply_webhook(request: CustomerReplyRequest):
+    """
+    Inbound customer reply hook — called by SMS/Email gateways.
+
+    Looks up the engagement by correlation_id, records the reply, and publishes
+    a CUSTOMER_FEEDBACK event to RabbitMQ so the Thinker can decide next steps.
+    No API key required so that gateway services can POST without credentials.
+    """
+    _require_mongo()
+    from datetime import timezone as _tz
+    from db.mongo import get_engagement_by_correlation, record_customer_response
+
+    engagement = await get_engagement_by_correlation(request.correlation_id)
+    if not engagement:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No engagement found for correlation_id={request.correlation_id}",
+        )
+
+    received_at = datetime.now(_tz.utc)
+    updated = await record_customer_response(engagement.id, request.reply_text, received_at)
+
+    # Publish CUSTOMER_FEEDBACK event to RabbitMQ so Thinker can react
+    rabbitmq_uri = os.getenv("RABBITMQ_URL")
+    if rabbitmq_uri:
+        try:
+            import aio_pika
+            connection = await aio_pika.connect_robust(rabbitmq_uri)
+            async with connection:
+                channel = await connection.channel()
+                import json
+                await channel.default_exchange.publish(
+                    aio_pika.Message(
+                        body=json.dumps({
+                            "event_type":     "CUSTOMER_FEEDBACK",
+                            "correlation_id": request.correlation_id,
+                            "action_id":      engagement.action_id,
+                            "customer_id":    engagement.customer_id,
+                            "reply_text":     request.reply_text,
+                            "channel":        request.channel,
+                            "received_at":    received_at.isoformat(),
+                        }).encode(),
+                    ),
+                    routing_key="incoming_events",
+                )
+            logger.info(
+                "CUSTOMER_FEEDBACK published correlation=%s action=%s",
+                request.correlation_id, engagement.action_id,
+            )
+        except Exception as exc:
+            logger.warning("RabbitMQ publish failed for feedback: %s", exc)
+
+    return {
+        "status":         "recorded",
+        "engagement_id":  updated.id if updated else engagement.id,
+        "customer_response": updated.customer_response.value if updated else "REPLIED",
+    }
 
 
 # ── Dev runner ─────────────────────────────────────────────────────────────────

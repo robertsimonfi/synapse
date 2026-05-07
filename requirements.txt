@@ -40,3 +40,8 @@ faker>=25.0.0
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0
+
+# ── Phase 7: Notification providers (optional — only needed for real dispatch) ──
+# twilio>=8.0.0        # Uncomment to enable TwilioProvider
+# sendgrid>=6.11.0     # Uncomment to enable SendGridProvider
+# aiohttp is already listed above and is used by the Twilio/SendGrid stubs

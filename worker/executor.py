@@ -140,6 +140,16 @@ async def _execute_action(action: ActionProposal) -> None:
                     "HITL_APPROVED_EXECUTION action=%s type=%s latency=%.2fs",
                     action.id, action.action_type, latency,
                 )
+
+                # Phase 7 — post-action engagement dispatch (non-blocking; failure is soft)
+                try:
+                    from src.actions.notifications import EngagementDispatcher
+                    await EngagementDispatcher.dispatch(action, result)
+                except Exception as eng_exc:
+                    logger.warning(
+                        "Engagement dispatch skipped for action %s: %s", action.id, eng_exc
+                    )
+
                 return
 
             except Exception as exc:

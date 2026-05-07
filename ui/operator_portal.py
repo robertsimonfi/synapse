@@ -106,11 +106,12 @@ def render_sidebar() -> str:
 def render_main(operator_id: str) -> None:
     st.title("Action Review Queue")
 
-    tab_pending, tab_approved, tab_history, tab_failed = st.tabs([
+    tab_pending, tab_approved, tab_history, tab_failed, tab_engagement = st.tabs([
         "⏳ Pending Review",
         "✅ Approved",
         "📋 History",
         "❌ Failed / Expired",
+        "📣 Customer Engagement",
     ])
 
     with tab_pending:
@@ -171,6 +172,102 @@ def render_main(operator_id: str) -> None:
                     f"⌛ `{a['id'][:8]}` **{a['action_type']}** — "
                     f"created {a['created_at'][:10]}"
                 )
+
+    with tab_engagement:
+        _render_engagement_tab()
+
+
+# ── Customer Engagement tab ───────────────────────────────────────────────────
+
+_RESPONSE_ICON = {
+    "PENDING":  "⏳",
+    "ACCEPTED": "✅",
+    "DECLINED": "❌",
+    "REPLIED":  "💬",
+}
+
+_STATUS_ICON = {
+    "SENT":    "📤",
+    "PENDING": "🕐",
+    "FAILED":  "💥",
+}
+
+_CHANNEL_ICON = {
+    "SMS":      "📱",
+    "EMAIL":    "✉️",
+    "WHATSAPP": "💚",
+}
+
+
+def _render_engagement_tab() -> None:
+    st.subheader("Customer Engagement Log")
+    st.caption("Proactive notifications sent after action execution, and customer replies.")
+
+    col_filter, col_refresh = st.columns([4, 1])
+    with col_filter:
+        filter_action = st.text_input(
+            "Filter by Action ID (optional)", placeholder="paste action UUID prefix…"
+        )
+    with col_refresh:
+        st.write("")
+        refresh = st.button("🔄 Refresh")
+
+    logs = _get("/engagements", limit=100, **({"action_id": filter_action} if filter_action else {})) or []
+
+    if not logs:
+        st.info("No engagement records yet. They appear here after actions are executed.")
+        return
+
+    # Summary metrics row
+    total   = len(logs)
+    sent    = sum(1 for e in logs if e["status"] == "SENT")
+    replied = sum(1 for e in logs if e["customer_response"] == "REPLIED")
+    failed  = sum(1 for e in logs if e["status"] == "FAILED")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Sent", sent)
+    m2.metric("Replies Received", replied)
+    m3.metric("Delivery Failures", failed, delta=failed if failed else None, delta_color="inverse")
+    m4.metric("Total Engagements", total)
+
+    st.divider()
+
+    # Engagement cards
+    for eng in logs:
+        chan_icon = _CHANNEL_ICON.get(eng["channel"], "📨")
+        resp_icon = _RESPONSE_ICON.get(eng["customer_response"], "⏳")
+        stat_icon = _STATUS_ICON.get(eng["status"], "")
+        label     = (
+            f"{chan_icon} [{eng['channel']}] {stat_icon} {eng['status']} "
+            f"→ {resp_icon} {eng['customer_response']} "
+            f"— action `{eng['action_id'][:8]}` "
+            f"— {eng['created_at'][:10]}"
+        )
+        with st.expander(label, expanded=False):
+            col_info, col_msg = st.columns([1, 2])
+
+            with col_info:
+                st.markdown(f"**Engagement ID:** `{eng['id']}`")
+                st.markdown(f"**Action ID:** `{eng['action_id']}`")
+                st.markdown(f"**Correlation:** `{eng['correlation_id']}`")
+                st.markdown(f"**Customer ID:** `{eng.get('customer_id', '—')}`")
+                st.markdown(f"**Channel:** {chan_icon} `{eng['channel']}`")
+                st.markdown(f"**Template:** `{eng['template_used']}`")
+                st.markdown(f"**Recipient (masked):** `{eng['recipient_masked']}`")
+                st.markdown(f"**Sent at:** {eng.get('sent_at', '—')}")
+
+            with col_msg:
+                st.markdown("**Message sent to customer:**")
+                st.info(eng["message_body"])
+
+                if eng["customer_response"] != "PENDING":
+                    st.markdown(
+                        f"**Customer replied** ({resp_icon} `{eng['customer_response']}`) "
+                        f"at {eng.get('response_received_at', '—')[:19]}:"
+                    )
+                    st.success(eng.get("response_text", "_(no text)_"))
+                else:
+                    st.caption("Awaiting customer response…")
 
 
 # ── Action card ────────────────────────────────────────────────────────────────
