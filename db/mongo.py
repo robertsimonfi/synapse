@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 _client: AsyncIOMotorClient | None = None
 
+_CUSTOMERS_COLLECTION = "customers"
+
 
 def _get_client() -> AsyncIOMotorClient:
     global _client
@@ -44,7 +46,49 @@ async def ensure_indexes() -> None:
     await db.action_audit_trail.create_index(
         [("action_id", ASCENDING), ("timestamp", DESCENDING)]
     )
-    logger.info("MongoDB indexes ensured on collection 'action_states'")
+    await db[_CUSTOMERS_COLLECTION].create_index("customer_key", unique=True, background=True)
+    await db[_CUSTOMERS_COLLECTION].create_index(
+        [("segment", ASCENDING), ("churn_risk_score", DESCENDING)], background=True
+    )
+    logger.info("MongoDB indexes ensured")
+
+
+# ── Customer document helpers ─────────────────────────────────────────────────
+
+
+async def get_customer(customer_key: str) -> dict | None:
+    """Fetch a full customer document by customer_key. Returns None if not found."""
+    doc = await _db()[_CUSTOMERS_COLLECTION].find_one(
+        {"customer_key": customer_key},
+        projection={"_id": 0},
+    )
+    if doc is None:
+        logger.warning("Customer not found: %s", customer_key)
+    return doc
+
+
+async def upsert_customer(customer_key: str, document: dict) -> None:
+    """Insert or fully replace a customer document (used by seed scripts and tests)."""
+    await _db()[_CUSTOMERS_COLLECTION].replace_one(
+        {"customer_key": customer_key},
+        document,
+        upsert=True,
+    )
+
+
+async def list_customer_keys() -> list[str]:
+    """Return all customer_key values in the collection."""
+    cursor = _db()[_CUSTOMERS_COLLECTION].find({}, projection={"customer_key": 1, "_id": 0})
+    docs = await cursor.to_list(length=None)
+    return [d["customer_key"] for d in docs]
+
+
+async def append_agent_history(customer_key: str, entry: dict) -> None:
+    """Append an interaction record to the customer's agent_history array."""
+    await _db()[_CUSTOMERS_COLLECTION].update_one(
+        {"customer_key": customer_key},
+        {"$push": {"agent_history": entry}},
+    )
 
 
 # ── CRUD ──────────────────────────────────────────────────────────────────────
