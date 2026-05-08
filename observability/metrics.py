@@ -67,3 +67,43 @@ pii_masked_fields_total = Counter(
     "Total number of PII field values tokenised before MongoDB ODS write",
     ["field_type"],
 )
+
+# ── Phase 12: Predictive prefetch ─────────────────────────────────────────────
+
+prefetch_signals_received_total = Counter(
+    "synapse_prefetch_signals_received_total",
+    "HIGH_SIGNAL events received by the predictive hydration engine",
+    ["signal_type", "opco_id"],
+)
+
+prefetch_customers_queued_total = Counter(
+    "synapse_prefetch_customers_queued_total",
+    "Subscribers queued for proactive re-hydration following a HIGH_SIGNAL event",
+    ["signal_type", "opco_id"],
+)
+
+force_sync_total = Counter(
+    "synapse_force_sync_total",
+    "Operator-triggered force-sync calls that bypass the Kafka pipeline",
+    ["opco_id"],
+)
+
+# ── Phase 12: Canary analysis ─────────────────────────────────────────────────
+
+canary_success_rate = Gauge(
+    "synapse_canary_success_rate",
+    "Rolling approval rate for a given model version (0.0 – 1.0)",
+    ["model_version"],
+)
+
+canary_sample_count = Gauge(
+    "synapse_canary_sample_count",
+    "Total resolutions scored within the canary evaluation window",
+    ["model_version"],
+)
+
+canary_promotion_total = Counter(
+    "synapse_canary_promotion_total",
+    "Number of times a candidate model was promoted to champion",
+    ["from_model", "to_model"],
+)

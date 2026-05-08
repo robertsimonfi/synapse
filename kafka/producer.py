@@ -34,6 +34,21 @@ logger = logging.getLogger(__name__)
 BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 
 
+def _kafka_tls_kwargs() -> dict:
+    """Return SSL kwargs for AIOKafkaProducer when mTLS is configured (Phase 12)."""
+    try:
+        from infra.secrets import get_kafka_ssl_context
+        ctx = get_kafka_ssl_context()
+        if ctx:
+            return {
+                "ssl_context":       ctx,
+                "security_protocol": os.getenv("KAFKA_SECURITY_PROTOCOL", "SSL"),
+            }
+    except Exception as exc:
+        logger.debug("Kafka TLS config unavailable: %s", exc)
+    return {}
+
+
 def _build_trace_headers() -> list[tuple[str, bytes]]:
     """
     Inject the current OTel span context into W3C traceparent/tracestate headers.
@@ -100,6 +115,7 @@ async def create_producer(ensure_topics: bool = True) -> AIOKafkaProducer:
         acks="all",                  # wait for all in-sync replicas
         enable_idempotence=True,     # exactly-once producer semantics
         compression_type="lz4",
+        **_kafka_tls_kwargs(),       # Phase 12: mTLS when KAFKA_SECURITY_PROTOCOL=SSL
     )
     await producer.start()
     return producer

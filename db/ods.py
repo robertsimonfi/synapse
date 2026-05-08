@@ -1,5 +1,5 @@
 """
-MongoDB Operational Data Store (ODS) — Phase 9.
+MongoDB Operational Data Store (ODS) — Phase 9 / Phase 12.
 
 Two collections:
   subscribers  — Golden JSON documents hydrated from Oracle by the Hydrator service.
@@ -10,6 +10,16 @@ Two collections:
 Provides both sync (pymongo) and async (motor) interfaces because:
   - agent/tools.py runs in a thread pool (sync)
   - hydrator/relay/executor are async coroutines
+
+Phase 12 — Sharding Strategy:
+  Shard key:  { opco_id: 1, customer_id: 1 }
+  Rationale:  opco_id provides balanced cardinality across regional shards; customer_id
+              as the sub-key ensures even distribution within each OpCo bucket.
+              All hot-path queries filter on opco_id first, so chunk-level locality
+              is preserved without scatter-gather fan-out.
+  Admin:      Run infra/mongo_sharding.js against mongos when promoting to a sharded
+              cluster.  The compound index created here doubles as the required
+              supporting index for the shard key.
 """
 
 from __future__ import annotations
@@ -58,22 +68,43 @@ def _async_motor_db():
 
 async def ensure_ods_indexes() -> None:
     db = _async_motor_db()
-    # subscribers
+    # subscribers — Phase 12: compound shard-key index first so it can be used
+    # directly as the shard key without a second supporting index.
+    await db.subscribers.create_index(
+        [("opco_id", pymongo.ASCENDING), ("customer_id", pymongo.ASCENDING)],
+        name="opco_customer_shard_key",
+    )
     await db.subscribers.create_index("customer_id", unique=True)
     await db.subscribers.create_index("profile.email", sparse=True)
     await db.subscribers.create_index("hydrated_at")
-    await db.subscribers.create_index("opco_id", sparse=True)  # Phase 11
+    await db.subscribers.create_index(
+        [("opco_id", pymongo.ASCENDING), ("hydrated_at", pymongo.DESCENDING)],
+        name="opco_hydrated_at",
+    )
+    # prefetch cache index — Phase 12
+    await db.subscribers.create_index(
+        [("opco_id", pymongo.ASCENDING), ("_prefetch_requested_at", pymongo.DESCENDING)],
+        name="opco_prefetch_ts",
+        sparse=True,
+    )
     # outbox
     await db.outbox.create_index([("status", 1), ("created_at", 1)])
     await db.outbox.create_index("action_id", unique=True)
     await db.outbox.create_index("correlation_id")
-    await db.outbox.create_index([("opco_id", 1), ("status", 1)])  # Phase 11
+    await db.outbox.create_index([("opco_id", 1), ("status", 1)])
     # dlq_events (Phase 10)
     await db.dlq_events.create_index([("status", 1), ("failed_at", -1)])
     await db.dlq_events.create_index("outbox_id", unique=True, sparse=True)
     await db.dlq_events.create_index("action_type")
-    await db.dlq_events.create_index([("opco_id", 1), ("status", 1)])  # Phase 11
-    logger.info("ODS indexes ensured (subscribers, outbox, dlq_events)")
+    await db.dlq_events.create_index([("opco_id", 1), ("status", 1)])
+    # canary_runs (Phase 12)
+    await db.canary_runs.create_index([("model_version", 1), ("started_at", -1)])
+    await db.canary_runs.create_index([("opco_id", 1), ("model_version", 1)])
+    await db.canary_runs.create_index("run_id", unique=True)
+    # force_sync_audit (Phase 12)
+    await db.force_sync_audit.create_index([("customer_id", 1), ("synced_at", -1)])
+    await db.force_sync_audit.create_index([("opco_id", 1), ("synced_at", -1)])
+    logger.info("ODS indexes ensured (subscribers, outbox, dlq_events, canary_runs, force_sync_audit)")
 
 
 # ── Sync subscriber helpers (used by agent/tools.py) ─────────────────────────
@@ -111,6 +142,67 @@ async def async_get_all_customer_ids() -> list[int]:
     db = _async_motor_db()
     cursor = db.subscribers.find({}, {"customer_id": 1, "_id": 0})
     return [doc["customer_id"] async for doc in cursor]
+
+
+async def async_get_customer_ids_by_opco(opco_id: str, limit: int = 5000) -> list[int]:
+    """Return all customer_ids for a given OpCo — used by predictive prefetch."""
+    db = _async_motor_db()
+    cursor = db.subscribers.find(
+        {"opco_id": opco_id},
+        {"customer_id": 1, "_id": 0},
+        limit=limit,
+    )
+    return [doc["customer_id"] async for doc in cursor]
+
+
+async def force_sync_customer(
+    customer_id: int,
+    opco_id: str,
+    operator_id: str,
+    justification: str,
+) -> Optional[dict]:
+    """
+    Phase 12 — Force Sync: bypass Kafka and rebuild the subscriber document
+    directly from Oracle, then immediately upsert to MongoDB ODS.
+
+    This is the targeted per-customer override for when the Kafka circuit
+    breaker is SYSTEM_STALE. The Kafka pipeline recovers independently;
+    this call gives NOC operators fresh data for a specific subscriber
+    without waiting for lag to drain.
+
+    Returns the freshly upserted document, or None if the customer does not
+    exist in Oracle.
+    """
+    import asyncio
+    from db.ods import build_subscriber_doc, mask_subscriber_pii
+
+    doc = await asyncio.to_thread(build_subscriber_doc, customer_id)
+    if doc is None:
+        return None
+
+    doc["opco_id"] = opco_id
+    doc, masked_count = mask_subscriber_pii(doc)
+    doc["_force_synced_at"] = datetime.now(timezone.utc).isoformat()
+    doc["_force_synced_by"] = operator_id
+
+    await async_upsert_subscriber(doc)
+
+    # Persist audit trail
+    db = _async_motor_db()
+    await db.force_sync_audit.insert_one({
+        "customer_id":   customer_id,
+        "opco_id":       opco_id,
+        "operator_id":   operator_id,
+        "justification": justification,
+        "pii_masked":    masked_count,
+        "synced_at":     datetime.now(timezone.utc),
+    })
+
+    logger.info(
+        "Force-sync: customer_id=%s opco=%s by=%s pii_masked=%d",
+        customer_id, opco_id, operator_id, masked_count,
+    )
+    return doc
 
 
 # ── Outbox helpers ─────────────────────────────────────────────────────────────

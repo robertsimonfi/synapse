@@ -27,6 +27,22 @@ logger = logging.getLogger(__name__)
 BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 
 
+def _kafka_tls_kwargs() -> dict:
+    """Return SSL kwargs for AIOKafkaConsumer when mTLS is configured (Phase 12)."""
+    try:
+        from infra.secrets import get_kafka_ssl_context
+        import os as _os
+        ctx = get_kafka_ssl_context()
+        if ctx:
+            return {
+                "ssl_context":       ctx,
+                "security_protocol": _os.getenv("KAFKA_SECURITY_PROTOCOL", "SSL"),
+            }
+    except Exception as exc:
+        logger.debug("Kafka TLS config unavailable: %s", exc)
+    return {}
+
+
 async def create_consumer(
     *topics: str,
     group_id: str,
@@ -47,6 +63,7 @@ async def create_consumer(
         value_deserializer=lambda raw: json.loads(raw.decode("utf-8")),
         session_timeout_ms=30_000,
         heartbeat_interval_ms=10_000,
+        **_kafka_tls_kwargs(),       # Phase 12: mTLS when KAFKA_SECURITY_PROTOCOL=SSL
     )
     await consumer.start()
     logger.info(

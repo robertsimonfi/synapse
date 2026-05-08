@@ -42,6 +42,48 @@ class OracleCdcEvent(BaseModel):
     source_schema: str = "TELCO"
     trace_id:      Optional[str] = None  # Phase 10: W3C traceparent
     opco_id:       Optional[str] = None  # Phase 11: operational company for multi-tenancy
+    metadata:      dict[str, Any] = Field(default_factory=dict)  # Phase 12: prefetch/canary tags
+
+    class Config:
+        json_encoders = {datetime: lambda v: v.isoformat()}
+
+
+# ── synapse.system.events — HIGH_SIGNAL (Phase 12) ────────────────────────────
+
+class HighSignalEvent(BaseModel):
+    """Published by CDC producer or external alerting when a sector-wide event warrants prefetch."""
+
+    event_id:       str = Field(default_factory=lambda: str(uuid.uuid4()))
+    event_type:     str = "HIGH_SIGNAL"
+    signal_type:    Literal["OUTAGE", "MASS_FALLOUT", "CRITICAL_SPIKE"]
+    opco_id:        str
+    sector:         Optional[str]  = None   # e.g. "HLR-East", "BSSv2-South"
+    affected_count: Optional[int]  = None   # estimated impacted subscribers
+    source:         str            = "cdc_producer"
+    ts:             str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    trace_id:       Optional[str]  = None
+
+    class Config:
+        json_encoders = {datetime: lambda v: v.isoformat()}
+
+
+# ── synapse.canary.results (Phase 12) ─────────────────────────────────────────
+
+class CanaryResult(BaseModel):
+    """Published after each resolution; consumed by the Canary Analyzer."""
+
+    result_id:      str = Field(default_factory=lambda: str(uuid.uuid4()))
+    correlation_id: str
+    model_version:  str                     # e.g. "claude-sonnet-4-6", "claude-opus-4-7"
+    opco_id:        Optional[str]  = None
+    confidence:     str                     # HIGH / MEDIUM / LOW
+    action_count:   int            = 0
+    domain:         str            = ""
+    resolved_at:    str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    # Operator feedback (filled later via /canary/{result_id}/score)
+    operator_score: Optional[int]  = None   # 1 (poor) – 5 (excellent)
+    approved:       Optional[bool] = None   # True if at least one action was approved
+    trace_id:       Optional[str]  = None
 
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat()}

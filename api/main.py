@@ -29,6 +29,12 @@ Phase 10 — DLQ:
 Phase 11 — Real-time NOC Dashboard:
   WS   /ws/noc/{opco_id}           — Live event stream per OpCo (or "ALL")
 
+Phase 12 — Advanced Reliability:
+  POST /customer/{customer_id}/force-sync — Bypass Kafka; rebuild ODS doc from Oracle
+  GET  /canary/status              — Head-to-head champion vs. candidate model KPIs
+  POST /canary/promote             — Promote candidate model to 100% traffic
+  POST /canary/{result_id}/score   — Backfill operator quality score onto a canary result
+
 Observability:
   GET  /metrics                    — Prometheus metrics (scraped by Prometheus)
 """
@@ -55,6 +61,7 @@ from agent.agent import (
 from agent.memory import memory_stats
 from api.security import require_api_key
 from api.websocket_manager import manager as ws_manager, noc_event, VALID_OPCO_IDS
+from api.canary_routes import router as canary_router  # Phase 12
 from models.action import ApproveRequest, ForceApproveRequest, RejectRequest
 from rag.knowledge_base import ingest_runbooks
 
@@ -110,6 +117,9 @@ app.add_middleware(
 
 # Mount Prometheus metrics at /metrics
 app.mount("/metrics", make_asgi_app())
+
+# Phase 12: canary analysis routes
+app.include_router(canary_router)
 
 
 # ── Resolve schemas ────────────────────────────────────────────────────────────
@@ -823,6 +833,101 @@ async def acknowledge_dlq_event_endpoint(
     from db.ods import acknowledge_dlq_event
     await acknowledge_dlq_event(outbox_id, body.operator_id)
     return {"status": "acknowledged", "outbox_id": outbox_id, "by": body.operator_id}
+
+
+# ── Phase 12: Force Sync — per-customer Oracle bypass for SYSTEM_STALE state ──
+#
+# Design rationale (architect-to-architect):
+#   When the Kafka circuit breaker trips (SYSTEM_STALE), the NOC has two options:
+#     A) Wait for the pipeline to drain naturally — correct for bulk traffic.
+#     B) Force-sync a specific customer — correct when an agent is on the call NOW.
+#
+#   This endpoint implements (B): a point-lookup override that fetches ONE
+#   subscriber directly from Oracle, tokenises PII, and writes to MongoDB ODS,
+#   bypassing Kafka entirely.  The Kafka pipeline continues recovering in
+#   parallel — this does NOT reset the consumer offset or flush the queue.
+#
+#   Force-sync requires an operator justification and produces an audit entry
+#   so the action is fully traceable, identical to force-approve on actions.
+
+
+class ForceSyncRequest(BaseModel):
+    opco_id:       str = Field("DEFAULT", description="OpCo for multi-tenancy isolation")
+    operator_id:   str = Field(..., description="Operator triggering the override")
+    justification: str = Field(..., description="Reason for bypassing the Kafka pipeline")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "opco_id":       "VODAFONE_UK",
+                "operator_id":   "noc-lead@vodafone.com",
+                "justification": "Customer on live call — Kafka lag at 480s, need fresh ODS now",
+            }
+        }
+    }
+
+
+@app.post("/customer/{customer_id}/force-sync", tags=["System"])
+async def force_sync_customer_endpoint(
+    customer_id: int,
+    body: ForceSyncRequest,
+    _: str = Security(require_api_key),
+):
+    """
+    Phase 12 — Force Sync: rebuild a subscriber's ODS document directly from Oracle.
+
+    Use this when the Kafka circuit breaker is SYSTEM_STALE and a specific customer
+    is on a live call.  The Kafka pipeline recovery is NOT affected; this is a
+    targeted point-lookup override for a single subscriber.
+
+    Requires a mandatory justification for the audit trail.
+    Returns the freshly hydrated (PII-masked) subscriber document.
+    """
+    _require_mongo()
+    from db.ods import force_sync_customer
+    from observability.metrics import force_sync_total
+
+    doc = await force_sync_customer(
+        customer_id=customer_id,
+        opco_id=body.opco_id,
+        operator_id=body.operator_id,
+        justification=body.justification,
+    )
+
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Customer {customer_id} not found in Oracle",
+        )
+
+    force_sync_total.labels(opco_id=body.opco_id).inc()
+
+    # Broadcast to NOC so other operators see the override
+    await ws_manager.broadcast(
+        body.opco_id,
+        noc_event(
+            "force_sync",
+            body.opco_id,
+            customer_id=customer_id,
+            operator_id=body.operator_id,
+            hydrated_at=doc.get("_force_synced_at"),
+        ),
+    )
+
+    logger.warning(
+        "Force-sync: customer_id=%s opco=%s by=%s reason=%s",
+        customer_id, body.opco_id, body.operator_id, body.justification,
+    )
+
+    return {
+        "status":          "force_synced",
+        "customer_id":     customer_id,
+        "opco_id":         body.opco_id,
+        "hydrated_at":     doc.get("_force_synced_at"),
+        "pii_fields_masked": sum(
+            1 for v in str(doc).split("[PII:") if ":" in v
+        ),
+    }
 
 
 # ── Phase 11: Real-time NOC WebSocket dashboard ────────────────────────────────
