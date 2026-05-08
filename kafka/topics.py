@@ -12,6 +12,7 @@ TOPIC_CDC_ALL_CHANGES  = "oracle.cdc.all_changes"
 TOPIC_AI_ORCHESTRATION = "ai.orchestration.tasks"
 TOPIC_WRITEBACK        = "legacy.commands.writeback"
 TOPIC_DLQ              = "legacy.commands.dlq"
+TOPIC_SYSTEM_EVENTS    = "synapse.system.events"   # Phase 11: SYSTEM_STALE + health signals
 
 # Partition count sized for horizontal scale; replication_factor=1 for local dev.
 # In production: replication_factor >= 3, min.insync.replicas = 2.
@@ -20,6 +21,7 @@ TOPIC_CONFIGS: dict[str, dict] = {
     TOPIC_AI_ORCHESTRATION: {"num_partitions": 3, "replication_factor": 1},
     TOPIC_WRITEBACK:        {"num_partitions": 3, "replication_factor": 1},
     TOPIC_DLQ:              {"num_partitions": 3, "replication_factor": 1},
+    TOPIC_SYSTEM_EVENTS:    {"num_partitions": 1, "replication_factor": 1},
 }
 
 # Consumer group IDs

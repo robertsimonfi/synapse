@@ -41,6 +41,7 @@ class OracleCdcEvent(BaseModel):
     commit_ts:     str = Field(default_factory=lambda: datetime.utcnow().isoformat())
     source_schema: str = "TELCO"
     trace_id:      Optional[str] = None  # Phase 10: W3C traceparent
+    opco_id:       Optional[str] = None  # Phase 11: operational company for multi-tenancy
 
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat()}
@@ -72,6 +73,7 @@ class OrchestrationTask(BaseModel):
 
     published_at:     str = Field(default_factory=lambda: datetime.utcnow().isoformat())
     trace_id:         Optional[str] = None  # Phase 10: W3C traceparent
+    opco_id:          Optional[str] = None  # Phase 11: operational company for multi-tenancy
 
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat()}
@@ -103,6 +105,7 @@ class WritebackCommand(BaseModel):
     outbox_id:      str
     published_at:   str = Field(default_factory=lambda: datetime.utcnow().isoformat())
     trace_id:       Optional[str] = None  # Phase 10: W3C traceparent
+    opco_id:        Optional[str] = None  # Phase 11: operational company for multi-tenancy
 
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat()}
@@ -134,6 +137,7 @@ class DlqEvent(BaseModel):
     attempts:       int             # Number of retries attempted
     failed_at:      str = Field(default_factory=lambda: datetime.utcnow().isoformat())
     trace_id:       Optional[str] = None  # W3C traceparent inherited from original command
+    opco_id:        Optional[str] = None  # Phase 11: operational company for multi-tenancy
 
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat()}

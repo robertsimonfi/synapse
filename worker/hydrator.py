@@ -39,6 +39,7 @@ from db.ods import (
     async_upsert_subscriber,
     build_subscriber_doc,
     ensure_ods_indexes,
+    mask_subscriber_pii,
 )
 from kafka.producer import create_producer, publish, current_trace_id
 from kafka.consumer import create_consumer, extract_trace_context
@@ -46,12 +47,19 @@ from kafka.schemas import OracleCdcEvent
 from kafka.topics import (
     GROUP_HYDRATOR,
     TOPIC_CDC_ALL_CHANGES,
+    TOPIC_SYSTEM_EVENTS,
+)
+from observability.metrics import (
+    kafka_consumer_lag_seconds,
+    kafka_circuit_breaker_stale,
+    pii_masked_fields_total,
 )
 
 logger = logging.getLogger(__name__)
 
-POLL_INTERVAL = int(os.getenv("HYDRATOR_POLL_INTERVAL", "30"))
-BATCH_SIZE    = int(os.getenv("HYDRATOR_BATCH_SIZE", "200"))
+POLL_INTERVAL          = int(os.getenv("HYDRATOR_POLL_INTERVAL",        "30"))
+BATCH_SIZE             = int(os.getenv("HYDRATOR_BATCH_SIZE",           "200"))
+LAG_THRESHOLD_SECONDS  = int(os.getenv("HYDRATOR_LAG_THRESHOLD_SECONDS","300"))
 
 # ── CDC checkpoint (in-memory, persisted to a simple file for crash recovery) ──
 
@@ -167,8 +175,11 @@ async def _run_cdc_producer(producer) -> None:
 
 # ── CDC consumer / hydrator — builds Golden JSON and upserts to MongoDB ────────
 
-async def _run_hydrator_consumer() -> None:
+async def _run_hydrator_consumer(producer) -> None:
     """Consume CDC events and rebuild subscriber documents in MongoDB ODS."""
+    # producer is needed to publish SYSTEM_STALE events to TOPIC_SYSTEM_EVENTS
+    producer_ref = [producer]
+
     consumer = await create_consumer(
         TOPIC_CDC_ALL_CHANGES,
         group_id=GROUP_HYDRATOR,
@@ -179,6 +190,36 @@ async def _run_hydrator_consumer() -> None:
         async for msg in consumer:
             # Phase 10: resume distributed trace from Kafka message headers
             extract_trace_context(msg)
+
+            # ── Phase 11: Kafka lag circuit breaker ───────────────────────────
+            now_ms     = datetime.now(timezone.utc).timestamp() * 1000
+            lag_seconds = (now_ms - msg.timestamp) / 1000.0
+            kafka_consumer_lag_seconds.labels(
+                topic=TOPIC_CDC_ALL_CHANGES, group_id=GROUP_HYDRATOR
+            ).set(lag_seconds)
+
+            if lag_seconds > LAG_THRESHOLD_SECONDS:
+                kafka_circuit_breaker_stale.labels(topic=TOPIC_CDC_ALL_CHANGES).set(1)
+                logger.warning(
+                    "SYSTEM_STALE: Kafka consumer lag %.1fs exceeds threshold %ds — "
+                    "publishing system event and processing with reduced confidence",
+                    lag_seconds, LAG_THRESHOLD_SECONDS,
+                )
+                stale_event = {
+                    "event_type": "SYSTEM_STALE",
+                    "source": "hydrator",
+                    "topic": TOPIC_CDC_ALL_CHANGES,
+                    "lag_seconds": round(lag_seconds, 1),
+                    "threshold_seconds": LAG_THRESHOLD_SECONDS,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+                try:
+                    await publish(producer_ref[0], TOPIC_SYSTEM_EVENTS, stale_event, key="system_stale")
+                except Exception as exc:
+                    logger.warning("Failed to publish SYSTEM_STALE event: %s", exc)
+            else:
+                kafka_circuit_breaker_stale.labels(topic=TOPIC_CDC_ALL_CHANGES).set(0)
+            # ─────────────────────────────────────────────────────────────────
 
             event = msg.value  # already a dict via consumer's deserializer
             customer_id = (
@@ -196,8 +237,17 @@ async def _run_hydrator_consumer() -> None:
                     tid = current_trace_id()
                     if tid:
                         doc["last_sync_trace_id"] = tid
+
+                    # Phase 11: PII masking — tokenise before ODS write
+                    doc, masked_count = mask_subscriber_pii(doc)
+                    if masked_count:
+                        pii_masked_fields_total.labels(field_type="subscriber").inc(masked_count)
+
                     await async_upsert_subscriber(doc)
-                    logger.debug("Hydrated customer_id=%s trace_id=%s", customer_id, tid)
+                    logger.debug(
+                        "Hydrated customer_id=%s trace_id=%s pii_masked=%d lag=%.1fs",
+                        customer_id, tid, masked_count, lag_seconds,
+                    )
                 else:
                     logger.warning("build_subscriber_doc returned None for customer_id=%s", customer_id)
             except Exception as exc:
@@ -257,7 +307,7 @@ async def run_hydrator() -> None:
         await _bulk_backfill(producer)
         await asyncio.gather(
             _run_cdc_producer(producer),
-            _run_hydrator_consumer(),
+            _run_hydrator_consumer(producer),
         )
     finally:
         await producer.stop()

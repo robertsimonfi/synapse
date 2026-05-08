@@ -14,6 +14,7 @@ Provides both sync (pymongo) and async (motor) interfaces because:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -61,14 +62,17 @@ async def ensure_ods_indexes() -> None:
     await db.subscribers.create_index("customer_id", unique=True)
     await db.subscribers.create_index("profile.email", sparse=True)
     await db.subscribers.create_index("hydrated_at")
+    await db.subscribers.create_index("opco_id", sparse=True)  # Phase 11
     # outbox
     await db.outbox.create_index([("status", 1), ("created_at", 1)])
     await db.outbox.create_index("action_id", unique=True)
     await db.outbox.create_index("correlation_id")
+    await db.outbox.create_index([("opco_id", 1), ("status", 1)])  # Phase 11
     # dlq_events (Phase 10)
     await db.dlq_events.create_index([("status", 1), ("failed_at", -1)])
     await db.dlq_events.create_index("outbox_id", unique=True, sparse=True)
     await db.dlq_events.create_index("action_type")
+    await db.dlq_events.create_index([("opco_id", 1), ("status", 1)])  # Phase 11
     logger.info("ODS indexes ensured (subscribers, outbox, dlq_events)")
 
 
@@ -126,6 +130,7 @@ async def create_outbox_entry(
     where_clause: dict,
     set_values: dict,
     source_version_anchor: Optional[str] = None,
+    opco_id: Optional[str] = None,
 ) -> str:
     """Insert a write-back command into the outbox. Returns the outbox document _id as str."""
     import uuid
@@ -141,6 +146,7 @@ async def create_outbox_entry(
         "where_clause":          where_clause,
         "set_values":            set_values,
         "source_version_anchor": source_version_anchor,
+        "opco_id":               opco_id,
         "status":                "PENDING",
         "retry_count":           0,
         "created_at":            datetime.now(timezone.utc),
@@ -149,7 +155,7 @@ async def create_outbox_entry(
         "error":                 None,
     }
     await db.outbox.insert_one(doc)
-    logger.info("Outbox entry created outbox_id=%s action_id=%s", outbox_id, action_id)
+    logger.info("Outbox entry created outbox_id=%s action_id=%s opco_id=%s", outbox_id, action_id, opco_id)
     return outbox_id
 
 
@@ -217,6 +223,49 @@ async def acknowledge_dlq_event(outbox_id: str, operator_id: str) -> None:
             "acknowledged_at": datetime.now(timezone.utc).isoformat(),
         }},
     )
+
+
+# ── Phase 11: PII masking — Privacy by Design ─────────────────────────────────
+#
+# Deterministic SHA-256 tokenisation applied before any subscriber document
+# is written to the MongoDB ODS.  Same input always produces the same token
+# so cross-document correlation remains possible, but raw PII is never stored.
+#
+# Token format:  [PII:<CATEGORY>:<12-HEX>]
+
+def _pii_token(value: str, category: str) -> str:
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12].upper()
+    return f"[PII:{category}:{digest}]"
+
+
+def mask_subscriber_pii(doc: dict) -> tuple[dict, int]:
+    """
+    Return a copy of *doc* with PII fields in profile and subscriptions tokenised.
+    Also returns the count of masked fields (for Prometheus).
+    """
+    masked_count = 0
+    doc = dict(doc)  # shallow copy; we mutate profile and subscriptions below
+
+    # ── Profile PII ───────────────────────────────────────────────────────────
+    profile = dict(doc.get("profile") or {})
+    for field, category in (("email", "EMAIL"), ("phone", "PHONE")):
+        if profile.get(field):
+            profile[field] = _pii_token(profile[field], category)
+            masked_count += 1
+    doc["profile"] = profile
+
+    # ── Subscription PII (MSISDN, IMSI, ICC_ID) ──────────────────────────────
+    masked_subs = []
+    for sub in doc.get("subscriptions") or []:
+        sub = dict(sub)
+        for field, category in (("msisdn", "PHONE"), ("imsi", "IMSI"), ("icc_id", "ICC")):
+            if sub.get(field):
+                sub[field] = _pii_token(sub[field], category)
+                masked_count += 1
+        masked_subs.append(sub)
+    doc["subscriptions"] = masked_subs
+
+    return doc, masked_count
 
 
 # ── Subscriber document builder (used by hydrator) ────────────────────────────

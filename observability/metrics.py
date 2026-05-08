@@ -47,3 +47,23 @@ pending_queue_depth = Gauge(
     "synapse_pending_queue_depth",
     "Current number of actions sitting in PENDING state awaiting human review",
 )
+
+# ── Phase 11: Kafka consumer lag & PII masking ────────────────────────────────
+
+kafka_consumer_lag_seconds = Gauge(
+    "synapse_kafka_consumer_lag_seconds",
+    "Estimated consumer lag in seconds (producer timestamp → consumed timestamp) per topic-group",
+    ["topic", "group_id"],
+)
+
+kafka_circuit_breaker_stale = Gauge(
+    "synapse_kafka_circuit_breaker_stale",
+    "1 when the hydrator circuit breaker is SYSTEM_STALE (lag > threshold), 0 when HEALTHY",
+    ["topic"],
+)
+
+pii_masked_fields_total = Counter(
+    "synapse_pii_masked_fields_total",
+    "Total number of PII field values tokenised before MongoDB ODS write",
+    ["field_type"],
+)
