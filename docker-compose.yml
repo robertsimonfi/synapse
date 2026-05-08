@@ -259,6 +259,57 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ── Phase 12: Predictive Hydration — prefetch service ───────────────────────
+
+  prefetch:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telco-agent:local
+    container_name: synapse-prefetch
+    command: ["python", "-m", "worker.prefetch"]
+    environment:
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB: synapse
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      PREFETCH_CONCURRENCY: "50"
+      PREFETCH_MAX_CUSTOMERS: "2000"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      hydrator:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── Phase 12: Canary Analysis — model quality scoring consumer ───────────────
+
+  canary:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telco-agent:local
+    container_name: synapse-canary
+    command: ["python", "-m", "worker.canary"]
+    environment:
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB: synapse
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      CANARY_WINDOW_MINUTES: "60"
+      CANARY_MIN_SUCCESS_RATE: "0.85"
+      CANARY_MIN_SAMPLES: "100"
+      # Set these when you want to A/B test a new model:
+      # CANARY_CHAMPION_MODEL: claude-sonnet-4-6
+      # CANARY_CANDIDATE_MODEL: claude-opus-4-7
+      # CANARY_CANDIDATE_TRAFFIC_PCT: "10"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
   ui:
     build:
       context: .
