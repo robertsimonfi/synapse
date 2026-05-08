@@ -1,20 +1,33 @@
 """
-Telco Fallout Resolution Agent — FastAPI REST layer.
+Synapse — Telco Fallout Resolution Agent — FastAPI REST + WebSocket layer.
 
 Endpoints:
   POST /resolve                    — Analyze a fallout; persist action proposals to MongoDB
+  POST /customer-360               — Comprehensive customer profile (with opco_id)
   GET  /health                     — Health check
+  GET  /system/status              — Circuit breaker state + WebSocket connections  (Phase 11)
   GET  /memory/stats               — Memory store statistics
   POST /memory/ingest              — Re-ingest runbooks into ChromaDB
-  POST /customer-360               — Comprehensive customer profile
 
 HITL action management:
   GET  /actions                    — List actions (filter by ?status=PENDING)
   GET  /actions/depths             — Queue depth per status
   GET  /actions/{id}               — Single action detail
   POST /actions/{id}/approve       — Operator approves an action
+  POST /actions/{id}/force-approve — Force-execute ESCALATED_STALE actions (Phase 10)
   POST /actions/{id}/reject        — Operator rejects an action (reason required)
   GET  /actions/{id}/audit         — Full audit trail for an action
+
+Phase 7 — Proactive Engagement:
+  GET  /engagements                — List engagement log entries
+  POST /webhooks/customer-reply    — Inbound customer reply from SMS/Email gateway
+
+Phase 10 — DLQ:
+  GET  /dlq                        — List Dead Letter Queue events
+  POST /dlq/{outbox_id}/acknowledge — Mark DLQ event as acknowledged
+
+Phase 11 — Real-time NOC Dashboard:
+  WS   /ws/noc/{opco_id}           — Live event stream per OpCo (or "ALL")
 
 Observability:
   GET  /metrics                    — Prometheus metrics (scraped by Prometheus)
@@ -25,12 +38,13 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Security
+from fastapi import FastAPI, HTTPException, Security, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import make_asgi_app
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from agent.agent import (
     Customer360Input,
@@ -40,7 +54,8 @@ from agent.agent import (
 )
 from agent.memory import memory_stats
 from api.security import require_api_key
-from models.action import ApproveRequest, RejectRequest
+from api.websocket_manager import manager as ws_manager, noc_event, VALID_OPCO_IDS
+from models.action import ApproveRequest, ForceApproveRequest, RejectRequest
 from rag.knowledge_base import ingest_runbooks
 
 logger = logging.getLogger(__name__)
@@ -108,6 +123,14 @@ class ResolveRequest(BaseModel):
     domain:        str             = Field("",   description="BSS, OSS, BILLING, NETWORK, etc.")
     severity:      str             = Field("MEDIUM", description="CRITICAL, HIGH, MEDIUM, LOW")
     free_text:     Optional[str]   = Field(None, description="Any additional operator context")
+    opco_id:       str             = Field("DEFAULT", description="OpCo for multi-tenancy isolation")
+
+    @field_validator("opco_id")
+    @classmethod
+    def validate_opco(cls, v: str) -> str:
+        if v not in VALID_OPCO_IDS:
+            raise ValueError(f"opco_id must be one of: {sorted(VALID_OPCO_IDS)}")
+        return v
 
     model_config = {
         "json_schema_extra": {
@@ -120,6 +143,7 @@ class ResolveRequest(BaseModel):
                 "domain": "PROVISIONING",
                 "severity": "HIGH",
                 "free_text": "Third retry attempt — still failing on HLR-East cluster",
+                "opco_id": "VODAFONE_UK",
             }
         }
     }
@@ -164,10 +188,22 @@ class MemoryStatsResponse(BaseModel):
 class Customer360Request(BaseModel):
     customer_id: int           = Field(..., description="Customer ID to build 360 profile for")
     query:       Optional[str] = Field(None, description="Specific question e.g. 'Why is my bill high?'")
+    opco_id:     str           = Field("DEFAULT", description="OpCo for multi-tenancy isolation")
+
+    @field_validator("opco_id")
+    @classmethod
+    def validate_opco(cls, v: str) -> str:
+        if v not in VALID_OPCO_IDS:
+            raise ValueError(f"opco_id must be one of: {sorted(VALID_OPCO_IDS)}")
+        return v
 
     model_config = {
         "json_schema_extra": {
-            "example": {"customer_id": 7, "query": "Why did my bill increase last month?"}
+            "example": {
+                "customer_id": 7,
+                "query": "Why did my bill increase last month?",
+                "opco_id": "VODAFONE_UK",
+            }
         }
     }
 
@@ -267,6 +303,31 @@ def health():
     return {"status": "ok", "version": "2.0.0"}
 
 
+@app.get("/system/status", tags=["System"])
+def system_status():
+    """NOC dashboard: WebSocket connections, circuit breaker state per OpCo."""
+    from observability.metrics import kafka_circuit_breaker_stale, kafka_consumer_lag_seconds
+    # Read the current Prometheus gauge values
+    try:
+        stale = kafka_circuit_breaker_stale.labels(topic="oracle.cdc.all_changes")._value.get()
+        lag   = kafka_consumer_lag_seconds.labels(
+            topic="oracle.cdc.all_changes", group_id="synapse-hydrator"
+        )._value.get()
+    except Exception:
+        stale, lag = None, None
+
+    return {
+        "circuit_breaker": {
+            "status":      "SYSTEM_STALE" if stale else "HEALTHY",
+            "lag_seconds": round(lag, 1) if lag is not None else None,
+            "threshold":   int(os.getenv("HYDRATOR_LAG_THRESHOLD_SECONDS", "300")),
+        },
+        "websocket_connections": ws_manager.connection_count(),
+        "connected_opcos":       ws_manager.connected_opcos(),
+        "version": "2.0.0",
+    }
+
+
 @app.get("/memory/stats", response_model=MemoryStatsResponse, tags=["Memory"])
 def get_memory_stats(_: str = Security(require_api_key)):
     return memory_stats()
@@ -337,6 +398,21 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
 
     classification = resolution.classification or {}
     critique       = resolution.critique or {}
+
+    # Phase 11: broadcast live event to NOC WebSocket subscribers
+    await ws_manager.broadcast(
+        request.opco_id,
+        noc_event(
+            "resolution_proposed",
+            request.opco_id,
+            correlation_id=correlation_id,
+            error_code=request.error_code,
+            domain=classification.get("domain", request.domain),
+            severity=classification.get("severity", request.severity),
+            confidence=resolution.confidence,
+            action_count=len(proposal_ids),
+        ),
+    )
 
     return ResolveResponse(
         correlation_id=correlation_id,
@@ -468,6 +544,80 @@ async def approve_action(
         "Action %s APPROVED by %s (correlation=%s)",
         action_id, body.operator_id, action.correlation_id,
     )
+    # Phase 11: broadcast to all NOC subscribers (action doesn't carry opco_id yet)
+    await ws_manager.broadcast(
+        "ALL",
+        noc_event(
+            "action_approved",
+            "ALL",
+            action_id=action_id,
+            action_type=action.action_type,
+            operator_id=body.operator_id,
+            correlation_id=action.correlation_id,
+        ),
+    )
+    return _action_to_out(updated)
+
+
+@app.post("/actions/{action_id}/force-approve", response_model=ActionOut, tags=["HITL"])
+async def force_approve_action(
+    action_id: str,
+    body: ForceApproveRequest,
+    _: str = Security(require_api_key),
+):
+    """
+    Phase 10 — Operator manual override for ESCALATED_STALE actions.
+
+    Transitions the action to FORCE_APPROVED, which the Executor picks up and
+    executes immediately, skipping the pre-flight drift check. Requires a
+    mandatory justification for the audit trail.
+    """
+    _require_mongo()
+    from db.mongo import get_action, transition_action
+    from models.action import ActionStatus
+
+    action = await get_action(action_id)
+    if not action:
+        raise HTTPException(status_code=404, detail=f"Action {action_id} not found")
+
+    if action.status != ActionStatus.ESCALATED_STALE:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Force-approve only applies to ESCALATED_STALE actions (current: {action.status})",
+        )
+
+    try:
+        updated = await transition_action(
+            action_id, action.version, ActionStatus.FORCE_APPROVED,
+            actor=body.operator_id,
+            extra_updates={"force_justification": body.justification},
+        )
+    except (ValueError, KeyError) as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    if updated is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Concurrent update detected — please refresh and try again.",
+        )
+
+    logger.warning(
+        "Action %s FORCE_APPROVED by %s — justification: %s",
+        action_id, body.operator_id, body.justification,
+    )
+    # Phase 11: broadcast — force-approve is a significant NOC event
+    await ws_manager.broadcast(
+        "ALL",
+        noc_event(
+            "force_approved",
+            "ALL",
+            action_id=action_id,
+            action_type=action.action_type,
+            operator_id=body.operator_id,
+            justification=body.justification,
+            correlation_id=action.correlation_id,
+        ),
+    )
     return _action_to_out(updated)
 
 
@@ -523,6 +673,198 @@ async def get_audit_trail_endpoint(action_id: str, _: str = Security(require_api
 
     events = await get_audit_trail(action_id)
     return [_audit_to_out(e) for e in events]
+
+
+# ── Phase 7: Engagement endpoints ─────────────────────────────────────────────
+
+
+class EngagementOut(BaseModel):
+    id:                   str
+    action_id:            str
+    correlation_id:       str
+    customer_id:          Optional[str]
+    channel:              str
+    template_used:        str
+    message_body:         str
+    recipient_masked:     str
+    sent_at:              Optional[str]
+    status:               str
+    customer_response:    str
+    response_text:        Optional[str]
+    response_received_at: Optional[str]
+    created_at:           str
+
+
+class CustomerReplyRequest(BaseModel):
+    correlation_id: str  = Field(..., description="Links reply to the original engagement")
+    reply_text:     str  = Field(..., description="Raw text of the customer's reply")
+    channel:        str  = Field("SMS", description="SMS | EMAIL | WHATSAPP")
+    from_address:   Optional[str] = Field(None, description="Phone/email of sender (for audit)")
+
+
+def _engagement_to_out(e) -> EngagementOut:
+    return EngagementOut(
+        id=e.id,
+        action_id=e.action_id,
+        correlation_id=e.correlation_id,
+        customer_id=e.customer_id,
+        channel=e.channel.value,
+        template_used=e.template_used,
+        message_body=e.message_body,
+        recipient_masked=e.recipient_masked,
+        sent_at=e.sent_at.isoformat() if e.sent_at else None,
+        status=e.status.value,
+        customer_response=e.customer_response.value,
+        response_text=e.response_text,
+        response_received_at=e.response_received_at.isoformat() if e.response_received_at else None,
+        created_at=e.created_at.isoformat(),
+    )
+
+
+@app.get("/engagements", response_model=list[EngagementOut], tags=["Engagement"])
+async def list_engagements_endpoint(
+    action_id:   Optional[str] = None,
+    customer_id: Optional[str] = None,
+    limit:       int = 100,
+    _: str = Security(require_api_key),
+):
+    """List engagement log entries, optionally filtered by action or customer."""
+    _require_mongo()
+    from db.mongo import list_engagements
+    logs = await list_engagements(limit=min(limit, 500), action_id=action_id, customer_id=customer_id)
+    return [_engagement_to_out(e) for e in logs]
+
+
+@app.post("/webhooks/customer-reply", tags=["Engagement"])
+async def customer_reply_webhook(request: CustomerReplyRequest):
+    """
+    Inbound customer reply hook — called by SMS/Email gateways.
+
+    Looks up the engagement by correlation_id, records the reply, and publishes
+    a CUSTOMER_FEEDBACK event to RabbitMQ so the Thinker can decide next steps.
+    No API key required so that gateway services can POST without credentials.
+    """
+    _require_mongo()
+    from datetime import timezone as _tz
+    from db.mongo import get_engagement_by_correlation, record_customer_response
+
+    engagement = await get_engagement_by_correlation(request.correlation_id)
+    if not engagement:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No engagement found for correlation_id={request.correlation_id}",
+        )
+
+    received_at = datetime.now(_tz.utc)
+    updated = await record_customer_response(engagement.id, request.reply_text, received_at)
+
+    # Publish CUSTOMER_FEEDBACK event to RabbitMQ so Thinker can react
+    rabbitmq_uri = os.getenv("RABBITMQ_URL")
+    if rabbitmq_uri:
+        try:
+            import aio_pika
+            connection = await aio_pika.connect_robust(rabbitmq_uri)
+            async with connection:
+                channel = await connection.channel()
+                import json
+                await channel.default_exchange.publish(
+                    aio_pika.Message(
+                        body=json.dumps({
+                            "event_type":     "CUSTOMER_FEEDBACK",
+                            "correlation_id": request.correlation_id,
+                            "action_id":      engagement.action_id,
+                            "customer_id":    engagement.customer_id,
+                            "reply_text":     request.reply_text,
+                            "channel":        request.channel,
+                            "received_at":    received_at.isoformat(),
+                        }).encode(),
+                    ),
+                    routing_key="incoming_events",
+                )
+            logger.info(
+                "CUSTOMER_FEEDBACK published correlation=%s action=%s",
+                request.correlation_id, engagement.action_id,
+            )
+        except Exception as exc:
+            logger.warning("RabbitMQ publish failed for feedback: %s", exc)
+
+    return {
+        "status":         "recorded",
+        "engagement_id":  updated.id if updated else engagement.id,
+        "customer_response": updated.customer_response.value if updated else "REPLIED",
+    }
+
+
+# ── Phase 10: DLQ endpoints ────────────────────────────────────────────────────
+
+@app.get("/dlq", tags=["DLQ"])
+async def list_dlq_events_endpoint(
+    status: str = "OPEN",
+    limit: int = 100,
+    _: str = Security(require_api_key),
+):
+    """
+    List Dead Letter Queue events.
+    status: OPEN | ACKNOWLEDGED | ALL
+    """
+    _require_mongo()
+    from db.ods import list_dlq_events
+    return await list_dlq_events(status=status, limit=min(limit, 500))
+
+
+@app.post("/dlq/{outbox_id}/acknowledge", tags=["DLQ"])
+async def acknowledge_dlq_event_endpoint(
+    outbox_id: str,
+    body: ApproveRequest,
+    _: str = Security(require_api_key),
+):
+    """Mark a DLQ event as acknowledged by an operator."""
+    _require_mongo()
+    from db.ods import acknowledge_dlq_event
+    await acknowledge_dlq_event(outbox_id, body.operator_id)
+    return {"status": "acknowledged", "outbox_id": outbox_id, "by": body.operator_id}
+
+
+# ── Phase 11: Real-time NOC WebSocket dashboard ────────────────────────────────
+
+@app.websocket("/ws/noc/{opco_id}")
+async def noc_websocket(websocket: WebSocket, opco_id: str):
+    """
+    Real-time NOC event stream — Phase 11.
+
+    Connect with your OpCo ID to receive live events scoped to your boundary.
+    Use "ALL" for a super-user view across all OpCos.
+
+    Valid opco_id values: VODAFONE_UK, VODAFONE_DE, VODAFONE_ES, VODAFONE_IT,
+                          DEFAULT, ALL
+
+    Event types pushed:
+      resolution_proposed  — agent completed analysis, actions awaiting review
+      action_approved      — operator approved an action
+      force_approved       — operator force-approved an ESCALATED_STALE action
+      dlq_acknowledged     — DLQ event acknowledged by NOC
+      system_stale         — Kafka consumer lag exceeded threshold
+      heartbeat            — keep-alive every 30 s
+    """
+    if opco_id not in VALID_OPCO_IDS and opco_id != "ALL":
+        await websocket.close(code=4008, reason=f"Unknown opco_id: {opco_id}")
+        return
+
+    await ws_manager.connect(websocket, opco_id)
+    try:
+        while True:
+            await asyncio.sleep(30)
+            await websocket.send_json(
+                noc_event(
+                    "heartbeat",
+                    opco_id,
+                    connections=ws_manager.connection_count(opco_id),
+                )
+            )
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket, opco_id)
+    except Exception:
+        ws_manager.disconnect(websocket, opco_id)
 
 
 # ── Dev runner ─────────────────────────────────────────────────────────────────

@@ -4,6 +4,7 @@ MongoDB async state store for the Synapse action pipeline.
 Collections:
   action_states       — One document per proposed action; status machine + optimistic locking.
   action_audit_trail  — Append-only audit log; one document per status transition.
+  engagement_log      — Phase 7: post-action customer notifications and their responses.
 """
 
 import logging
@@ -15,6 +16,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
 
 from models.action import ActionProposal, ActionStatus, AuditEvent, VALID_TRANSITIONS
+from models.engagement import CustomerResponse, EngagementLog, EngagementStatus
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,11 @@ async def ensure_indexes() -> None:
     await db[_CUSTOMERS_COLLECTION].create_index(
         [("segment", ASCENDING), ("churn_risk_score", DESCENDING)], background=True
     )
+    # Phase 7 — engagement log indexes
+    await db.engagement_log.create_index([("action_id", ASCENDING)])
+    await db.engagement_log.create_index([("correlation_id", ASCENDING)])
+    await db.engagement_log.create_index([("customer_id", ASCENDING)])
+    await db.engagement_log.create_index([("created_at", DESCENDING)])
     logger.info("MongoDB indexes ensured")
 
 
@@ -258,3 +265,72 @@ async def _append_audit(
     doc["previous_status"] = prev.value if prev else None
     doc["new_status"] = new.value
     await _db().action_audit_trail.insert_one(doc)
+
+
+# ── Phase 7: Engagement log helpers ──────────────────────────────────────────
+
+
+def _eng_to_doc(log: EngagementLog) -> dict:
+    d = log.model_dump()
+    d["_id"] = d.pop("id")
+    d["channel"]           = d["channel"].value           if hasattr(d["channel"], "value")           else d["channel"]
+    d["status"]            = d["status"].value             if hasattr(d["status"], "value")             else d["status"]
+    d["customer_response"] = d["customer_response"].value  if hasattr(d["customer_response"], "value")  else d["customer_response"]
+    return d
+
+
+def _eng_from_doc(doc: dict) -> EngagementLog:
+    d = dict(doc)
+    d["id"] = d.pop("_id")
+    return EngagementLog(**d)
+
+
+async def create_engagement(log: EngagementLog) -> EngagementLog:
+    await _db().engagement_log.insert_one(_eng_to_doc(log))
+    return log
+
+
+async def get_engagement(engagement_id: str) -> EngagementLog | None:
+    doc = await _db().engagement_log.find_one({"_id": engagement_id})
+    return _eng_from_doc(doc) if doc else None
+
+
+async def get_engagement_by_correlation(correlation_id: str) -> EngagementLog | None:
+    """Return the most recent engagement for a given correlation_id."""
+    doc = await _db().engagement_log.find_one(
+        {"correlation_id": correlation_id},
+        sort=[("created_at", DESCENDING)],
+    )
+    return _eng_from_doc(doc) if doc else None
+
+
+async def list_engagements(
+    limit: int = 100,
+    action_id: str | None = None,
+    customer_id: str | None = None,
+) -> list[EngagementLog]:
+    filt: dict[str, Any] = {}
+    if action_id:
+        filt["action_id"] = action_id
+    if customer_id:
+        filt["customer_id"] = customer_id
+    cursor = _db().engagement_log.find(filt).sort("created_at", DESCENDING).limit(limit)
+    return [_eng_from_doc(d) async for d in cursor]
+
+
+async def record_customer_response(
+    engagement_id: str,
+    response_text: str,
+    received_at: datetime,
+) -> EngagementLog | None:
+    """Mark an engagement as REPLIED and store the customer's response text."""
+    result = await _db().engagement_log.find_one_and_update(
+        {"_id": engagement_id},
+        {"$set": {
+            "customer_response":    CustomerResponse.REPLIED.value,
+            "response_text":        response_text,
+            "response_received_at": received_at,
+        }},
+        return_document=ReturnDocument.AFTER,
+    )
+    return _eng_from_doc(result) if result else None

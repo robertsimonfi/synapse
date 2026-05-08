@@ -71,20 +71,29 @@ def render_sidebar() -> str:
     st.sidebar.divider()
 
     depths = _get("/actions/depths") or {}
-    pending  = depths.get("PENDING",   0)
-    approved = depths.get("APPROVED",  0)
-    exec_    = depths.get("EXECUTED",  0)
-    failed   = depths.get("FAILED",    0)
-    expired  = depths.get("EXPIRED",   0)
-    rejected = depths.get("REJECTED",  0)
+    pending          = depths.get("PENDING",          0)
+    approved         = depths.get("APPROVED",         0)
+    exec_            = depths.get("EXECUTED",         0)
+    failed           = depths.get("FAILED",           0)
+    expired          = depths.get("EXPIRED",          0)
+    rejected         = depths.get("REJECTED",         0)
+    stale            = depths.get("STALE",            0)
+    escalated_stale  = depths.get("ESCALATED_STALE",  0)
 
     col1, col2 = st.sidebar.columns(2)
     col1.metric("Pending",  pending,  delta=None)
     col2.metric("Approved", approved, delta=None)
     col1.metric("Executed", exec_)
-    col2.metric("Failed",   failed,   delta=failed if failed else None, delta_color="inverse")
+    col2.metric("Failed",   failed,   delta=failed  if failed  else None, delta_color="inverse")
     col1.metric("Expired",  expired,  delta=expired if expired else None, delta_color="inverse")
     col2.metric("Rejected", rejected)
+
+    # Phase 8 — Defensive Execution metrics
+    if stale or escalated_stale:
+        st.sidebar.divider()
+        col3, col4 = st.sidebar.columns(2)
+        col3.metric("Stale",     stale,           delta=stale           if stale           else None, delta_color="inverse")
+        col4.metric("Escalated", escalated_stale, delta=escalated_stale if escalated_stale else None, delta_color="inverse")
 
     st.sidebar.divider()
     operator_id = st.sidebar.text_input(
@@ -93,9 +102,11 @@ def render_sidebar() -> str:
         help="Required before approving or rejecting actions.",
     )
 
-    if pending > 5:
+    if escalated_stale:
+        st.sidebar.error(f"🚨 {escalated_stale} action(s) ESCALATED — human review required!")
+    elif pending > 5:
         st.sidebar.warning(f"⚠ {pending} actions awaiting review!")
-    elif pending == 0:
+    elif pending == 0 and escalated_stale == 0:
         st.sidebar.success("✅ Queue clear — no pending actions.")
 
     return operator_id
@@ -106,11 +117,14 @@ def render_sidebar() -> str:
 def render_main(operator_id: str) -> None:
     st.title("Action Review Queue")
 
-    tab_pending, tab_approved, tab_history, tab_failed = st.tabs([
+    tab_pending, tab_approved, tab_history, tab_failed, tab_stale, tab_dlq, tab_engagement = st.tabs([
         "⏳ Pending Review",
         "✅ Approved",
         "📋 History",
         "❌ Failed / Expired",
+        "⚠️ Stale / Escalated",
+        "☠️ DLQ",
+        "📣 Customer Engagement",
     ])
 
     with tab_pending:
@@ -171,6 +185,292 @@ def render_main(operator_id: str) -> None:
                     f"⌛ `{a['id'][:8]}` **{a['action_type']}** — "
                     f"created {a['created_at'][:10]}"
                 )
+
+    with tab_stale:
+        _render_stale_tab(operator_id)
+
+    with tab_dlq:
+        _render_dlq_tab(operator_id)
+
+    with tab_engagement:
+        _render_engagement_tab()
+
+
+# ── Stale / Escalated tab (Phase 8) ──────────────────────────────────────────
+
+def _render_stale_tab(operator_id: str) -> None:
+    st.subheader("Stale & Escalated Actions")
+    st.caption(
+        "Actions the Watchdog detected as stale (CRM state changed since analysis). "
+        "ESCALATED actions require manual operator decision — the circuit breaker fired."
+    )
+
+    col_stale, col_esc = st.columns(2)
+
+    with col_stale:
+        st.markdown("#### 🟡 Stale — Re-analysing")
+        st.caption("Marked STALE by Watchdog; a fresh analysis has been re-queued.")
+        actions = _get("/actions", status="STALE", limit=50) or []
+        if not actions:
+            st.info("No stale actions.")
+        for a in actions:
+            reanalysis = a.get("reanalysis_count", 0)
+            reason     = a.get("stale_reason", "unknown reason")
+            with st.expander(
+                f"🟡 `{a['id'][:8]}` **{a['action_type']}** "
+                f"— attempt {reanalysis}/2",
+                expanded=False,
+            ):
+                st.markdown(f"**Action ID:** `{a['id']}`")
+                st.markdown(f"**Type:** `{a['action_type']}`")
+                st.markdown(f"**Customer:** `{a.get('customer_id', '—')}`")
+                st.markdown(f"**Order:** `{a.get('order_id', '—')}`")
+                st.markdown(f"**Re-analysis attempt:** {reanalysis} / 2")
+                st.warning(f"**Drift reason:** {reason}")
+                st.caption(f"Created: {a.get('created_at', '—')[:19]}")
+
+    with col_esc:
+        st.markdown("#### 🔴 Escalated — Human Review Required")
+        st.caption(
+            "Watchdog circuit breaker fired. The account state is too volatile "
+            "for autonomous re-analysis. Operator may force-execute if the drift "
+            "is a known artefact (e.g. caching, in-flight payment clearing)."
+        )
+        actions = _get("/actions", status="ESCALATED_STALE", limit=50) or []
+        if not actions:
+            st.info("No escalated actions.")
+        for a in actions:
+            action_id = a["id"]
+            reason    = a.get("stale_reason", "unknown reason")
+            with st.expander(
+                f"🔴 `{action_id[:8]}` **{a['action_type']}** — ESCALATED",
+                expanded=True,
+            ):
+                st.markdown(f"**Action ID:** `{action_id}`")
+                st.markdown(f"**Type:** `{a['action_type']}`")
+                st.markdown(f"**Customer:** `{a.get('customer_id', '—')}`")
+                st.markdown(f"**Order:** `{a.get('order_id', '—')}`")
+                st.error(f"**Escalation reason:** {reason}")
+                st.markdown("**Original proposal:**")
+                st.json(a.get("action_payload", {}))
+                st.caption(f"Created: {a.get('created_at', '—')[:19]}")
+
+                # ── Phase 10: Force Execute override ─────────────────────────
+                st.divider()
+                st.warning(
+                    "⚠️ **Force Execute** bypasses drift validation. "
+                    "Use only when you have confirmed the stale state is a known "
+                    "system artefact (e.g. cache lag, payment clearing delay)."
+                )
+                justification = st.text_area(
+                    "Justification (required — min 10 chars)",
+                    key=f"justification_{action_id}",
+                    placeholder="e.g. Confirmed with Network Ops — state drift is CDN cache lag, safe to proceed.",
+                    height=80,
+                )
+                if st.button(
+                    "🚨 Force Execute (bypass drift check)",
+                    key=f"force_{action_id}",
+                    type="primary",
+                ):
+                    if not operator_id:
+                        st.error("Set your Operator ID in the sidebar first.")
+                    elif not justification or len(justification.strip()) < 10:
+                        st.error("Provide a meaningful justification (min 10 chars).")
+                    else:
+                        result = _post(
+                            f"/actions/{action_id}/force-approve",
+                            {"operator_id": operator_id, "justification": justification},
+                        )
+                        if result:
+                            st.success(
+                                f"Action {action_id[:8]} marked FORCE_APPROVED — "
+                                "Executor will pick it up on the next poll cycle."
+                            )
+                            st.rerun()
+
+
+# ── DLQ tab (Phase 10) ────────────────────────────────────────────────────────
+
+def _render_dlq_tab(operator_id: str) -> None:
+    st.subheader("Dead Letter Queue — Failed Oracle Write-backs")
+    st.caption(
+        "Commands that exhausted all retry attempts in the Oracle Adapter. "
+        "Each entry represents a failed Oracle DML that needs manual repair or deliberate discard."
+    )
+
+    col_filter, col_refresh = st.columns([3, 1])
+    with col_filter:
+        status_filter = st.selectbox(
+            "Filter by status", ["OPEN", "ACKNOWLEDGED", "ALL"], index=0
+        )
+    with col_refresh:
+        st.write("")
+        st.button("🔄 Refresh", key="dlq_refresh")
+
+    events = _get("/dlq", status=status_filter, limit=200) or []
+
+    if not events:
+        st.info("No DLQ events — write-back pipeline is healthy.")
+        return
+
+    open_count = sum(1 for e in events if e.get("status") == "OPEN")
+    ack_count  = sum(1 for e in events if e.get("status") == "ACKNOWLEDGED")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Open", open_count,  delta=open_count if open_count else None, delta_color="inverse")
+    m2.metric("Acknowledged", ack_count)
+    m3.metric("Total shown", len(events))
+
+    st.divider()
+
+    for evt in events:
+        outbox_id   = evt.get("outbox_id", evt.get("dlq_id", "?"))
+        action_type = evt.get("action_type", "unknown")
+        table       = evt.get("table_name", "?")
+        attempts    = evt.get("attempts", "?")
+        status      = evt.get("status", "OPEN")
+        icon        = "🔴" if status == "OPEN" else "✅"
+
+        label = (
+            f"{icon} `{outbox_id[:8]}` **{action_type}** → `{table}` "
+            f"— {attempts} attempt(s) — {evt.get('failed_at', '?')[:19]}"
+        )
+        with st.expander(label, expanded=(status == "OPEN")):
+            col_meta, col_err = st.columns([1, 2])
+
+            with col_meta:
+                st.markdown(f"**Outbox ID:** `{outbox_id}`")
+                st.markdown(f"**Action ID:** `{evt.get('action_id', '—')}`")
+                st.markdown(f"**Correlation:** `{evt.get('correlation_id', '—')}`")
+                st.markdown(f"**Action type:** `{action_type}`")
+                st.markdown(f"**Table:** `{table}`")
+                st.markdown(f"**Attempts:** {attempts}")
+                st.markdown(f"**Status:** `{status}`")
+                trace_id = evt.get("trace_id")
+                if trace_id:
+                    st.markdown(f"**Trace ID:** `{trace_id}`")
+                st.caption(f"Failed at: {evt.get('failed_at', '—')[:19]}")
+
+            with col_err:
+                st.markdown("**Error context:**")
+                st.error(evt.get("error_context", "No error detail available."))
+                if evt.get("where_clause"):
+                    st.markdown("**WHERE clause:**")
+                    st.json(evt["where_clause"])
+                if evt.get("set_values"):
+                    st.markdown("**SET values:**")
+                    st.json(evt["set_values"])
+
+            if status == "OPEN":
+                st.divider()
+                if st.button(
+                    "✅ Acknowledge (mark as reviewed)",
+                    key=f"dlq_ack_{outbox_id}",
+                ):
+                    if not operator_id:
+                        st.error("Set your Operator ID in the sidebar first.")
+                    else:
+                        result = _post(
+                            f"/dlq/{outbox_id}/acknowledge",
+                            {"operator_id": operator_id},
+                        )
+                        if result:
+                            st.success("Event acknowledged.")
+                            st.rerun()
+
+
+# ── Customer Engagement tab ───────────────────────────────────────────────────
+
+_RESPONSE_ICON = {
+    "PENDING":  "⏳",
+    "ACCEPTED": "✅",
+    "DECLINED": "❌",
+    "REPLIED":  "💬",
+}
+
+_STATUS_ICON = {
+    "SENT":    "📤",
+    "PENDING": "🕐",
+    "FAILED":  "💥",
+}
+
+_CHANNEL_ICON = {
+    "SMS":      "📱",
+    "EMAIL":    "✉️",
+    "WHATSAPP": "💚",
+}
+
+
+def _render_engagement_tab() -> None:
+    st.subheader("Customer Engagement Log")
+    st.caption("Proactive notifications sent after action execution, and customer replies.")
+
+    col_filter, col_refresh = st.columns([4, 1])
+    with col_filter:
+        filter_action = st.text_input(
+            "Filter by Action ID (optional)", placeholder="paste action UUID prefix…"
+        )
+    with col_refresh:
+        st.write("")
+        refresh = st.button("🔄 Refresh")
+
+    logs = _get("/engagements", limit=100, **({"action_id": filter_action} if filter_action else {})) or []
+
+    if not logs:
+        st.info("No engagement records yet. They appear here after actions are executed.")
+        return
+
+    # Summary metrics row
+    total   = len(logs)
+    sent    = sum(1 for e in logs if e["status"] == "SENT")
+    replied = sum(1 for e in logs if e["customer_response"] == "REPLIED")
+    failed  = sum(1 for e in logs if e["status"] == "FAILED")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Sent", sent)
+    m2.metric("Replies Received", replied)
+    m3.metric("Delivery Failures", failed, delta=failed if failed else None, delta_color="inverse")
+    m4.metric("Total Engagements", total)
+
+    st.divider()
+
+    # Engagement cards
+    for eng in logs:
+        chan_icon = _CHANNEL_ICON.get(eng["channel"], "📨")
+        resp_icon = _RESPONSE_ICON.get(eng["customer_response"], "⏳")
+        stat_icon = _STATUS_ICON.get(eng["status"], "")
+        label     = (
+            f"{chan_icon} [{eng['channel']}] {stat_icon} {eng['status']} "
+            f"→ {resp_icon} {eng['customer_response']} "
+            f"— action `{eng['action_id'][:8]}` "
+            f"— {eng['created_at'][:10]}"
+        )
+        with st.expander(label, expanded=False):
+            col_info, col_msg = st.columns([1, 2])
+
+            with col_info:
+                st.markdown(f"**Engagement ID:** `{eng['id']}`")
+                st.markdown(f"**Action ID:** `{eng['action_id']}`")
+                st.markdown(f"**Correlation:** `{eng['correlation_id']}`")
+                st.markdown(f"**Customer ID:** `{eng.get('customer_id', '—')}`")
+                st.markdown(f"**Channel:** {chan_icon} `{eng['channel']}`")
+                st.markdown(f"**Template:** `{eng['template_used']}`")
+                st.markdown(f"**Recipient (masked):** `{eng['recipient_masked']}`")
+                st.markdown(f"**Sent at:** {eng.get('sent_at', '—')}")
+
+            with col_msg:
+                st.markdown("**Message sent to customer:**")
+                st.info(eng["message_body"])
+
+                if eng["customer_response"] != "PENDING":
+                    st.markdown(
+                        f"**Customer replied** ({resp_icon} `{eng['customer_response']}`) "
+                        f"at {eng.get('response_received_at', '—')[:19]}:"
+                    )
+                    st.success(eng.get("response_text", "_(no text)_"))
+                else:
+                    st.caption("Awaiting customer response…")
 
 
 # ── Action card ────────────────────────────────────────────────────────────────

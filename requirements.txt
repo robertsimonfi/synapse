@@ -17,8 +17,8 @@ oracledb>=2.3.0         # Oracle (production)
 motor>=3.3.0            # Async MongoDB driver
 pymongo>=4.6.0          # Sync driver used by motor; also needed for ReturnDocument
 
-# ── Message queue / Thinker service (Phase 3) ──────────────────────────────────
-aio-pika>=9.4.0         # Async RabbitMQ client
+# ── Message bus / Kafka (Phase 9 — replaces RabbitMQ) ─────────────────────────
+aiokafka>=0.11.0        # Async Kafka client (producer + consumer)
 
 # ── Observability (Phase 2) ────────────────────────────────────────────────────
 prometheus-client>=0.20.0
@@ -40,3 +40,8 @@ faker>=25.0.0
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0
+
+# ── Phase 7: Notification providers (optional — only needed for real dispatch) ──
+# twilio>=8.0.0        # Uncomment to enable TwilioProvider
+# sendgrid>=6.11.0     # Uncomment to enable SendGridProvider
+# aiohttp is already listed above and is used by the Twilio/SendGrid stubs
