@@ -45,7 +45,7 @@ from agent.agent import (
 )
 from agent.memory import memory_stats
 from api.security import require_api_key
-from models.action import ApproveRequest, RejectRequest
+from models.action import ApproveRequest, ForceApproveRequest, RejectRequest
 from rag.knowledge_base import ingest_runbooks
 
 logger = logging.getLogger(__name__)
@@ -476,6 +476,55 @@ async def approve_action(
     return _action_to_out(updated)
 
 
+@app.post("/actions/{action_id}/force-approve", response_model=ActionOut, tags=["HITL"])
+async def force_approve_action(
+    action_id: str,
+    body: ForceApproveRequest,
+    _: str = Security(require_api_key),
+):
+    """
+    Phase 10 — Operator manual override for ESCALATED_STALE actions.
+
+    Transitions the action to FORCE_APPROVED, which the Executor picks up and
+    executes immediately, skipping the pre-flight drift check. Requires a
+    mandatory justification for the audit trail.
+    """
+    _require_mongo()
+    from db.mongo import get_action, transition_action
+    from models.action import ActionStatus
+
+    action = await get_action(action_id)
+    if not action:
+        raise HTTPException(status_code=404, detail=f"Action {action_id} not found")
+
+    if action.status != ActionStatus.ESCALATED_STALE:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Force-approve only applies to ESCALATED_STALE actions (current: {action.status})",
+        )
+
+    try:
+        updated = await transition_action(
+            action_id, action.version, ActionStatus.FORCE_APPROVED,
+            actor=body.operator_id,
+            extra_updates={"force_justification": body.justification},
+        )
+    except (ValueError, KeyError) as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    if updated is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Concurrent update detected — please refresh and try again.",
+        )
+
+    logger.warning(
+        "Action %s FORCE_APPROVED by %s — justification: %s",
+        action_id, body.operator_id, body.justification,
+    )
+    return _action_to_out(updated)
+
+
 @app.post("/actions/{action_id}/reject", response_model=ActionOut, tags=["HITL"])
 async def reject_action(
     action_id: str,
@@ -648,6 +697,36 @@ async def customer_reply_webhook(request: CustomerReplyRequest):
         "engagement_id":  updated.id if updated else engagement.id,
         "customer_response": updated.customer_response.value if updated else "REPLIED",
     }
+
+
+# ── Phase 10: DLQ endpoints ────────────────────────────────────────────────────
+
+@app.get("/dlq", tags=["DLQ"])
+async def list_dlq_events_endpoint(
+    status: str = "OPEN",
+    limit: int = 100,
+    _: str = Security(require_api_key),
+):
+    """
+    List Dead Letter Queue events.
+    status: OPEN | ACKNOWLEDGED | ALL
+    """
+    _require_mongo()
+    from db.ods import list_dlq_events
+    return await list_dlq_events(status=status, limit=min(limit, 500))
+
+
+@app.post("/dlq/{outbox_id}/acknowledge", tags=["DLQ"])
+async def acknowledge_dlq_event_endpoint(
+    outbox_id: str,
+    body: ApproveRequest,
+    _: str = Security(require_api_key),
+):
+    """Mark a DLQ event as acknowledged by an operator."""
+    _require_mongo()
+    from db.ods import acknowledge_dlq_event
+    await acknowledge_dlq_event(outbox_id, body.operator_id)
+    return {"status": "acknowledged", "outbox_id": outbox_id, "by": body.operator_id}
 
 
 # ── Dev runner ─────────────────────────────────────────────────────────────────

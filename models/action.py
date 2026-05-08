@@ -2,12 +2,14 @@
 Action state machine models for the Synapse HITL pipeline.
 
 State transitions:
-  PENDING  → APPROVED | REJECTED | EXPIRED | STALE
-  APPROVED → EXECUTING | STALE
-  EXECUTING → EXECUTED | FAILED
-  FAILED → EXECUTING  (retry path)
-  STALE → ESCALATED_STALE  (Watchdog circuit breaker)
-  REJECTED, EXECUTED, EXPIRED, ESCALATED_STALE are terminal
+  PENDING          → APPROVED | REJECTED | EXPIRED | STALE
+  APPROVED         → EXECUTING | STALE
+  EXECUTING        → EXECUTED | FAILED
+  FAILED           → EXECUTING  (retry path)
+  STALE            → ESCALATED_STALE  (Watchdog circuit breaker)
+  ESCALATED_STALE  → FORCE_APPROVED   (Phase 10: operator manual override)
+  FORCE_APPROVED   → EXECUTING        (drift check skipped)
+  REJECTED, EXECUTED, EXPIRED are terminal
 """
 
 from datetime import datetime, timedelta
@@ -28,6 +30,7 @@ class ActionStatus(str, Enum):
     EXPIRED          = "EXPIRED"
     STALE            = "STALE"            # Phase 8: CRM state drifted before execution
     ESCALATED_STALE  = "ESCALATED_STALE"  # Phase 8: max re-analyses exceeded → human review
+    FORCE_APPROVED   = "FORCE_APPROVED"   # Phase 10: operator override bypasses drift check
 
 
 VALID_TRANSITIONS: dict[ActionStatus, set[ActionStatus]] = {
@@ -40,7 +43,9 @@ VALID_TRANSITIONS: dict[ActionStatus, set[ActionStatus]] = {
     ActionStatus.EXECUTED:        set(),
     ActionStatus.EXPIRED:         set(),
     ActionStatus.STALE:           {ActionStatus.ESCALATED_STALE},
-    ActionStatus.ESCALATED_STALE: set(),
+    # Phase 10: ESCALATED_STALE can be force-approved by an operator with explicit reason
+    ActionStatus.ESCALATED_STALE: {ActionStatus.FORCE_APPROVED},
+    ActionStatus.FORCE_APPROVED:  {ActionStatus.EXECUTING},
 }
 
 EXPIRY_HOURS = 4
@@ -129,6 +134,26 @@ class RejectRequest(BaseModel):
             "example": {
                 "operator_id": "operator-alice-42",
                 "reason": "Customer already has an active retry in progress via manual CRM.",
+            }
+        }
+    }
+
+
+class ForceApproveRequest(BaseModel):
+    """
+    Phase 10 — Manual override for ESCALATED_STALE actions.
+
+    Bypasses the drift pre-flight check in the Executor. Requires a mandatory
+    justification so every override is auditable.
+    """
+    operator_id:   str = Field(..., description="Identity of the operator forcing execution")
+    justification: str = Field(..., min_length=10, description="Mandatory reason for override")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "operator_id": "operator-alice-42",
+                "justification": "Confirmed with Network Ops team — stale state is a caching artefact. Safe to proceed.",
             }
         }
     }

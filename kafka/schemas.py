@@ -1,5 +1,5 @@
 """
-Pydantic-based message schemas for the three Synapse Kafka topics.
+Pydantic-based message schemas for the Synapse Kafka topics.
 
 These act as the "Schema Registry" contract — every producer validates its
 message against the appropriate schema before publishing, and every consumer
@@ -10,6 +10,12 @@ Topics → Schema classes:
   oracle.cdc.all_changes    → OracleCdcEvent
   ai.orchestration.tasks    → OrchestrationTask
   legacy.commands.writeback → WritebackCommand
+  legacy.commands.dlq       → DlqEvent  (Phase 10)
+
+Phase 10 — Schema Evolution:
+  All message types carry an optional trace_id (W3C traceparent) so the full
+  Oracle-CDC → Hydrator → AI Thinker → Executor → Oracle-Adapter path can be
+  reconstructed in a single distributed trace.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ class OracleCdcEvent(BaseModel):
     scn:           Optional[int]        = None   # Oracle System Change Number (simulated)
     commit_ts:     str = Field(default_factory=lambda: datetime.utcnow().isoformat())
     source_schema: str = "TELCO"
+    trace_id:      Optional[str] = None  # Phase 10: W3C traceparent
 
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat()}
@@ -64,6 +71,7 @@ class OrchestrationTask(BaseModel):
     stale_action_id:  Optional[str]  = None
 
     published_at:     str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    trace_id:         Optional[str] = None  # Phase 10: W3C traceparent
 
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat()}
@@ -94,6 +102,38 @@ class WritebackCommand(BaseModel):
 
     outbox_id:      str
     published_at:   str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    trace_id:       Optional[str] = None  # Phase 10: W3C traceparent
+
+    class Config:
+        json_encoders = {datetime: lambda v: v.isoformat()}
+
+
+# ── legacy.commands.dlq (Phase 10) ────────────────────────────────────────────
+
+class DlqEvent(BaseModel):
+    """
+    A failed Oracle write-back command routed to the Dead Letter Queue.
+    Published by oracle_adapter after MAX_RETRIES exhaustion.
+    Consumed by dlq_monitor which surfaces the event for NOC repair.
+    """
+
+    dlq_id:         str     = Field(default_factory=lambda: str(uuid.uuid4()))
+    source_topic:   str     = "legacy.commands.writeback"
+    # Original command fields (copied verbatim for full auditability)
+    command_id:     Optional[str] = None
+    outbox_id:      str
+    action_id:      str
+    correlation_id: str
+    action_type:    str
+    table_name:     str
+    where_clause:   dict[str, Any] = Field(default_factory=dict)
+    set_values:     dict[str, Any] = Field(default_factory=dict)
+    source_version_anchor: Optional[str] = None
+    # Failure metadata
+    error_context:  str             # Last exception message
+    attempts:       int             # Number of retries attempted
+    failed_at:      str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    trace_id:       Optional[str] = None  # W3C traceparent inherited from original command
 
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat()}

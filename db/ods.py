@@ -65,7 +65,11 @@ async def ensure_ods_indexes() -> None:
     await db.outbox.create_index([("status", 1), ("created_at", 1)])
     await db.outbox.create_index("action_id", unique=True)
     await db.outbox.create_index("correlation_id")
-    logger.info("ODS indexes ensured (subscribers, outbox)")
+    # dlq_events (Phase 10)
+    await db.dlq_events.create_index([("status", 1), ("failed_at", -1)])
+    await db.dlq_events.create_index("outbox_id", unique=True, sparse=True)
+    await db.dlq_events.create_index("action_type")
+    logger.info("ODS indexes ensured (subscribers, outbox, dlq_events)")
 
 
 # ── Sync subscriber helpers (used by agent/tools.py) ─────────────────────────
@@ -185,6 +189,33 @@ async def mark_outbox_failed(outbox_id: str, error: str) -> None:
             "$set":  {"status": "FAILED", "error": error},
             "$inc":  {"retry_count": 1},
         },
+    )
+
+
+# ── Phase 10: DLQ event helpers ───────────────────────────────────────────────
+
+async def list_dlq_events(status: str = "OPEN", limit: int = 100) -> list[dict]:
+    """Return DLQ events ordered newest-first."""
+    db = _async_motor_db()
+    cursor = db.dlq_events.find(
+        {"status": status} if status != "ALL" else {},
+        {"_id": 0},
+        sort=[("failed_at", pymongo.DESCENDING)],
+        limit=limit,
+    )
+    return [doc async for doc in cursor]
+
+
+async def acknowledge_dlq_event(outbox_id: str, operator_id: str) -> None:
+    """Mark a DLQ event as ACKNOWLEDGED by an operator."""
+    db = _async_motor_db()
+    await db.dlq_events.update_one(
+        {"outbox_id": outbox_id},
+        {"$set": {
+            "status": "ACKNOWLEDGED",
+            "acknowledged_by": operator_id,
+            "acknowledged_at": datetime.now(timezone.utc).isoformat(),
+        }},
     )
 
 

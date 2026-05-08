@@ -40,8 +40,8 @@ from db.ods import (
     build_subscriber_doc,
     ensure_ods_indexes,
 )
-from kafka.producer import create_producer, publish
-from kafka.consumer import create_consumer
+from kafka.producer import create_producer, publish, current_trace_id
+from kafka.consumer import create_consumer, extract_trace_context
 from kafka.schemas import OracleCdcEvent
 from kafka.topics import (
     GROUP_HYDRATOR,
@@ -177,6 +177,9 @@ async def _run_hydrator_consumer() -> None:
 
     try:
         async for msg in consumer:
+            # Phase 10: resume distributed trace from Kafka message headers
+            extract_trace_context(msg)
+
             event = msg.value  # already a dict via consumer's deserializer
             customer_id = (
                 event.get("primary_key", {}).get("CUSTOMER_ID")
@@ -189,8 +192,12 @@ async def _run_hydrator_consumer() -> None:
             try:
                 doc = await asyncio.to_thread(build_subscriber_doc, int(customer_id))
                 if doc:
+                    # Phase 10: stamp the trace_id so operators can click-to-trace
+                    tid = current_trace_id()
+                    if tid:
+                        doc["last_sync_trace_id"] = tid
                     await async_upsert_subscriber(doc)
-                    logger.debug("Hydrated customer_id=%s", customer_id)
+                    logger.debug("Hydrated customer_id=%s trace_id=%s", customer_id, tid)
                 else:
                     logger.warning("build_subscriber_doc returned None for customer_id=%s", customer_id)
             except Exception as exc:

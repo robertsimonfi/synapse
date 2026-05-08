@@ -288,25 +288,33 @@ async def _execute_action(action: ActionProposal) -> None:
     with traced_span("executor.execute_action", correlation_id=action.correlation_id,
                      attributes={"action.id": action.id, "action.type": action.action_type}):
 
-        # ── Phase 8: Pre-flight check (before acquiring the lock) ─────────────
-        # Runs APPROVED → STALE if CRM state has drifted since the agent's analysis.
-        # Only one executor replica will win the CAS; others will see the version
-        # mismatch and skip cleanly (same path as the EXECUTING lock contention).
-        drift_ok, drift_reason = await _pre_flight_check(action)
-        if not drift_ok:
-            stale = await transition_action(
-                action.id, action.version, ActionStatus.STALE,
-                actor=ACTOR,
-                extra_updates={"stale_reason": drift_reason},
-            )
-            if stale is not None:
-                logger.warning(
-                    "PRE_FLIGHT_STALE action=%s type=%s reason=%s",
-                    action.id, action.action_type, drift_reason,
-                )
-            return
+        force_mode = action.status == ActionStatus.FORCE_APPROVED
 
-        # Acquire execution lock via optimistic CAS: APPROVED → EXECUTING
+        if not force_mode:
+            # ── Phase 8: Pre-flight check (before acquiring the lock) ─────────
+            # Runs APPROVED → STALE if CRM state has drifted since the agent's analysis.
+            # Only one executor replica will win the CAS; others will see the version
+            # mismatch and skip cleanly (same path as the EXECUTING lock contention).
+            drift_ok, drift_reason = await _pre_flight_check(action)
+            if not drift_ok:
+                stale = await transition_action(
+                    action.id, action.version, ActionStatus.STALE,
+                    actor=ACTOR,
+                    extra_updates={"stale_reason": drift_reason},
+                )
+                if stale is not None:
+                    logger.warning(
+                        "PRE_FLIGHT_STALE action=%s type=%s reason=%s",
+                        action.id, action.action_type, drift_reason,
+                    )
+                return
+        else:
+            logger.warning(
+                "FORCE_EXECUTE action=%s type=%s — drift check skipped by operator override",
+                action.id, action.action_type,
+            )
+
+        # Acquire execution lock via optimistic CAS: APPROVED|FORCE_APPROVED → EXECUTING
         locked = await transition_action(
             action.id, action.version, ActionStatus.EXECUTING, actor=ACTOR
         )
@@ -423,13 +431,18 @@ async def _execute_action(action: ActionProposal) -> None:
 async def _poll_loop() -> None:
     while True:
         try:
-            approved = await list_actions(status=ActionStatus.APPROVED, limit=20)
-            pending  = await list_actions(status=ActionStatus.PENDING,  limit=1000)
+            approved       = await list_actions(status=ActionStatus.APPROVED,       limit=20)
+            force_approved = await list_actions(status=ActionStatus.FORCE_APPROVED, limit=20)
+            pending        = await list_actions(status=ActionStatus.PENDING,         limit=1000)
             pending_queue_depth.set(len(pending))
 
-            if approved:
-                logger.info("Executor: %d APPROVED action(s) to execute", len(approved))
-                await asyncio.gather(*[_execute_action(a) for a in approved])
+            to_execute = approved + force_approved
+            if to_execute:
+                logger.info(
+                    "Executor: %d APPROVED + %d FORCE_APPROVED action(s) to execute",
+                    len(approved), len(force_approved),
+                )
+                await asyncio.gather(*[_execute_action(a) for a in to_execute])
 
         except Exception:
             logger.exception("Executor poll loop error")

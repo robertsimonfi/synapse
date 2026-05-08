@@ -33,12 +33,62 @@ import os
 from typing import Any
 
 from db.ods import ensure_ods_indexes, mark_outbox_completed, mark_outbox_failed
-from kafka.consumer import create_consumer
-from kafka.topics import GROUP_ORACLE_ADAPTER, TOPIC_WRITEBACK
+from kafka.consumer import create_consumer, extract_trace_context
+from kafka.producer import create_producer, publish
+from kafka.schemas import DlqEvent
+from kafka.topics import GROUP_ORACLE_ADAPTER, TOPIC_DLQ, TOPIC_WRITEBACK
 
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = int(os.getenv("ORACLE_ADAPTER_MAX_RETRIES", "3"))
+
+_producer = None  # lazily initialised on first DLQ publish
+
+
+async def _get_producer():
+    global _producer
+    if _producer is None:
+        _producer = await create_producer(ensure_topics=True)
+    return _producer
+
+
+async def _publish_to_dlq(cmd: dict, error_context: str, attempts: int) -> None:
+    """
+    Route a poison-pill command to legacy.commands.dlq with full error context.
+    This prevents one bad message from blocking the entire write-back pipeline.
+    """
+    try:
+        event = DlqEvent(
+            source_topic="legacy.commands.writeback",
+            command_id=cmd.get("command_id"),
+            outbox_id=cmd.get("outbox_id", "unknown"),
+            action_id=cmd.get("action_id", "unknown"),
+            correlation_id=cmd.get("correlation_id", "unknown"),
+            action_type=cmd.get("action_type", "unknown"),
+            table_name=cmd.get("table_name", "unknown"),
+            where_clause=cmd.get("where_clause", {}),
+            set_values=cmd.get("set_values", {}),
+            source_version_anchor=cmd.get("source_version_anchor"),
+            error_context=error_context,
+            attempts=attempts,
+            trace_id=cmd.get("trace_id"),
+        )
+        producer = await _get_producer()
+        await publish(
+            producer,
+            TOPIC_DLQ,
+            event.model_dump(),
+            key=cmd.get("outbox_id", "unknown"),
+        )
+        logger.error(
+            "DLQ: published failed command outbox_id=%s action_type=%s error=%s",
+            event.outbox_id, event.action_type, error_context[:120],
+        )
+    except Exception as dlq_exc:
+        logger.critical(
+            "DLQ publish itself failed outbox_id=%s: %s — message is lost!",
+            cmd.get("outbox_id"), dlq_exc,
+        )
 
 
 # ── Action-type → Oracle DML mapping ──────────────────────────────────────────
@@ -240,18 +290,23 @@ async def _handle_command(cmd: dict) -> bool:
         await mark_outbox_completed(outbox_id)
         return True
 
+    last_error: str = ""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             await _execute_oracle_dml(sql, params, source_version_anchor, table_name, where_clause)
             await mark_outbox_completed(outbox_id)
             return True
         except Exception as exc:
+            last_error = str(exc)
             logger.error(
                 "Oracle DML attempt %d/%d failed outbox_id=%s: %s",
                 attempt, MAX_RETRIES, outbox_id, exc,
             )
             if attempt == MAX_RETRIES:
-                await mark_outbox_failed(outbox_id, str(exc))
+                # Mark MongoDB outbox as FAILED and route to DLQ — prevents
+                # this poison pill from blocking the write-back pipeline.
+                await mark_outbox_failed(outbox_id, last_error)
+                await _publish_to_dlq(cmd, last_error, attempts=MAX_RETRIES)
                 return False
             await asyncio.sleep(2 ** attempt)
 
@@ -271,11 +326,14 @@ async def run_oracle_adapter() -> None:
 
     try:
         async for msg in consumer:
+            # Phase 10: resume distributed trace from Kafka message headers
+            extract_trace_context(msg)
+
             cmd = msg.value
             outbox_id = cmd.get("outbox_id", "?")
             logger.info(
-                "Oracle Adapter received command outbox_id=%s action_type=%s",
-                outbox_id, cmd.get("action_type"),
+                "Oracle Adapter received command outbox_id=%s action_type=%s trace_id=%s",
+                outbox_id, cmd.get("action_type"), cmd.get("trace_id"),
             )
             try:
                 await _handle_command(cmd)

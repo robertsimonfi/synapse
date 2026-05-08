@@ -58,3 +58,22 @@ async def create_consumer(
 def parse_message(msg) -> dict[str, Any]:
     """Return the deserialized message value (already a dict after our deserializer)."""
     return msg.value if isinstance(msg.value, dict) else json.loads(msg.value)
+
+
+def extract_trace_context(msg) -> None:
+    """
+    Phase 10 — resume the OTel trace from a consumed Kafka message's headers.
+    Call at the top of a message handler to link consumer spans to the producer's trace.
+    No-op when tracing is not configured or headers are absent.
+    """
+    try:
+        from opentelemetry import propagate, context as otel_context
+        carrier = {
+            k: v.decode() if isinstance(v, bytes) else v
+            for k, v in (msg.headers or [])
+        }
+        if carrier:
+            ctx = propagate.extract(carrier)
+            otel_context.attach(ctx)
+    except Exception:
+        pass

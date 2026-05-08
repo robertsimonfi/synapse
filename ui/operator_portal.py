@@ -117,12 +117,13 @@ def render_sidebar() -> str:
 def render_main(operator_id: str) -> None:
     st.title("Action Review Queue")
 
-    tab_pending, tab_approved, tab_history, tab_failed, tab_stale, tab_engagement = st.tabs([
+    tab_pending, tab_approved, tab_history, tab_failed, tab_stale, tab_dlq, tab_engagement = st.tabs([
         "⏳ Pending Review",
         "✅ Approved",
         "📋 History",
         "❌ Failed / Expired",
         "⚠️ Stale / Escalated",
+        "☠️ DLQ",
         "📣 Customer Engagement",
     ])
 
@@ -186,7 +187,10 @@ def render_main(operator_id: str) -> None:
                 )
 
     with tab_stale:
-        _render_stale_tab()
+        _render_stale_tab(operator_id)
+
+    with tab_dlq:
+        _render_dlq_tab(operator_id)
 
     with tab_engagement:
         _render_engagement_tab()
@@ -194,7 +198,7 @@ def render_main(operator_id: str) -> None:
 
 # ── Stale / Escalated tab (Phase 8) ──────────────────────────────────────────
 
-def _render_stale_tab() -> None:
+def _render_stale_tab(operator_id: str) -> None:
     st.subheader("Stale & Escalated Actions")
     st.caption(
         "Actions the Watchdog detected as stale (CRM state changed since analysis). "
@@ -229,18 +233,20 @@ def _render_stale_tab() -> None:
         st.markdown("#### 🔴 Escalated — Human Review Required")
         st.caption(
             "Watchdog circuit breaker fired. The account state is too volatile "
-            "for autonomous re-analysis. Operator must review and act manually."
+            "for autonomous re-analysis. Operator may force-execute if the drift "
+            "is a known artefact (e.g. caching, in-flight payment clearing)."
         )
         actions = _get("/actions", status="ESCALATED_STALE", limit=50) or []
         if not actions:
             st.info("No escalated actions.")
         for a in actions:
-            reason = a.get("stale_reason", "unknown reason")
+            action_id = a["id"]
+            reason    = a.get("stale_reason", "unknown reason")
             with st.expander(
-                f"🔴 `{a['id'][:8]}` **{a['action_type']}** — ESCALATED",
+                f"🔴 `{action_id[:8]}` **{a['action_type']}** — ESCALATED",
                 expanded=True,
             ):
-                st.markdown(f"**Action ID:** `{a['id']}`")
+                st.markdown(f"**Action ID:** `{action_id}`")
                 st.markdown(f"**Type:** `{a['action_type']}`")
                 st.markdown(f"**Customer:** `{a.get('customer_id', '—')}`")
                 st.markdown(f"**Order:** `{a.get('order_id', '—')}`")
@@ -248,6 +254,130 @@ def _render_stale_tab() -> None:
                 st.markdown("**Original proposal:**")
                 st.json(a.get("action_payload", {}))
                 st.caption(f"Created: {a.get('created_at', '—')[:19]}")
+
+                # ── Phase 10: Force Execute override ─────────────────────────
+                st.divider()
+                st.warning(
+                    "⚠️ **Force Execute** bypasses drift validation. "
+                    "Use only when you have confirmed the stale state is a known "
+                    "system artefact (e.g. cache lag, payment clearing delay)."
+                )
+                justification = st.text_area(
+                    "Justification (required — min 10 chars)",
+                    key=f"justification_{action_id}",
+                    placeholder="e.g. Confirmed with Network Ops — state drift is CDN cache lag, safe to proceed.",
+                    height=80,
+                )
+                if st.button(
+                    "🚨 Force Execute (bypass drift check)",
+                    key=f"force_{action_id}",
+                    type="primary",
+                ):
+                    if not operator_id:
+                        st.error("Set your Operator ID in the sidebar first.")
+                    elif not justification or len(justification.strip()) < 10:
+                        st.error("Provide a meaningful justification (min 10 chars).")
+                    else:
+                        result = _post(
+                            f"/actions/{action_id}/force-approve",
+                            {"operator_id": operator_id, "justification": justification},
+                        )
+                        if result:
+                            st.success(
+                                f"Action {action_id[:8]} marked FORCE_APPROVED — "
+                                "Executor will pick it up on the next poll cycle."
+                            )
+                            st.rerun()
+
+
+# ── DLQ tab (Phase 10) ────────────────────────────────────────────────────────
+
+def _render_dlq_tab(operator_id: str) -> None:
+    st.subheader("Dead Letter Queue — Failed Oracle Write-backs")
+    st.caption(
+        "Commands that exhausted all retry attempts in the Oracle Adapter. "
+        "Each entry represents a failed Oracle DML that needs manual repair or deliberate discard."
+    )
+
+    col_filter, col_refresh = st.columns([3, 1])
+    with col_filter:
+        status_filter = st.selectbox(
+            "Filter by status", ["OPEN", "ACKNOWLEDGED", "ALL"], index=0
+        )
+    with col_refresh:
+        st.write("")
+        st.button("🔄 Refresh", key="dlq_refresh")
+
+    events = _get("/dlq", status=status_filter, limit=200) or []
+
+    if not events:
+        st.info("No DLQ events — write-back pipeline is healthy.")
+        return
+
+    open_count = sum(1 for e in events if e.get("status") == "OPEN")
+    ack_count  = sum(1 for e in events if e.get("status") == "ACKNOWLEDGED")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Open", open_count,  delta=open_count if open_count else None, delta_color="inverse")
+    m2.metric("Acknowledged", ack_count)
+    m3.metric("Total shown", len(events))
+
+    st.divider()
+
+    for evt in events:
+        outbox_id   = evt.get("outbox_id", evt.get("dlq_id", "?"))
+        action_type = evt.get("action_type", "unknown")
+        table       = evt.get("table_name", "?")
+        attempts    = evt.get("attempts", "?")
+        status      = evt.get("status", "OPEN")
+        icon        = "🔴" if status == "OPEN" else "✅"
+
+        label = (
+            f"{icon} `{outbox_id[:8]}` **{action_type}** → `{table}` "
+            f"— {attempts} attempt(s) — {evt.get('failed_at', '?')[:19]}"
+        )
+        with st.expander(label, expanded=(status == "OPEN")):
+            col_meta, col_err = st.columns([1, 2])
+
+            with col_meta:
+                st.markdown(f"**Outbox ID:** `{outbox_id}`")
+                st.markdown(f"**Action ID:** `{evt.get('action_id', '—')}`")
+                st.markdown(f"**Correlation:** `{evt.get('correlation_id', '—')}`")
+                st.markdown(f"**Action type:** `{action_type}`")
+                st.markdown(f"**Table:** `{table}`")
+                st.markdown(f"**Attempts:** {attempts}")
+                st.markdown(f"**Status:** `{status}`")
+                trace_id = evt.get("trace_id")
+                if trace_id:
+                    st.markdown(f"**Trace ID:** `{trace_id}`")
+                st.caption(f"Failed at: {evt.get('failed_at', '—')[:19]}")
+
+            with col_err:
+                st.markdown("**Error context:**")
+                st.error(evt.get("error_context", "No error detail available."))
+                if evt.get("where_clause"):
+                    st.markdown("**WHERE clause:**")
+                    st.json(evt["where_clause"])
+                if evt.get("set_values"):
+                    st.markdown("**SET values:**")
+                    st.json(evt["set_values"])
+
+            if status == "OPEN":
+                st.divider()
+                if st.button(
+                    "✅ Acknowledge (mark as reviewed)",
+                    key=f"dlq_ack_{outbox_id}",
+                ):
+                    if not operator_id:
+                        st.error("Set your Operator ID in the sidebar first.")
+                    else:
+                        result = _post(
+                            f"/dlq/{outbox_id}/acknowledge",
+                            {"operator_id": operator_id},
+                        )
+                        if result:
+                            st.success("Event acknowledged.")
+                            st.rerun()
 
 
 # ── Customer Engagement tab ───────────────────────────────────────────────────
