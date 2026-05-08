@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from db.mongo import ensure_indexes, list_actions, transition_action
+from db.ods import create_outbox_entry
 from models.action import ActionProposal, ActionStatus
 from observability.metrics import (
     actions_failed_total,
@@ -159,6 +160,58 @@ _COMPENSATIONS: dict[str, Handler] = {
 }
 
 
+# ── Phase 9: Outbox write-back builder ────────────────────────────────────────
+
+def _outbox_params(action: ActionProposal) -> tuple[str, str, dict, dict] | None:
+    """
+    Map an ActionProposal to (table_name, operation, where_clause, set_values) for the
+    Saga write-back outbox. Returns None for action types with no Oracle target.
+    """
+    p = action.action_payload
+
+    if action.action_type == "update_billing":
+        return (
+            "BILLING_ACCOUNT", "UPDATE",
+            {"billing_account_id": p.get("account_id") or p.get("billing_account_id")},
+            {k: p[k] for k in ("current_balance", "status", "credit_limit") if k in p},
+        )
+    elif action.action_type == "update_subscription":
+        return (
+            "SERVICE_SUBSCRIPTION", "UPDATE",
+            {"subscription_id": p.get("subscription_id")},
+            {k: p[k] for k in ("status", "suspend_reason") if k in p},
+        )
+    elif action.action_type == "cancel_order":
+        return (
+            "ORDER_HEADER", "UPDATE",
+            {"order_id": int(action.order_id) if action.order_id else p.get("order_id")},
+            {"status": "CANCELLED"},
+        )
+    elif action.action_type == "retry_provisioning":
+        return (
+            "ORDER_FALLOUT", "UPDATE",
+            {"fallout_id": p.get("fallout_id")},
+            {"status": "IN_PROGRESS"},
+        )
+    elif action.action_type == "create_ticket":
+        return (
+            "INCIDENT_TICKET", "INSERT",
+            {
+                "customer_id": int(action.customer_id) if action.customer_id else None,
+                "order_id":    int(action.order_id)    if action.order_id    else None,
+                "fallout_id":  p.get("fallout_id"),
+            },
+            {
+                "title":         p.get("title", action.action_description[:200]),
+                "category":      p.get("category", "ORDER_FALLOUT"),
+                "priority":      p.get("priority", "P3"),
+                "assigned_team": p.get("assigned_team", "BSS_SUPPORT"),
+            },
+        )
+
+    return None  # escalate, notify_customer, manual_review — no Oracle write
+
+
 # ── Phase 8: Pre-flight drift check ───────────────────────────────────────────
 
 async def _pre_flight_check(action: ActionProposal) -> tuple[bool, str]:
@@ -286,6 +339,29 @@ async def _execute_action(action: ActionProposal) -> None:
                         except Exception as comp_exc:
                             logger.error("COMPENSATION_FAILED action=%s: %s", action.id, comp_exc)
                     raise RuntimeError(f"Post-write verification failed: {verify_reason}")
+
+                # ── Phase 9: Write to outbox → Relay → Kafka → Oracle Adapter ────────
+                outbox_p = _outbox_params(action)
+                if outbox_p:
+                    table_name, operation, where_clause, set_values = outbox_p
+                    try:
+                        await create_outbox_entry(
+                            action_id=action.id,
+                            correlation_id=action.correlation_id,
+                            action_type=action.action_type,
+                            table_name=table_name,
+                            operation=operation,
+                            where_clause=where_clause,
+                            set_values=set_values,
+                            source_version_anchor=action.predicted_before_state.get(
+                                "updated_date"
+                            ),
+                        )
+                    except Exception as outbox_exc:
+                        logger.error(
+                            "Outbox write failed for action %s: %s — execution marked EXECUTED anyway",
+                            action.id, outbox_exc,
+                        )
 
                 await transition_action(
                     action.id, current_version, ActionStatus.EXECUTED,

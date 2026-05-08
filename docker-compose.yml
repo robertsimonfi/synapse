@@ -1,22 +1,53 @@
-# Synapse — full local-dev stack.
+# Synapse — Phase 9 full local-dev stack.
 #
-# Services:
-#   mongodb    — Action state store (Phase 1)
-#   rabbitmq   — Job queue between API and Thinker (Phase 3)
-#   api        — FastAPI: resolve, HITL endpoints, Prometheus /metrics
-#   thinker    — Async agent consumer: RabbitMQ → Claude → MongoDB proposals
-#   executor   — Polls MongoDB for APPROVED actions and executes them
-#   watchdog   — Phase 8: polls PENDING/APPROVED actions for CRM state drift
-#   prometheus — Scrapes /metrics from the API
-#   ui         — Streamlit Operator Portal (HITL review dashboard)
+# Architecture:
+#   kafka          — Kafka 3.7 (KRaft mode, no ZooKeeper)
+#   mongodb        — Action state store + ODS subscribers + outbox
+#   api            — FastAPI: resolve, HITL endpoints, Prometheus /metrics
+#   thinker        — Kafka consumer → Claude → MongoDB action proposals
+#   executor       — APPROVED actions → execute → MongoDB outbox write
+#   watchdog       — PENDING/APPROVED drift check → Kafka re-analysis
+#   hydrator       — Oracle CDC simulation → Kafka → MongoDB ODS
+#   relay          — MongoDB outbox → Kafka legacy.commands.writeback
+#   oracle_adapter — Kafka → Oracle DML write-back
+#   prometheus     — Scrapes /metrics from the API
+#   ui             — Streamlit Operator Portal (HITL review dashboard)
 #
-# For production: replace SQLite with managed Oracle/Postgres, local ChromaDB
-# with a managed vector store (pgvector, AI Search), and scale thinker/executor
-# as independent Deployments on AKS.
+# Kafka replaces RabbitMQ for all inter-service messaging (Phase 9).
+# For production: replace SQLite with managed Oracle, local ChromaDB with
+# Azure AI Search, and scale each service as independent AKS Deployments.
 
 services:
 
   # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  kafka:
+    image: bitnami/kafka:3.7
+    container_name: synapse-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      # KRaft mode — no ZooKeeper required
+      - KAFKA_CFG_NODE_ID=0
+      - KAFKA_CFG_PROCESS_ROLES=controller,broker
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_EXTERNAL://:9094
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_EXTERNAL://localhost:9094
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_EXTERNAL:PLAINTEXT
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka:9093
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+      - KAFKA_CFG_LOG_RETENTION_HOURS=168
+      - KAFKA_CFG_LOG_SEGMENT_BYTES=536870912
+      - ALLOW_PLAINTEXT_LISTENER=yes
+    volumes:
+      - kafka_data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
 
   mongodb:
     image: mongo:7.0
@@ -33,25 +64,6 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
-    restart: unless-stopped
-
-  rabbitmq:
-    image: rabbitmq:3.13-management
-    container_name: synapse-rabbitmq
-    ports:
-      - "5672:5672"
-      - "15672:15672"   # Management UI → http://localhost:15672 (guest/guest)
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-    environment:
-      RABBITMQ_DEFAULT_USER: synapse
-      RABBITMQ_DEFAULT_PASS: synapse
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 15s
-      timeout: 10s
-      retries: 5
-      start_period: 20s
     restart: unless-stopped
 
   prometheus:
@@ -89,7 +101,7 @@ services:
       AUTO_INGEST: "true"
       MONGODB_URI: mongodb://mongodb:27017
       MONGODB_DB: synapse
-      RABBITMQ_URL: amqp://synapse:synapse@rabbitmq/
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       ACTION_EXPIRY_HOURS: "4"
       EXPIRY_CHECK_INTERVAL_MINUTES: "15"
     volumes:
@@ -97,7 +109,7 @@ services:
     depends_on:
       mongodb:
         condition: service_healthy
-      rabbitmq:
+      kafka:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
@@ -123,15 +135,13 @@ services:
       AGENT_MEMORY_PATH: /data/agent_memory
       MONGODB_URI: mongodb://mongodb:27017
       MONGODB_DB: synapse
-      RABBITMQ_URL: amqp://synapse:synapse@rabbitmq/
-      THINKER_QUEUE: resolve_jobs
-      THINKER_PREFETCH: "5"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     volumes:
       - telco_data:/data
     depends_on:
       mongodb:
         condition: service_healthy
-      rabbitmq:
+      kafka:
         condition: service_healthy
       api:
         condition: service_healthy
@@ -148,7 +158,6 @@ services:
       MONGODB_URI: mongodb://mongodb:27017
       MONGODB_DB: synapse
       EXECUTOR_POLL_INTERVAL: "10"
-      # Phase 8: SQLite access for pre-flight drift check and post-write verify
       SQLITE_PATH: /data/telco_dev.db
     volumes:
       - telco_data:/data
@@ -167,8 +176,7 @@ services:
     environment:
       MONGODB_URI: mongodb://mongodb:27017
       MONGODB_DB: synapse
-      RABBITMQ_URL: amqp://synapse:synapse@rabbitmq/
-      THINKER_QUEUE: resolve_jobs
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       WATCHDOG_POLL_INTERVAL: "30"
       SQLITE_PATH: /data/telco_dev.db
     volumes:
@@ -176,7 +184,78 @@ services:
     depends_on:
       mongodb:
         condition: service_healthy
-      rabbitmq:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  hydrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telco-agent:local
+    container_name: synapse-hydrator
+    command: ["python", "-m", "worker.hydrator"]
+    environment:
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB: synapse
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DB_TYPE: sqlite
+      SQLITE_PATH: /data/telco_dev.db
+      HYDRATOR_POLL_INTERVAL: "30"
+      HYDRATOR_BATCH_SIZE: "200"
+      HYDRATOR_CHECKPOINT_FILE: /data/hydrator_checkpoint.json
+    volumes:
+      - telco_data:/data
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      api:
+        condition: service_healthy    # ensures SQLite is seeded before hydrator starts
+    restart: unless-stopped
+
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telco-agent:local
+    container_name: synapse-relay
+    command: ["python", "-m", "worker.relay"]
+    environment:
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB: synapse
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      RELAY_POLL_INTERVAL: "5"
+      RELAY_BATCH_SIZE: "50"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  oracle_adapter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telco-agent:local
+    container_name: synapse-oracle-adapter
+    command: ["python", "-m", "worker.oracle_adapter"]
+    environment:
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB: synapse
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # Set DB_TYPE=oracle and ORA_* vars to enable real Oracle write-back
+      DB_TYPE: sqlite
+      SQLITE_PATH: /data/telco_dev.db
+      ORACLE_ADAPTER_MAX_RETRIES: "3"
+    volumes:
+      - telco_data:/data
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     restart: unless-stopped
 
@@ -209,7 +288,7 @@ volumes:
     driver: local
   mongo_data:
     driver: local
-  rabbitmq_data:
+  kafka_data:
     driver: local
   prometheus_data:
     driver: local
