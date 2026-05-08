@@ -113,8 +113,23 @@ Resolution JSON format:
       "action_type": "retry_provisioning|update_billing|create_ticket|escalate|notify_customer|update_subscription|cancel_order",
       "action_description": "One concise sentence describing what this action does and why.",
       "action_payload": {{"key": "value pairs an executor needs to carry out this action (e.g. system, msisdn, order_id)"}},
-      "predicted_before_state": {{"field": "current observed value from the data you retrieved"}},
-      "predicted_after_state": {{"field": "expected value once the action succeeds"}}
+      "predicted_before_state": {{
+        // Populate ONLY the keys listed for your action_type. Use exact values
+        // you observed from the database tools — do not guess or infer.
+        // retry_provisioning  → customer_status, subscription_status, last_provisioning_result
+        // update_billing       → account_status, current_balance, credit_limit
+        // cancel_order         → order_status
+        // escalate             → customer_status
+        // notify_customer      → customer_status
+        // update_subscription  → customer_status, subscription_status
+        // create_ticket        → customer_status, order_status
+        "key": "exact value you read from a tool result"
+      }},
+      "predicted_after_state": {{
+        // Same keys as predicted_before_state, but with the values you expect
+        // after the action executes successfully.
+        "key": "expected value post-execution"
+      }}
     }}
   ]
 }}"""

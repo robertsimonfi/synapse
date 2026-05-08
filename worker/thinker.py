@@ -37,12 +37,16 @@ def _build_proposals(
     correlation_id: str,
     order_id: str | None,
     customer_id: str | None,
+    reanalysis_count: int = 0,
 ) -> list[ActionProposal]:
     """
     Convert agent output into ActionProposal documents.
 
     Prefers the structured 'action_proposals' list from the resolution JSON.
     Falls back to creating one 'manual_review' proposal per recommended_action string.
+
+    reanalysis_count is forwarded from Watchdog re-analysis messages (Phase 8)
+    so the circuit breaker can count correctly across analysis cycles.
     """
     structured: list[dict] = resolution_raw.get("action_proposals", [])
 
@@ -67,6 +71,7 @@ def _build_proposals(
             action_payload=raw.get("action_payload", {}),
             predicted_before_state=raw.get("predicted_before_state", {}),
             predicted_after_state=raw.get("predicted_after_state", {}),
+            reanalysis_count=reanalysis_count,
         ))
     return proposals
 
@@ -87,6 +92,9 @@ async def _handle_resolve_job(message: aio_pika.IncomingMessage) -> None:
             # Agent is sync/CPU-bound — run in thread pool to free the event loop
             resolution = await asyncio.to_thread(run_agent, fallout_input, correlation_id)
 
+            # Phase 8: carry forward reanalysis_count from Watchdog re-analysis messages
+            reanalysis_count = body.get("reanalysis_count", 0)
+
             proposals = _build_proposals(
                 {
                     "recommended_actions": resolution.recommended_actions,
@@ -95,6 +103,7 @@ async def _handle_resolve_job(message: aio_pika.IncomingMessage) -> None:
                 correlation_id=correlation_id,
                 order_id=fallout_input.order_id,
                 customer_id=fallout_input.customer_id,
+                reanalysis_count=reanalysis_count,
             )
 
             for proposal in proposals:

@@ -6,6 +6,7 @@
 #   api        — FastAPI: resolve, HITL endpoints, Prometheus /metrics
 #   thinker    — Async agent consumer: RabbitMQ → Claude → MongoDB proposals
 #   executor   — Polls MongoDB for APPROVED actions and executes them
+#   watchdog   — Phase 8: polls PENDING/APPROVED actions for CRM state drift
 #   prometheus — Scrapes /metrics from the API
 #   ui         — Streamlit Operator Portal (HITL review dashboard)
 #
@@ -147,8 +148,35 @@ services:
       MONGODB_URI: mongodb://mongodb:27017
       MONGODB_DB: synapse
       EXECUTOR_POLL_INTERVAL: "10"
+      # Phase 8: SQLite access for pre-flight drift check and post-write verify
+      SQLITE_PATH: /data/telco_dev.db
+    volumes:
+      - telco_data:/data
     depends_on:
       mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  watchdog:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telco-agent:local
+    container_name: synapse-watchdog
+    command: ["python", "-m", "worker.watchdog"]
+    environment:
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB: synapse
+      RABBITMQ_URL: amqp://synapse:synapse@rabbitmq/
+      THINKER_QUEUE: resolve_jobs
+      WATCHDOG_POLL_INTERVAL: "30"
+      SQLITE_PATH: /data/telco_dev.db
+    volumes:
+      - telco_data:/data
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     restart: unless-stopped
 
