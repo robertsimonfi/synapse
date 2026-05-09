@@ -41,6 +41,11 @@ faker>=25.0.0
 # ── Utilities ──────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0
 
+# ── Phase 13: Cold Store S3 backend (optional) ─────────────────────────────────
+# Install boto3 when COLD_STORE_BACKEND=s3 (production).  Not required for the
+# default MongoDB cold store backend used in local dev.
+boto3>=1.34.0             # AWS S3 cold subscriber archive (set COLD_STORE_BACKEND=s3)
+
 # ── Phase 7: Notification providers (optional — only needed for real dispatch) ──
 # twilio>=8.0.0        # Uncomment to enable TwilioProvider
 # sendgrid>=6.11.0     # Uncomment to enable SendGridProvider

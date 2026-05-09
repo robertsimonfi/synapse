@@ -87,6 +87,25 @@ async def ensure_ods_indexes() -> None:
         name="opco_prefetch_ts",
         sparse=True,
     )
+    # Phase 13: tiered storage — archiver queries on last_accessed_at + storage_tier
+    await db.subscribers.create_index(
+        [("storage_tier", pymongo.ASCENDING), ("last_accessed_at", pymongo.ASCENDING)],
+        name="storage_tier_last_accessed",
+        sparse=True,
+    )
+    await db.subscribers.create_index("storage_tier", sparse=True)
+    # cold_subscribers — cold store index (MongoDB backend)
+    await db.cold_subscribers.create_index(
+        [("opco_id", pymongo.ASCENDING), ("customer_id", pymongo.ASCENDING)],
+        unique=True,
+        name="cold_opco_customer",
+    )
+    # token_budgets — Phase 13
+    await db.token_budgets.create_index(
+        [("opco_id", pymongo.ASCENDING), ("period_start", pymongo.ASCENDING)],
+        unique=True,
+        name="token_budget_opco_period",
+    )
     # outbox
     await db.outbox.create_index([("status", 1), ("created_at", 1)])
     await db.outbox.create_index("action_id", unique=True)
@@ -110,10 +129,18 @@ async def ensure_ods_indexes() -> None:
 # ── Sync subscriber helpers (used by agent/tools.py) ─────────────────────────
 
 def get_subscriber(customer_id: int) -> Optional[dict]:
-    """Return the full subscriber document from the ODS, or None if not hydrated yet."""
-    return _sync_db().subscribers.find_one(
-        {"customer_id": customer_id}, {"_id": 0}
-    )
+    """
+    Return the full subscriber document from the ODS, or None if not hydrated yet.
+    Phase 13: touches last_accessed_at to prevent premature archival.
+    """
+    db  = _sync_db()
+    doc = db.subscribers.find_one({"customer_id": customer_id}, {"_id": 0})
+    if doc and doc.get("storage_tier") != "cold":
+        db.subscribers.update_one(
+            {"customer_id": customer_id},
+            {"$set": {"last_accessed_at": datetime.now(timezone.utc).isoformat()}},
+        )
+    return doc
 
 
 def subscriber_exists(customer_id: int) -> bool:
@@ -124,17 +151,32 @@ def subscriber_exists(customer_id: int) -> bool:
 
 async def async_upsert_subscriber(doc: dict) -> None:
     """Upsert a hydrated subscriber document into the ODS."""
-    db = _async_motor_db()
+    db  = _async_motor_db()
+    now = datetime.now(timezone.utc).isoformat()
     await db.subscribers.update_one(
         {"customer_id": doc["customer_id"]},
-        {"$set": {**doc, "hydrated_at": datetime.now(timezone.utc).isoformat()}},
+        {"$set": {
+            **doc,
+            "hydrated_at":      now,
+            "last_accessed_at": now,
+            "storage_tier":     "warm",
+        }},
         upsert=True,
     )
 
 
 async def async_get_subscriber(customer_id: int) -> Optional[dict]:
-    db = _async_motor_db()
-    return await db.subscribers.find_one({"customer_id": customer_id}, {"_id": 0})
+    """
+    Async read path — also touches last_accessed_at for archiver TTL tracking.
+    """
+    db  = _async_motor_db()
+    doc = await db.subscribers.find_one({"customer_id": customer_id}, {"_id": 0})
+    if doc and doc.get("storage_tier") != "cold":
+        await db.subscribers.update_one(
+            {"customer_id": customer_id},
+            {"$set": {"last_accessed_at": datetime.now(timezone.utc).isoformat()}},
+        )
+    return doc
 
 
 async def async_get_all_customer_ids() -> list[int]:
@@ -144,15 +186,60 @@ async def async_get_all_customer_ids() -> list[int]:
     return [doc["customer_id"] async for doc in cursor]
 
 
-async def async_get_customer_ids_by_opco(opco_id: str, limit: int = 5000) -> list[int]:
-    """Return all customer_ids for a given OpCo — used by predictive prefetch."""
-    db = _async_motor_db()
-    cursor = db.subscribers.find(
-        {"opco_id": opco_id},
-        {"customer_id": 1, "_id": 0},
-        limit=limit,
-    )
+async def async_get_customer_ids_by_opco(
+    opco_id: str,
+    limit: int = 5000,
+    include_cold: bool = True,
+) -> list[int]:
+    """
+    Return all customer_ids for a given OpCo — used by predictive prefetch.
+
+    Phase 13: include_cold=True (default) returns both warm docs and cold stubs,
+    so the prefetch fan-out list is complete and the Hydrator can promote cold
+    subscribers before issuing their synthetic CDC events.
+    """
+    db    = _async_motor_db()
+    query = {"opco_id": opco_id}
+    if not include_cold:
+        query["storage_tier"] = {"$ne": "cold"}
+
+    cursor = db.subscribers.find(query, {"customer_id": 1, "_id": 0}, limit=limit)
     return [doc["customer_id"] async for doc in cursor]
+
+
+async def promote_from_cold(customer_id: int, opco_id: str, reason: str = "prefetch") -> bool:
+    """
+    Phase 13 — Warm-up path: restore a cold document from the cold store to the hot ODS.
+
+    Returns True if the document was found and promoted, False if it was not in cold store
+    (caller should then fall back to Oracle source directly via build_subscriber_doc).
+
+    Called by worker/prefetch.py when a HIGH_SIGNAL event touches a cold subscriber.
+    The Predictive Hydrator is the warmth-tier arbiter: the act of prefetch IS the
+    promotion event.
+    """
+    from db.cold_store import get_cold_store  # noqa: PLC0415
+
+    cold = get_cold_store()
+    doc  = await cold.retrieve(customer_id, opco_id)
+
+    if doc is None:
+        return False
+
+    # Restore full document to hot ODS with warm tier
+    await async_upsert_subscriber(doc)
+
+    # Remove from cold store (it's now back in hot ODS)
+    await cold.delete(customer_id, opco_id)
+
+    from observability.metrics import cold_promotions_total  # noqa: PLC0415
+    cold_promotions_total.labels(opco_id=opco_id, reason=reason).inc()
+
+    logger.info(
+        "Cold→warm promotion: customer_id=%s opco=%s reason=%s",
+        customer_id, opco_id, reason,
+    )
+    return True
 
 
 async def force_sync_customer(

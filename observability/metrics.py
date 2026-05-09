@@ -107,3 +107,60 @@ canary_promotion_total = Counter(
     "Number of times a candidate model was promoted to champion",
     ["from_model", "to_model"],
 )
+
+# ── Phase 13: Tiered Storage ──────────────────────────────────────────────────
+
+archived_documents_total = Counter(
+    "synapse_archived_documents_total",
+    "Subscriber documents moved from hot ODS to cold store by the archiver",
+    ["opco_id"],
+)
+
+cold_store_documents_gauge = Gauge(
+    "synapse_cold_store_documents",
+    "Current number of cold-tier subscriber stubs in the hot ODS",
+)
+
+cold_promotions_total = Counter(
+    "synapse_cold_promotions_total",
+    "Subscriber documents promoted from cold store to hot ODS by the Hydrator",
+    ["opco_id", "reason"],
+)
+
+# ── Phase 13: Oracle HA Circuit Breaker ──────────────────────────────────────
+
+oracle_circuit_breaker_open = Gauge(
+    "synapse_oracle_circuit_breaker_open",
+    "1 when the Oracle primary circuit breaker is OPEN, 0 when CLOSED/HALF_OPEN",
+)
+
+oracle_standby_reads_total = Counter(
+    "synapse_oracle_standby_reads_total",
+    "Read operations routed to the Oracle standby replica (circuit breaker OPEN)",
+)
+
+oracle_writes_queued_total = Counter(
+    "synapse_oracle_writes_queued_total",
+    "Write commands queued to Kafka because Oracle primary is unavailable",
+    ["opco_id"],
+)
+
+# ── Phase 13: AI Token Budget ─────────────────────────────────────────────────
+
+token_budget_remaining_gauge = Gauge(
+    "synapse_token_budget_remaining",
+    "Tokens remaining in the current billing period for an OpCo",
+    ["opco_id"],
+)
+
+token_budget_consumed_total = Counter(
+    "synapse_token_budget_consumed_total",
+    "Cumulative tokens consumed (input + output) per OpCo",
+    ["opco_id"],
+)
+
+token_quota_exceeded_total = Counter(
+    "synapse_token_quota_exceeded_total",
+    "Number of times an OpCo's monthly quota was exhausted",
+    ["opco_id"],
+)
