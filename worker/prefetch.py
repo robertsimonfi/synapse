@@ -44,10 +44,11 @@ from kafka.topics import (
     TOPIC_CDC_ALL_CHANGES,
     TOPIC_SYSTEM_EVENTS,
 )
-from db.ods import async_get_customer_ids_by_opco
+from db.ods import async_get_customer_ids_by_opco, async_get_subscriber, promote_from_cold
 from observability.metrics import (
     prefetch_signals_received_total,
     prefetch_customers_queued_total,
+    cold_promotions_total,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,12 +81,29 @@ async def _handle_high_signal(event: dict, producer) -> None:
         logger.info("Prefetch: no hydrated customers found for opco=%s", opco_id)
         return
 
-    queued = 0
+    queued    = 0
+    promoted  = 0
     semaphore = asyncio.Semaphore(PREFETCH_CONCURRENCY)
 
     async def _publish_one(cid: int) -> None:
-        nonlocal queued
+        nonlocal queued, promoted
         async with semaphore:
+            # Phase 13: if this customer has a cold stub, promote to warm FIRST.
+            # The Hydrator is the warmth-tier arbiter — the act of HIGH_SIGNAL
+            # prefetch IS the promotion event for cold subscribers.
+            stub = await async_get_subscriber(cid)
+            if stub and stub.get("storage_tier") == "cold":
+                warmed = await promote_from_cold(cid, opco_id, reason="high_signal_prefetch")
+                if not warmed:
+                    # Not in cold store — fall back to Oracle source (force-sync style)
+                    import asyncio as _asyncio
+                    from db.ods import build_subscriber_doc, async_upsert_subscriber
+                    doc = await _asyncio.to_thread(build_subscriber_doc, cid)
+                    if doc:
+                        doc["opco_id"] = opco_id
+                        await async_upsert_subscriber(doc)
+                promoted += 1
+
             evt = OracleCdcEvent(
                 op="UPDATE",
                 table_name="CUSTOMER",
@@ -108,8 +126,8 @@ async def _handle_high_signal(event: dict, producer) -> None:
     ).inc(queued)
 
     logger.info(
-        "Predictive prefetch: queued %d CDC events for opco=%s (signal=%s)",
-        queued, opco_id, signal_type,
+        "Predictive prefetch: queued=%d CDC events cold_promoted=%d opco=%s signal=%s",
+        queued, promoted, opco_id, signal_type,
     )
 
 
