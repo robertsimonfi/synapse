@@ -322,8 +322,6 @@ services:
     environment:
       MONGODB_URI: mongodb://mongodb:27017
       MONGODB_DB: synapse
-      # Cold store backend: "mongodb" uses cold_subscribers collection (dev default)
-      # Switch to "s3" in production and set COLD_STORE_S3_BUCKET / AWS credentials
       COLD_STORE_BACKEND: mongodb
       ARCHIVE_INACTIVE_DAYS: "30"
       ARCHIVER_BATCH_SIZE: "500"
@@ -334,6 +332,47 @@ services:
       hydrator:
         condition: service_started
     restart: unless-stopped
+
+  # ── Phase 14: Sentiment Analysis — customer feedback Kafka consumer ─────────
+
+  sentiment:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telco-agent:local
+    container_name: synapse-sentiment
+    command: ["python", "-m", "worker.sentiment"]
+    environment:
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB: synapse
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Phase 14: React NOC Dashboard — replaces Streamlit operator portal ───────
+
+  frontend:
+    image: node:20-alpine
+    container_name: synapse-frontend
+    working_dir: /app
+    command: sh -c "npm install --silent && npm run build && npm run preview"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+    environment:
+      VITE_API_BASE_URL: http://api:8000
+      VITE_WS_HOST: api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Streamlit portal kept as fallback for ops teams not yet on React ─────────
 
   ui:
     build:

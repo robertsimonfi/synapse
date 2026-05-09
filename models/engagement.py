@@ -33,6 +33,13 @@ class CustomerResponse(str, Enum):
     REPLIED  = "REPLIED"
 
 
+class SentimentLabel(str, Enum):
+    POSITIVE = "POSITIVE"
+    NEUTRAL  = "NEUTRAL"
+    NEGATIVE = "NEGATIVE"
+    ANGRY    = "ANGRY"
+
+
 class EngagementLog(BaseModel):
     id:                   str = Field(default_factory=lambda: str(uuid.uuid4()))
     action_id:            str
@@ -48,4 +55,7 @@ class EngagementLog(BaseModel):
     customer_response:    CustomerResponse  = CustomerResponse.PENDING
     response_text:        Optional[str]     = None
     response_received_at: Optional[datetime] = None
+    # Phase 14: sentiment analysis of inbound customer response
+    sentiment_score:      Optional[float]        = None   # -1.0 (angry) to +1.0 (positive)
+    sentiment_label:      Optional[SentimentLabel] = None
     created_at:           datetime = Field(default_factory=datetime.utcnow)
