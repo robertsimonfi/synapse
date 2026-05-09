@@ -35,6 +35,10 @@ Phase 12 — Advanced Reliability:
   POST /canary/promote             — Promote candidate model to 100% traffic
   POST /canary/{result_id}/score   — Backfill operator quality score onto a canary result
 
+Phase 14 — GA Sprint (Sentiment + React Dashboard):
+  GET  /system/trace/{trace_id}    — Chronological event timeline for a distributed trace
+  POST /actions/{id}/feedback      — Operator correction published to synapse.operator.corrections
+
 Observability:
   GET  /metrics                    — Prometheus metrics (scraped by Prometheus)
 """
@@ -768,35 +772,35 @@ async def customer_reply_webhook(request: CustomerReplyRequest):
     received_at = datetime.now(_tz.utc)
     updated = await record_customer_response(engagement.id, request.reply_text, received_at)
 
-    # Publish CUSTOMER_FEEDBACK event to RabbitMQ so Thinker can react
-    rabbitmq_uri = os.getenv("RABBITMQ_URL")
-    if rabbitmq_uri:
+    # Phase 14: publish CustomerFeedbackEvent to Kafka for sentiment scoring
+    kafka_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+    if kafka_servers:
         try:
-            import aio_pika
-            connection = await aio_pika.connect_robust(rabbitmq_uri)
-            async with connection:
-                channel = await connection.channel()
-                import json
-                await channel.default_exchange.publish(
-                    aio_pika.Message(
-                        body=json.dumps({
-                            "event_type":     "CUSTOMER_FEEDBACK",
-                            "correlation_id": request.correlation_id,
-                            "action_id":      engagement.action_id,
-                            "customer_id":    engagement.customer_id,
-                            "reply_text":     request.reply_text,
-                            "channel":        request.channel,
-                            "received_at":    received_at.isoformat(),
-                        }).encode(),
-                    ),
-                    routing_key="incoming_events",
+            from kafka.producer import create_producer, publish
+            from kafka.schemas import CustomerFeedbackEvent
+            from kafka.topics import TOPIC_CUSTOMER_FEEDBACK
+
+            feedback_evt = CustomerFeedbackEvent(
+                customer_id=int(engagement.customer_id) if engagement.customer_id else None,
+                engagement_id=engagement.id,
+                correlation_id=request.correlation_id,
+                channel=request.channel,
+                raw_text=request.reply_text,
+            )
+            producer = await create_producer()
+            async with producer:
+                await publish(
+                    producer,
+                    TOPIC_CUSTOMER_FEEDBACK,
+                    feedback_evt.model_dump(),
+                    key=engagement.id,
                 )
             logger.info(
-                "CUSTOMER_FEEDBACK published correlation=%s action=%s",
-                request.correlation_id, engagement.action_id,
+                "CUSTOMER_FEEDBACK published to Kafka correlation=%s engagement=%s",
+                request.correlation_id, engagement.id,
             )
         except Exception as exc:
-            logger.warning("RabbitMQ publish failed for feedback: %s", exc)
+            logger.warning("Kafka publish failed for customer feedback: %s", exc)
 
     return {
         "status":         "recorded",
@@ -833,6 +837,249 @@ async def acknowledge_dlq_event_endpoint(
     from db.ods import acknowledge_dlq_event
     await acknowledge_dlq_event(outbox_id, body.operator_id)
     return {"status": "acknowledged", "outbox_id": outbox_id, "by": body.operator_id}
+
+
+# ── Phase 14: Timeline API ────────────────────────────────────────────────────
+
+
+@app.get("/system/trace/{trace_id}", tags=["System"])
+async def get_trace_timeline(
+    trace_id: str,
+    _: str = Security(require_api_key),
+):
+    """
+    Phase 14 — Distributed Trace Timeline.
+
+    Aggregates all events that share the given trace_id (W3C traceparent) into a
+    chronological JSON array.  Each event carries a `node_type` tag used by the
+    React Timeline component to colour-code the node:
+      blue  — AI_REASONING  (resolution proposed, action created, reanalysis)
+      green — ORACLE_WRITE  (write-back completed, force-sync)
+      red   — DLQ_FAILURE   (dead-letter queue event)
+      amber — OPERATOR_HITL (approval, rejection, force-approve)
+      grey  — ENGAGEMENT    (customer notification, reply)
+
+    Falls back to correlation_id lookup when trace_id is a plain UUID.
+    """
+    _require_mongo()
+    from db.mongo import get_db
+
+    db = await get_db()
+
+    # Primary key for the trace is the W3C traceparent; many documents store
+    # the correlation_id *as* their trace_id, so we search both fields.
+    q = {"$or": [{"trace_id": trace_id}, {"correlation_id": trace_id}]}
+
+    events: list[dict[str, Any]] = []
+
+    # ── Action proposals ──────────────────────────────────────────────────
+    async for doc in db.action_proposals.find(q, {"_id": 0}):
+        ts = doc.get("created_at", "")
+        correlation_id = doc.get("correlation_id", "")
+        events.append({
+            "event_id":   str(doc.get("id", uuid.uuid4())),
+            "trace_id":   trace_id,
+            "node_type":  "AI_REASONING",
+            "event_type": "ACTION_CREATED",
+            "timestamp":  ts,
+            "label":      f"AI proposed: {doc.get('action_type', '?')}",
+            "detail": {
+                "action_id":     doc.get("id"),
+                "action_type":   doc.get("action_type"),
+                "description":   doc.get("action_description"),
+                "confidence":    doc.get("action_payload", {}).get("confidence"),
+                "correlation_id": correlation_id,
+            },
+        })
+        # Status transition events from the same action
+        for status, field, evt, node in [
+            ("APPROVED",  "updated_at", "ACTION_APPROVED",  "OPERATOR_HITL"),
+            ("REJECTED",  "updated_at", "ACTION_REJECTED",  "OPERATOR_HITL"),
+            ("EXECUTED",  "executed_at", "ORACLE_WRITE_COMPLETED", "ORACLE_WRITE"),
+            ("FAILED",    "updated_at", "ACTION_FAILED",    "DLQ_FAILURE"),
+            ("ESCALATED_STALE", "updated_at", "ACTION_ESCALATED", "OPERATOR_HITL"),
+        ]:
+            if doc.get("status") == status and doc.get(field):
+                events.append({
+                    "event_id":   str(uuid.uuid4()),
+                    "trace_id":   trace_id,
+                    "node_type":  node,
+                    "event_type": evt,
+                    "timestamp":  doc.get(field, ""),
+                    "label":      f"{evt.replace('_', ' ').title()}: {doc.get('action_type', '?')}",
+                    "detail": {
+                        "action_id":       doc.get("id"),
+                        "operator":        doc.get("approved_by"),
+                        "rejection_reason": doc.get("rejection_reason"),
+                        "execution_error": doc.get("execution_error"),
+                    },
+                })
+
+    # ── DLQ events ────────────────────────────────────────────────────────
+    async for doc in db.dlq_events.find(q, {"_id": 0}):
+        events.append({
+            "event_id":   str(doc.get("dlq_id", uuid.uuid4())),
+            "trace_id":   trace_id,
+            "node_type":  "DLQ_FAILURE",
+            "event_type": "DLQ_FAILURE",
+            "timestamp":  doc.get("failed_at", ""),
+            "label":      f"DLQ: {doc.get('action_type', '?')} — {doc.get('table_name', '?')}",
+            "detail": {
+                "outbox_id":     doc.get("outbox_id"),
+                "error_context": doc.get("error_context"),
+                "attempts":      doc.get("attempts"),
+                "table_name":    doc.get("table_name"),
+            },
+        })
+
+    # ── Engagement / customer interaction events ───────────────────────────
+    async for doc in db.engagement_logs.find(q, {"_id": 0}):
+        events.append({
+            "event_id":   str(doc.get("id", uuid.uuid4())),
+            "trace_id":   trace_id,
+            "node_type":  "ENGAGEMENT",
+            "event_type": "ENGAGEMENT_SENT",
+            "timestamp":  doc.get("sent_at") or doc.get("created_at", ""),
+            "label":      f"Customer notified via {doc.get('channel', '?')}",
+            "detail": {
+                "channel":          doc.get("channel"),
+                "template":         doc.get("template_used"),
+                "status":           doc.get("status"),
+                "customer_response": doc.get("customer_response"),
+                "sentiment_score":  doc.get("sentiment_score"),
+                "sentiment_label":  doc.get("sentiment_label"),
+            },
+        })
+        if doc.get("response_received_at"):
+            events.append({
+                "event_id":   str(uuid.uuid4()),
+                "trace_id":   trace_id,
+                "node_type":  "ENGAGEMENT",
+                "event_type": "CUSTOMER_REPLIED",
+                "timestamp":  doc.get("response_received_at", ""),
+                "label":      f"Customer replied ({doc.get('sentiment_label', 'UNKNOWN')})",
+                "detail": {
+                    "response":        doc.get("customer_response"),
+                    "sentiment_score": doc.get("sentiment_score"),
+                    "sentiment_label": doc.get("sentiment_label"),
+                },
+            })
+
+    # ── Audit trail entries ───────────────────────────────────────────────
+    async for doc in db.audit_events.find(
+        {"$or": [{"trace_id": trace_id}, {"metadata.correlation_id": trace_id}]},
+        {"_id": 0},
+    ):
+        if doc.get("new_status") in ("APPROVED", "REJECTED", "FORCE_APPROVED"):
+            events.append({
+                "event_id":   str(doc.get("id", uuid.uuid4())),
+                "trace_id":   trace_id,
+                "node_type":  "OPERATOR_HITL",
+                "event_type": f"AUDIT_{doc.get('new_status', 'TRANSITION')}",
+                "timestamp":  doc.get("timestamp", ""),
+                "label":      f"Operator: {doc.get('new_status', '?')} by {doc.get('actor', '?')}",
+                "detail":     doc.get("metadata", {}),
+            })
+
+    if not events:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No trace events found for trace_id={trace_id}",
+        )
+
+    # Sort chronologically; fall back to empty string for missing timestamps
+    events.sort(key=lambda e: e.get("timestamp") or "")
+    return {"trace_id": trace_id, "event_count": len(events), "events": events}
+
+
+# ── Phase 14: Human Feedback endpoint ─────────────────────────────────────────
+
+
+class HumanFeedbackRequest(BaseModel):
+    operator_id:    str            = Field(..., description="Operator submitting the correction")
+    quality_score:  int            = Field(..., ge=1, le=5, description="1 (wrong) – 5 (excellent)")
+    correct_action: Optional[str]  = Field(None, description="What should the AI have proposed?")
+    feedback_notes: Optional[str]  = Field(None, description="Free-text rationale for the correction")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "operator_id":    "noc-lead@vodafone.com",
+                "quality_score":  2,
+                "correct_action": "escalate",
+                "feedback_notes": "Customer has VIP flag — should always escalate, not offer credit",
+            }
+        }
+    }
+
+
+@app.post("/actions/{action_id}/feedback", tags=["HITL"])
+async def submit_action_feedback(
+    action_id: str,
+    body: HumanFeedbackRequest,
+    _: str = Security(require_api_key),
+):
+    """
+    Phase 14 — Human Feedback / Operator Correction.
+
+    Publishes an OperatorCorrectionEvent to the synapse.operator.corrections Kafka
+    topic so future fine-tuning pipelines can learn from NOC operator expertise.
+
+    The feedback is also stored in MongoDB for offline analysis.
+    """
+    _require_mongo()
+    from db.mongo import get_db
+
+    db = await get_db()
+    action_doc = await db.action_proposals.find_one({"id": action_id}, {"_id": 0})
+    if not action_doc:
+        raise HTTPException(status_code=404, detail=f"Action {action_id} not found")
+
+    from kafka.schemas import OperatorCorrectionEvent
+    from kafka.topics import TOPIC_OPERATOR_CORRECTIONS
+
+    correction = OperatorCorrectionEvent(
+        action_id=action_id,
+        correlation_id=action_doc.get("correlation_id", ""),
+        operator_id=body.operator_id,
+        original_action_type=action_doc.get("action_type", ""),
+        proposed_action=action_doc.get("action_description", ""),
+        correct_action=body.correct_action,
+        quality_score=body.quality_score,
+        feedback_notes=body.feedback_notes,
+        opco_id=action_doc.get("opco_id"),
+        trace_id=action_doc.get("trace_id"),
+    )
+
+    # Persist to MongoDB for offline analytics
+    await db.operator_corrections.insert_one(correction.model_dump())
+
+    # Publish to Kafka (best-effort; non-fatal if Kafka unavailable)
+    kafka_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+    if kafka_servers:
+        try:
+            from kafka.producer import create_producer, publish
+            producer = await create_producer()
+            async with producer:
+                await publish(
+                    producer,
+                    TOPIC_OPERATOR_CORRECTIONS,
+                    correction.model_dump(),
+                    key=action_id,
+                )
+        except Exception as exc:
+            logger.warning("Could not publish operator correction to Kafka: %s", exc)
+
+    logger.info(
+        "Operator feedback: action=%s score=%d operator=%s",
+        action_id, body.quality_score, body.operator_id,
+    )
+    return {
+        "status":        "feedback_recorded",
+        "correction_id": correction.correction_id,
+        "action_id":     action_id,
+        "quality_score": body.quality_score,
+    }
 
 
 # ── Phase 12: Force Sync — per-customer Oracle bypass for SYSTEM_STALE state ──
