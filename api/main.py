@@ -35,8 +35,22 @@ Phase 12 — Advanced Reliability:
   POST /canary/promote             — Promote candidate model to 100% traffic
   POST /canary/{result_id}/score   — Backfill operator quality score onto a canary result
 
+Phase 13 — Resilience & Cost:
+  GET  /billing/usage              — All OpCo token usage for the current billing period
+  GET  /billing/usage/{opco_id}    — Single OpCo token usage + quota status
+  GET  /system/oracle-ha           — Oracle primary/standby circuit breaker state
+
 Observability:
   GET  /metrics                    — Prometheus metrics (scraped by Prometheus)
+
+WebSocket events pushed to /ws/noc/{opco_id}:
+  resolution_proposed  — agent completed analysis, actions awaiting review
+  action_approved      — operator approved an action
+  force_approved       — operator force-approved an ESCALATED_STALE action
+  dlq_acknowledged     — DLQ event acknowledged by NOC
+  system_stale         — Kafka consumer lag exceeded threshold
+  force_sync           — NOC operator triggered a per-customer Kafka bypass
+  heartbeat            — keep-alive every 30 s
 """
 
 import asyncio
@@ -77,8 +91,12 @@ async def lifespan(app: FastAPI):
     # Startup
     if _mongo_enabled:
         from db.mongo import ensure_indexes
+        from db.ods import ensure_ods_indexes
+        from billing.token_budget import ensure_budget_indexes
         await ensure_indexes()
-        logger.info("MongoDB indexes ready")
+        await ensure_ods_indexes()
+        await ensure_budget_indexes()
+        logger.info("MongoDB indexes ready (actions, ODS, token_budgets)")
 
     from jobs.expiry import setup_expiry_scheduler
     scheduler = setup_expiry_scheduler()
@@ -98,13 +116,35 @@ async def lifespan(app: FastAPI):
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
+_OPENAPI_TAGS = [
+    {"name": "Agent",      "description": "AI fallout analysis and Customer 360 profiles"},
+    {"name": "HITL",       "description": "Human-in-the-loop action review and approval workflow"},
+    {"name": "System",     "description": "Health, circuit breaker status, and NOC controls"},
+    {"name": "Engagement", "description": "Proactive customer engagement via SMS / Email / WhatsApp"},
+    {"name": "DLQ",        "description": "Dead Letter Queue — inspect and acknowledge failed commands"},
+    {"name": "Canary",     "description": "A/B model traffic splitting and quality-gate promotion"},
+    {"name": "Memory",     "description": "ChromaDB RAG knowledge base management"},
+    {
+        "name": "Billing",
+        "description": (
+            "Phase 13 — Per-OpCo AI token quota management.  "
+            "Enforces monthly token budgets so no single OpCo can exhaust the shared "
+            "Anthropic API allowance.  Quotas are configured via OPCO_TOKEN_QUOTAS env var."
+        ),
+    },
+]
+
 app = FastAPI(
     title="Synapse — Telco Fallout Resolution Agent",
     description=(
         "AI-powered BSS/OSS fallout detection, root cause analysis, HITL action management, "
-        "and resolution. Powered by Claude."
+        "and resolution.  Powered by Claude.\n\n"
+        "**Multi-tenant** — each request is scoped to an `opco_id` "
+        "(e.g. `VODAFONE_UK`, `VODAFONE_DE`) for data residency and quota isolation.\n\n"
+        "**WebSocket NOC dashboard** — connect to `WS /ws/noc/{opco_id}` for live events."
     ),
-    version="2.0.0",
+    version="3.0.0",
+    openapi_tags=_OPENAPI_TAGS,
     lifespan=lifespan,
 )
 
@@ -970,6 +1010,72 @@ async def noc_websocket(websocket: WebSocket, opco_id: str):
         ws_manager.disconnect(websocket, opco_id)
     except Exception:
         ws_manager.disconnect(websocket, opco_id)
+
+
+# ── Phase 13: Billing — Per-OpCo AI Token Budget ──────────────────────────────
+
+
+@app.get("/billing/usage", tags=["Billing"])
+async def list_token_usage(_: str = Security(require_api_key)):
+    """
+    Phase 13 — List AI token usage for **all** OpCos in the current billing period.
+
+    Returns one document per OpCo showing quota, consumed tokens, remaining tokens,
+    and utilisation percentage.  Use this to monitor budget burn rate and catch
+    runaway OpCos before they exhaust the shared Anthropic API allowance.
+    """
+    _require_mongo()
+    from billing.token_budget import get_usage_report
+    return await get_usage_report()
+
+
+@app.get("/billing/usage/{opco_id}", tags=["Billing"])
+async def get_opco_token_usage(opco_id: str, _: str = Security(require_api_key)):
+    """
+    Phase 13 — AI token usage and quota status for a **single** OpCo.
+
+    Returns current period consumed/remaining tokens and whether the OpCo is
+    within quota.  Useful for per-tenant dashboards and automated alerts.
+    """
+    _require_mongo()
+    from billing.token_budget import check_quota, get_usage_report
+
+    quota  = await check_quota(opco_id)
+    report = await get_usage_report(opco_id)
+
+    return {
+        "opco_id":       quota.opco_id,
+        "quota_tokens":  quota.quota,
+        "consumed":      quota.consumed,
+        "remaining":     quota.remaining,
+        "utilisation_pct": round(quota.consumed / quota.quota * 100, 1) if quota.quota else 0,
+        "allowed":       quota.allowed,
+        "period":        quota.period,
+        "detail":        report[0] if report else {},
+    }
+
+
+# ── Phase 13: Oracle HA Circuit Breaker status ─────────────────────────────────
+
+
+@app.get("/system/oracle-ha", tags=["System"])
+def oracle_ha_status(_: str = Security(require_api_key)):
+    """
+    Phase 13 — Oracle High-Availability circuit breaker state.
+
+    Reports whether the primary Oracle is CLOSED (healthy), OPEN (failed over
+    to standby), or HALF_OPEN (probing recovery).  When OPEN, writes are queued
+    to Kafka and reads are served from the standby replica.
+    """
+    from db.oracle_ha import OracleHAPool
+    pool = OracleHAPool.instance()
+    return {
+        "state":           pool.state.value,
+        "failure_count":   pool.failure_count,
+        "standby_configured": bool(os.getenv("ORA_STANDBY_HOST")),
+        "failure_threshold": int(os.getenv("ORACLE_HA_FAILURE_THRESHOLD", "3")),
+        "half_open_probe_seconds": int(os.getenv("ORACLE_HA_HALF_OPEN_PROBE_SECONDS", "60")),
+    }
 
 
 # ── Dev runner ─────────────────────────────────────────────────────────────────

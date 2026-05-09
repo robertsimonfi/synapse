@@ -208,31 +208,38 @@ async def _execute_oracle_dml(
     """
     Execute a parameterised DML statement against Oracle.
 
-    Returns True on success. Raises on failure.
-    The source_version_anchor guard is applied for UPDATE statements — if the
-    target row's UPDATED_DATE is newer than the anchor, the write is skipped.
-    """
-    from agent.db import get_connection
+    Phase 13 — Oracle HA:
+      • Stale-write guard read uses OracleHAPool.get_read_connection()
+        so it can fall back to the standby replica when the primary is OPEN.
+      • The actual write uses OracleHAPool.get_write_connection() which raises
+        OracleWriteUnavailable when the circuit is OPEN.  Callers catch this
+        and re-queue the command to Kafka.
 
-    def _do_execute():
-        conn = get_connection()
-        cur  = conn.cursor()
-        try:
-            # Stale-write guard for UPDATE operations
-            if source_version_anchor and table_name in (
-                "BILLING_ACCOUNT", "SERVICE_SUBSCRIPTION", "ORDER_HEADER", "ORDER_FALLOUT"
-            ):
-                pk_col = next(
-                    (v for k, v in {
-                        "billing_account_id": "BILLING_ACCOUNT_ID",
-                        "subscription_id":    "SUBSCRIPTION_ID",
-                        "order_id":           "ORDER_ID",
-                        "fallout_id":         "FALLOUT_ID",
-                    }.items() if k in where_clause),
-                    None,
-                )
-                if pk_col:
-                    pk_val = where_clause[pk_col.lower()]
+    Returns True on success. Raises on failure.
+    """
+    from db.oracle_ha import OracleHAPool, OracleWriteUnavailable  # noqa: PLC0415
+
+    pool = OracleHAPool.instance()
+
+    def _do_execute() -> bool:
+        # ── Stale-write guard (read path — can use standby) ───────────────────
+        if source_version_anchor and table_name in (
+            "BILLING_ACCOUNT", "SERVICE_SUBSCRIPTION", "ORDER_HEADER", "ORDER_FALLOUT"
+        ):
+            pk_col = next(
+                (v for k, v in {
+                    "billing_account_id": "BILLING_ACCOUNT_ID",
+                    "subscription_id":    "SUBSCRIPTION_ID",
+                    "order_id":           "ORDER_ID",
+                    "fallout_id":         "FALLOUT_ID",
+                }.items() if k in where_clause),
+                None,
+            )
+            if pk_col:
+                pk_val   = where_clause[pk_col.lower()]
+                read_con = pool.get_read_connection()
+                cur      = read_con.cursor()
+                try:
                     cur.execute(
                         f"SELECT TO_CHAR(UPDATED_DATE, 'YYYY-MM-DD HH24:MI:SS') AS updated_date "
                         f"FROM {table_name} WHERE {pk_col} = :pk",
@@ -241,18 +248,25 @@ async def _execute_oracle_dml(
                     row = cur.fetchone()
                     if row and row[0] and row[0] > source_version_anchor:
                         logger.warning(
-                            "Stale-write guard: %s row updated_date=%s > anchor=%s — skipping",
+                            "Stale-write guard: %s updated_date=%s > anchor=%s — skipping",
                             table_name, row[0], source_version_anchor,
                         )
-                        return True  # Idempotent skip
+                        return True  # idempotent skip
+                finally:
+                    cur.close()
+                    read_con.close()
 
+        # ── DML write (primary only) ──────────────────────────────────────────
+        write_con = pool.get_write_connection()  # raises OracleWriteUnavailable when OPEN
+        cur       = write_con.cursor()
+        try:
             cur.execute(sql, params)
-            conn.commit()
+            write_con.commit()
             logger.info("Oracle DML executed: %s rows_affected=%d", sql[:80], cur.rowcount)
             return True
         finally:
             cur.close()
-            conn.close()
+            write_con.close()
 
     return await asyncio.to_thread(_do_execute)
 
@@ -290,12 +304,30 @@ async def _handle_command(cmd: dict) -> bool:
         await mark_outbox_completed(outbox_id)
         return True
 
+    from db.oracle_ha import OracleWriteUnavailable  # noqa: PLC0415
+
+    # Phase 13: if Oracle primary is unavailable, re-queue immediately to DLQ
+    # rather than retrying against a known-down primary.  The outbox stays
+    # PENDING so the Relay will re-lift it when the circuit recovers.
     last_error: str = ""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             await _execute_oracle_dml(sql, params, source_version_anchor, table_name, where_clause)
             await mark_outbox_completed(outbox_id)
             return True
+        except OracleWriteUnavailable as exc:
+            # Primary circuit is OPEN — don't burn retries; queue to DLQ with
+            # HA context so the NOC knows to wait for primary recovery.
+            error_msg = f"ORACLE_HA_UNAVAILABLE: {exc}"
+            logger.warning(
+                "Oracle HA: primary unavailable — queuing outbox_id=%s to DLQ", outbox_id
+            )
+            from observability.metrics import oracle_writes_queued_total
+            opco = cmd.get("opco_id", "DEFAULT")
+            oracle_writes_queued_total.labels(opco_id=opco).inc()
+            await mark_outbox_failed(outbox_id, error_msg)
+            await _publish_to_dlq(cmd, error_msg, attempts=attempt)
+            return False
         except Exception as exc:
             last_error = str(exc)
             logger.error(
