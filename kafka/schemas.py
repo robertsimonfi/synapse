@@ -183,3 +183,50 @@ class DlqEvent(BaseModel):
 
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat()}
+
+
+# ── synapse.customer.feedback (Phase 14) ──────────────────────────────────────
+
+class CustomerFeedbackEvent(BaseModel):
+    """
+    Inbound customer feedback from any channel (SMS reply, IVR, web form).
+    Published by the webhook/engagement handler; consumed by the Sentiment worker.
+    """
+
+    feedback_id:    str = Field(default_factory=lambda: str(uuid.uuid4()))
+    customer_id:    Optional[int]  = None
+    engagement_id:  Optional[str]  = None   # links back to EngagementLog.id
+    correlation_id: Optional[str]  = None
+    channel:        str            = "UNKNOWN"   # SMS, EMAIL, WHATSAPP, IVR, WEB
+    raw_text:       str                          # original customer message
+    opco_id:        Optional[str]  = None
+    received_at:    str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    trace_id:       Optional[str]  = None
+
+    class Config:
+        json_encoders = {datetime: lambda v: v.isoformat()}
+
+
+# ── synapse.operator.corrections (Phase 14) ───────────────────────────────────
+
+class OperatorCorrectionEvent(BaseModel):
+    """
+    Human feedback from the NOC operator correcting or annotating an AI decision.
+    Published via POST /actions/{id}/feedback; consumed by future training pipelines.
+    """
+
+    correction_id:        str = Field(default_factory=lambda: str(uuid.uuid4()))
+    action_id:            str
+    correlation_id:       str
+    operator_id:          str
+    original_action_type: str
+    proposed_action:      str            # what the AI recommended
+    correct_action:       Optional[str]  = None   # what the operator says should have happened
+    quality_score:        int            = 3      # 1 (wrong) – 5 (excellent)
+    feedback_notes:       Optional[str]  = None   # free-text operator rationale
+    opco_id:              Optional[str]  = None
+    submitted_at:         str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    trace_id:             Optional[str]  = None
+
+    class Config:
+        json_encoders = {datetime: lambda v: v.isoformat()}
