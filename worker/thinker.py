@@ -18,9 +18,12 @@ import os
 import uuid
 
 from agent.agent import FalloutInput, run_agent
+from billing.token_budget import check_quota, consume_tokens
 from db.mongo import create_action, ensure_indexes
 from kafka.consumer import create_consumer
-from kafka.topics import GROUP_THINKER, TOPIC_AI_ORCHESTRATION
+from kafka.producer import create_producer, publish
+from kafka.schemas import DlqEvent
+from kafka.topics import GROUP_THINKER, TOPIC_AI_ORCHESTRATION, TOPIC_DLQ
 from models.action import ActionProposal
 from observability.metrics import actions_pending_total
 from observability.tracing import traced_span
@@ -73,11 +76,49 @@ def _build_proposals(
 
 # ── Message handler ───────────────────────────────────────────────────────────
 
+_dlq_producer = None
+
+
+async def _get_dlq_producer():
+    global _dlq_producer
+    if _dlq_producer is None:
+        _dlq_producer = await create_producer()
+    return _dlq_producer
+
+
 async def _handle_task(msg_value: dict) -> None:
     correlation_id: str = msg_value.get("correlation_id", str(uuid.uuid4()))
+    opco_id: str        = msg_value.get("opco_id") or "DEFAULT"
 
     with traced_span("thinker.resolve_job", correlation_id=correlation_id):
-        logger.info("Thinker received task correlation_id=%s", correlation_id)
+        logger.info(
+            "Thinker received task correlation_id=%s opco=%s", correlation_id, opco_id
+        )
+
+        # Phase 13: check per-OpCo token quota before running the (expensive) agent
+        quota = await check_quota(opco_id)
+        if not quota.allowed:
+            logger.warning(
+                "Token quota EXHAUSTED opco=%s — routing task correlation=%s to DLQ",
+                opco_id, correlation_id,
+            )
+            dlq_event = DlqEvent(
+                source_topic=TOPIC_AI_ORCHESTRATION,
+                outbox_id=correlation_id,
+                action_id="N/A",
+                correlation_id=correlation_id,
+                action_type="resolve_fallout",
+                table_name="N/A",
+                error_context=(
+                    f"QUOTA_EXCEEDED: opco={opco_id} consumed={quota.consumed} "
+                    f"quota={quota.quota} period={quota.period}"
+                ),
+                attempts=1,
+                opco_id=opco_id,
+            )
+            producer = await _get_dlq_producer()
+            await publish(producer, TOPIC_DLQ, dlq_event.model_dump(), key=correlation_id)
+            return
 
         fallout_input = FalloutInput(
             order_id=msg_value.get("order_id"),
@@ -92,6 +133,15 @@ async def _handle_task(msg_value: dict) -> None:
 
         # Agent is sync/CPU-bound — run in thread pool to free the event loop
         resolution = await asyncio.to_thread(run_agent, fallout_input, correlation_id)
+
+        # Phase 13: debit token usage from the OpCo's monthly budget
+        usage = resolution.token_usage
+        if usage.get("input_tokens") or usage.get("output_tokens"):
+            await consume_tokens(
+                opco_id,
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+            )
 
         reanalysis_count = msg_value.get("reanalysis_count", 0)
 
@@ -117,6 +167,28 @@ async def _handle_task(msg_value: dict) -> None:
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
+_rca_check_counter = 0
+_RCA_INTERVAL = int(os.getenv("RCA_CHECK_INTERVAL_MESSAGES", "50"))
+
+
+async def _maybe_run_rca(opco_id: str | None) -> None:
+    """Phase 15: periodic RCA check every RCA_INTERVAL messages."""
+    global _rca_check_counter
+    _rca_check_counter += 1
+    if _rca_check_counter % _RCA_INTERVAL != 0:
+        return
+    try:
+        from agent.rca import run_rca
+        result = await run_rca(opco_id)
+        if result and result.cluster:
+            logger.info(
+                "rca: cluster detected %s=%s pct=%.0f%% — proposals created",
+                result.cluster.dimension, result.cluster.value, result.cluster.pct * 100,
+            )
+    except Exception as exc:
+        logger.warning("rca: check failed — %s", exc)
+
+
 async def run_thinker() -> None:
     await ensure_indexes()
 
@@ -131,6 +203,7 @@ async def run_thinker() -> None:
             task = msg.value
             try:
                 await _handle_task(task)
+                await _maybe_run_rca(task.get("opco_id"))
             except Exception:
                 logger.exception(
                     "Thinker handler failed for correlation_id=%s",

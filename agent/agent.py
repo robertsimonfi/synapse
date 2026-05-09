@@ -63,15 +63,35 @@ class FalloutResolution:
     routing_confidence:  float = 0.0
     critic_violations:   list[str] = field(default_factory=list)
     policy_violations:   list[str] = field(default_factory=list)
+    # Phase 13: cumulative token usage across all API calls in this resolution
+    token_usage:         dict = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0})
 
     def __post_init__(self):
         if self.action_proposals is None:
             self.action_proposals = []
 
 
+def _load_prompt_addenda() -> str:
+    """Phase 15: load operator-approved prompt addenda from prompt_optimizer."""
+    import json as _json
+    addenda_path = os.path.join(os.path.dirname(__file__), "prompt_addenda.json")
+    try:
+        with open(addenda_path) as f:
+            items: list[dict] = _json.load(f)
+        if not items:
+            return ""
+        lines = ["Operator-approved AI behaviour guidelines (derived from correction analysis):"]
+        for item in items:
+            lines.append(f"- [{item.get('action_type', 'ALL')}] {item.get('addendum', '')}")
+        return "\n".join(lines) + "\n"
+    except FileNotFoundError:
+        return ""
+
+
 def build_system_prompt(
     rag_context: str, memory_context: str, expert_addendum: str = ""
 ) -> str:
+    addenda = _load_prompt_addenda()
     return f"""You are a Telco Fallout Resolution Agent for a major US carrier (T-Mobile style BSS/OSS).
 
 Your job is to:
@@ -85,7 +105,7 @@ Your job is to:
 {rag_context}
 
 {memory_context}
-{expert_addendum}
+{addenda}{expert_addendum}
 Guidelines:
 - Always call at minimum 2-3 tools to build a complete picture before concluding.
 - Correlate provisioning failures with active network alarms when relevant.
@@ -199,6 +219,8 @@ def run_agent(fallout_input: FalloutInput, correlation_id: str | None = None) ->
     raw_reasoning_parts: list[str] = []
     last_response = None
     max_iterations = 10
+    # Phase 13: accumulate token usage across all API calls for budget tracking
+    _token_usage: dict = {"input_tokens": 0, "output_tokens": 0}
 
     for _ in range(max_iterations):
         last_response = client.messages.create(
@@ -208,6 +230,10 @@ def run_agent(fallout_input: FalloutInput, correlation_id: str | None = None) ->
             tools=active_tools,
             messages=messages,
         )
+        if hasattr(last_response, "usage") and last_response.usage:
+            _token_usage["input_tokens"]  += getattr(last_response.usage, "input_tokens",  0)
+            _token_usage["output_tokens"] += getattr(last_response.usage, "output_tokens", 0)
+
         for block in last_response.content:
             if hasattr(block, "text"):
                 raw_reasoning_parts.append(block.text)
@@ -256,6 +282,10 @@ def run_agent(fallout_input: FalloutInput, correlation_id: str | None = None) ->
                 tools=active_tools,
                 messages=messages,
             )
+            if hasattr(last_response, "usage") and last_response.usage:
+                _token_usage["input_tokens"]  += getattr(last_response.usage, "input_tokens",  0)
+                _token_usage["output_tokens"] += getattr(last_response.usage, "output_tokens", 0)
+
             for block in last_response.content:
                 if hasattr(block, "text"):
                     raw_reasoning_parts.append(block.text)
@@ -312,6 +342,7 @@ def run_agent(fallout_input: FalloutInput, correlation_id: str | None = None) ->
         routing_confidence=routing.confidence,
         critic_violations=critic_violations,
         policy_violations=policy_violations,
+        token_usage=_token_usage,
     )
 
 

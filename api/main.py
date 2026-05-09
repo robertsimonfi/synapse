@@ -35,8 +35,35 @@ Phase 12 — Advanced Reliability:
   POST /canary/promote             — Promote candidate model to 100% traffic
   POST /canary/{result_id}/score   — Backfill operator quality score onto a canary result
 
+Phase 13 — Resilience & Cost:
+  GET  /billing/usage              — All OpCo token usage for the current billing period
+  GET  /billing/usage/{opco_id}    — Single OpCo token usage + quota status
+  GET  /system/oracle-ha           — Oracle primary/standby circuit breaker state
+
+Phase 14 — GA Sprint (Sentiment + React Dashboard):
+  GET  /system/trace/{trace_id}    — Chronological event timeline for a distributed trace
+  POST /actions/{id}/feedback      — Operator correction published to synapse.operator.corrections
+
+Phase 15 — Autonomous Intelligence:
+  POST /auth/token                  — Obtain a JWT access token (operator login)
+  GET  /auth/refresh                — Refresh a valid JWT
+  GET  /system/rca/latest           — Latest predictive Root Cause Analysis result
+  POST /system/rca/run              — Trigger an on-demand RCA scan
+  GET  /intelligence/prompt-suggestions      — List pending prompt-optimizer suggestions
+  POST /intelligence/prompt-suggestions/{id}/apply  — Apply a suggestion to the system prompt
+  POST /intelligence/prompt-suggestions/{id}/reject — Reject a suggestion
+
 Observability:
   GET  /metrics                    — Prometheus metrics (scraped by Prometheus)
+
+WebSocket events pushed to /ws/noc/{opco_id}:
+  resolution_proposed  — agent completed analysis, actions awaiting review
+  action_approved      — operator approved an action
+  force_approved       — operator force-approved an ESCALATED_STALE action
+  dlq_acknowledged     — DLQ event acknowledged by NOC
+  system_stale         — Kafka consumer lag exceeded threshold
+  force_sync           — NOC operator triggered a per-customer Kafka bypass
+  heartbeat            — keep-alive every 30 s
 """
 
 import asyncio
@@ -59,7 +86,7 @@ from agent.agent import (
     run_customer_360,
 )
 from agent.memory import memory_stats
-from api.security import require_api_key
+from api.security import require_api_key, auth_router, get_current_operator, OperatorInfo
 from api.websocket_manager import manager as ws_manager, noc_event, VALID_OPCO_IDS
 from api.canary_routes import router as canary_router  # Phase 12
 from models.action import ApproveRequest, ForceApproveRequest, RejectRequest
@@ -77,8 +104,12 @@ async def lifespan(app: FastAPI):
     # Startup
     if _mongo_enabled:
         from db.mongo import ensure_indexes
+        from db.ods import ensure_ods_indexes
+        from billing.token_budget import ensure_budget_indexes
         await ensure_indexes()
-        logger.info("MongoDB indexes ready")
+        await ensure_ods_indexes()
+        await ensure_budget_indexes()
+        logger.info("MongoDB indexes ready (actions, ODS, token_budgets)")
 
     from jobs.expiry import setup_expiry_scheduler
     scheduler = setup_expiry_scheduler()
@@ -98,13 +129,50 @@ async def lifespan(app: FastAPI):
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
+_OPENAPI_TAGS = [
+    {"name": "Agent",      "description": "AI fallout analysis and Customer 360 profiles"},
+    {"name": "HITL",       "description": "Human-in-the-loop action review and approval workflow"},
+    {"name": "System",     "description": "Health, circuit breaker status, and NOC controls"},
+    {"name": "Engagement", "description": "Proactive customer engagement via SMS / Email / WhatsApp"},
+    {"name": "DLQ",        "description": "Dead Letter Queue — inspect and acknowledge failed commands"},
+    {"name": "Canary",     "description": "A/B model traffic splitting and quality-gate promotion"},
+    {"name": "Memory",     "description": "ChromaDB RAG knowledge base management"},
+    {
+        "name": "Billing",
+        "description": (
+            "Phase 13 — Per-OpCo AI token quota management.  "
+            "Enforces monthly token budgets so no single OpCo can exhaust the shared "
+            "Anthropic API allowance.  Quotas are configured via OPCO_TOKEN_QUOTAS env var."
+        ),
+    },
+    {
+        "name": "Auth",
+        "description": (
+            "Phase 15 — JWT operator authentication.  "
+            "POST /auth/token to obtain a Bearer token.  All dashboard endpoints accept "
+            "Bearer tokens in addition to the legacy X-API-Key header."
+        ),
+    },
+    {
+        "name": "Intelligence",
+        "description": (
+            "Phase 15 — Autonomous intelligence: predictive RCA cluster detection and "
+            "AI prompt self-optimization driven by operator correction feedback."
+        ),
+    },
+]
+
 app = FastAPI(
     title="Synapse — Telco Fallout Resolution Agent",
     description=(
         "AI-powered BSS/OSS fallout detection, root cause analysis, HITL action management, "
-        "and resolution. Powered by Claude."
+        "and resolution.  Powered by Claude.\n\n"
+        "**Multi-tenant** — each request is scoped to an `opco_id` "
+        "(e.g. `VODAFONE_UK`, `VODAFONE_DE`) for data residency and quota isolation.\n\n"
+        "**WebSocket NOC dashboard** — connect to `WS /ws/noc/{opco_id}` for live events."
     ),
-    version="2.0.0",
+    version="3.0.0",
+    openapi_tags=_OPENAPI_TAGS,
     lifespan=lifespan,
 )
 
@@ -120,6 +188,9 @@ app.mount("/metrics", make_asgi_app())
 
 # Phase 12: canary analysis routes
 app.include_router(canary_router)
+
+# Phase 15: JWT auth routes
+app.include_router(auth_router)
 
 
 # ── Resolve schemas ────────────────────────────────────────────────────────────
@@ -768,35 +839,35 @@ async def customer_reply_webhook(request: CustomerReplyRequest):
     received_at = datetime.now(_tz.utc)
     updated = await record_customer_response(engagement.id, request.reply_text, received_at)
 
-    # Publish CUSTOMER_FEEDBACK event to RabbitMQ so Thinker can react
-    rabbitmq_uri = os.getenv("RABBITMQ_URL")
-    if rabbitmq_uri:
+    # Phase 14: publish CustomerFeedbackEvent to Kafka for sentiment scoring
+    kafka_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+    if kafka_servers:
         try:
-            import aio_pika
-            connection = await aio_pika.connect_robust(rabbitmq_uri)
-            async with connection:
-                channel = await connection.channel()
-                import json
-                await channel.default_exchange.publish(
-                    aio_pika.Message(
-                        body=json.dumps({
-                            "event_type":     "CUSTOMER_FEEDBACK",
-                            "correlation_id": request.correlation_id,
-                            "action_id":      engagement.action_id,
-                            "customer_id":    engagement.customer_id,
-                            "reply_text":     request.reply_text,
-                            "channel":        request.channel,
-                            "received_at":    received_at.isoformat(),
-                        }).encode(),
-                    ),
-                    routing_key="incoming_events",
+            from kafka.producer import create_producer, publish
+            from kafka.schemas import CustomerFeedbackEvent
+            from kafka.topics import TOPIC_CUSTOMER_FEEDBACK
+
+            feedback_evt = CustomerFeedbackEvent(
+                customer_id=int(engagement.customer_id) if engagement.customer_id else None,
+                engagement_id=engagement.id,
+                correlation_id=request.correlation_id,
+                channel=request.channel,
+                raw_text=request.reply_text,
+            )
+            producer = await create_producer()
+            async with producer:
+                await publish(
+                    producer,
+                    TOPIC_CUSTOMER_FEEDBACK,
+                    feedback_evt.model_dump(),
+                    key=engagement.id,
                 )
             logger.info(
-                "CUSTOMER_FEEDBACK published correlation=%s action=%s",
-                request.correlation_id, engagement.action_id,
+                "CUSTOMER_FEEDBACK published to Kafka correlation=%s engagement=%s",
+                request.correlation_id, engagement.id,
             )
         except Exception as exc:
-            logger.warning("RabbitMQ publish failed for feedback: %s", exc)
+            logger.warning("Kafka publish failed for customer feedback: %s", exc)
 
     return {
         "status":         "recorded",
@@ -833,6 +904,249 @@ async def acknowledge_dlq_event_endpoint(
     from db.ods import acknowledge_dlq_event
     await acknowledge_dlq_event(outbox_id, body.operator_id)
     return {"status": "acknowledged", "outbox_id": outbox_id, "by": body.operator_id}
+
+
+# ── Phase 14: Timeline API ────────────────────────────────────────────────────
+
+
+@app.get("/system/trace/{trace_id}", tags=["System"])
+async def get_trace_timeline(
+    trace_id: str,
+    _: str = Security(require_api_key),
+):
+    """
+    Phase 14 — Distributed Trace Timeline.
+
+    Aggregates all events that share the given trace_id (W3C traceparent) into a
+    chronological JSON array.  Each event carries a `node_type` tag used by the
+    React Timeline component to colour-code the node:
+      blue  — AI_REASONING  (resolution proposed, action created, reanalysis)
+      green — ORACLE_WRITE  (write-back completed, force-sync)
+      red   — DLQ_FAILURE   (dead-letter queue event)
+      amber — OPERATOR_HITL (approval, rejection, force-approve)
+      grey  — ENGAGEMENT    (customer notification, reply)
+
+    Falls back to correlation_id lookup when trace_id is a plain UUID.
+    """
+    _require_mongo()
+    from db.mongo import get_db
+
+    db = await get_db()
+
+    # Primary key for the trace is the W3C traceparent; many documents store
+    # the correlation_id *as* their trace_id, so we search both fields.
+    q = {"$or": [{"trace_id": trace_id}, {"correlation_id": trace_id}]}
+
+    events: list[dict[str, Any]] = []
+
+    # ── Action proposals ──────────────────────────────────────────────────
+    async for doc in db.action_proposals.find(q, {"_id": 0}):
+        ts = doc.get("created_at", "")
+        correlation_id = doc.get("correlation_id", "")
+        events.append({
+            "event_id":   str(doc.get("id", uuid.uuid4())),
+            "trace_id":   trace_id,
+            "node_type":  "AI_REASONING",
+            "event_type": "ACTION_CREATED",
+            "timestamp":  ts,
+            "label":      f"AI proposed: {doc.get('action_type', '?')}",
+            "detail": {
+                "action_id":     doc.get("id"),
+                "action_type":   doc.get("action_type"),
+                "description":   doc.get("action_description"),
+                "confidence":    doc.get("action_payload", {}).get("confidence"),
+                "correlation_id": correlation_id,
+            },
+        })
+        # Status transition events from the same action
+        for status, field, evt, node in [
+            ("APPROVED",  "updated_at", "ACTION_APPROVED",  "OPERATOR_HITL"),
+            ("REJECTED",  "updated_at", "ACTION_REJECTED",  "OPERATOR_HITL"),
+            ("EXECUTED",  "executed_at", "ORACLE_WRITE_COMPLETED", "ORACLE_WRITE"),
+            ("FAILED",    "updated_at", "ACTION_FAILED",    "DLQ_FAILURE"),
+            ("ESCALATED_STALE", "updated_at", "ACTION_ESCALATED", "OPERATOR_HITL"),
+        ]:
+            if doc.get("status") == status and doc.get(field):
+                events.append({
+                    "event_id":   str(uuid.uuid4()),
+                    "trace_id":   trace_id,
+                    "node_type":  node,
+                    "event_type": evt,
+                    "timestamp":  doc.get(field, ""),
+                    "label":      f"{evt.replace('_', ' ').title()}: {doc.get('action_type', '?')}",
+                    "detail": {
+                        "action_id":       doc.get("id"),
+                        "operator":        doc.get("approved_by"),
+                        "rejection_reason": doc.get("rejection_reason"),
+                        "execution_error": doc.get("execution_error"),
+                    },
+                })
+
+    # ── DLQ events ────────────────────────────────────────────────────────
+    async for doc in db.dlq_events.find(q, {"_id": 0}):
+        events.append({
+            "event_id":   str(doc.get("dlq_id", uuid.uuid4())),
+            "trace_id":   trace_id,
+            "node_type":  "DLQ_FAILURE",
+            "event_type": "DLQ_FAILURE",
+            "timestamp":  doc.get("failed_at", ""),
+            "label":      f"DLQ: {doc.get('action_type', '?')} — {doc.get('table_name', '?')}",
+            "detail": {
+                "outbox_id":     doc.get("outbox_id"),
+                "error_context": doc.get("error_context"),
+                "attempts":      doc.get("attempts"),
+                "table_name":    doc.get("table_name"),
+            },
+        })
+
+    # ── Engagement / customer interaction events ───────────────────────────
+    async for doc in db.engagement_logs.find(q, {"_id": 0}):
+        events.append({
+            "event_id":   str(doc.get("id", uuid.uuid4())),
+            "trace_id":   trace_id,
+            "node_type":  "ENGAGEMENT",
+            "event_type": "ENGAGEMENT_SENT",
+            "timestamp":  doc.get("sent_at") or doc.get("created_at", ""),
+            "label":      f"Customer notified via {doc.get('channel', '?')}",
+            "detail": {
+                "channel":          doc.get("channel"),
+                "template":         doc.get("template_used"),
+                "status":           doc.get("status"),
+                "customer_response": doc.get("customer_response"),
+                "sentiment_score":  doc.get("sentiment_score"),
+                "sentiment_label":  doc.get("sentiment_label"),
+            },
+        })
+        if doc.get("response_received_at"):
+            events.append({
+                "event_id":   str(uuid.uuid4()),
+                "trace_id":   trace_id,
+                "node_type":  "ENGAGEMENT",
+                "event_type": "CUSTOMER_REPLIED",
+                "timestamp":  doc.get("response_received_at", ""),
+                "label":      f"Customer replied ({doc.get('sentiment_label', 'UNKNOWN')})",
+                "detail": {
+                    "response":        doc.get("customer_response"),
+                    "sentiment_score": doc.get("sentiment_score"),
+                    "sentiment_label": doc.get("sentiment_label"),
+                },
+            })
+
+    # ── Audit trail entries ───────────────────────────────────────────────
+    async for doc in db.audit_events.find(
+        {"$or": [{"trace_id": trace_id}, {"metadata.correlation_id": trace_id}]},
+        {"_id": 0},
+    ):
+        if doc.get("new_status") in ("APPROVED", "REJECTED", "FORCE_APPROVED"):
+            events.append({
+                "event_id":   str(doc.get("id", uuid.uuid4())),
+                "trace_id":   trace_id,
+                "node_type":  "OPERATOR_HITL",
+                "event_type": f"AUDIT_{doc.get('new_status', 'TRANSITION')}",
+                "timestamp":  doc.get("timestamp", ""),
+                "label":      f"Operator: {doc.get('new_status', '?')} by {doc.get('actor', '?')}",
+                "detail":     doc.get("metadata", {}),
+            })
+
+    if not events:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No trace events found for trace_id={trace_id}",
+        )
+
+    # Sort chronologically; fall back to empty string for missing timestamps
+    events.sort(key=lambda e: e.get("timestamp") or "")
+    return {"trace_id": trace_id, "event_count": len(events), "events": events}
+
+
+# ── Phase 14: Human Feedback endpoint ─────────────────────────────────────────
+
+
+class HumanFeedbackRequest(BaseModel):
+    operator_id:    str            = Field(..., description="Operator submitting the correction")
+    quality_score:  int            = Field(..., ge=1, le=5, description="1 (wrong) – 5 (excellent)")
+    correct_action: Optional[str]  = Field(None, description="What should the AI have proposed?")
+    feedback_notes: Optional[str]  = Field(None, description="Free-text rationale for the correction")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "operator_id":    "noc-lead@vodafone.com",
+                "quality_score":  2,
+                "correct_action": "escalate",
+                "feedback_notes": "Customer has VIP flag — should always escalate, not offer credit",
+            }
+        }
+    }
+
+
+@app.post("/actions/{action_id}/feedback", tags=["HITL"])
+async def submit_action_feedback(
+    action_id: str,
+    body: HumanFeedbackRequest,
+    _: str = Security(require_api_key),
+):
+    """
+    Phase 14 — Human Feedback / Operator Correction.
+
+    Publishes an OperatorCorrectionEvent to the synapse.operator.corrections Kafka
+    topic so future fine-tuning pipelines can learn from NOC operator expertise.
+
+    The feedback is also stored in MongoDB for offline analysis.
+    """
+    _require_mongo()
+    from db.mongo import get_db
+
+    db = await get_db()
+    action_doc = await db.action_proposals.find_one({"id": action_id}, {"_id": 0})
+    if not action_doc:
+        raise HTTPException(status_code=404, detail=f"Action {action_id} not found")
+
+    from kafka.schemas import OperatorCorrectionEvent
+    from kafka.topics import TOPIC_OPERATOR_CORRECTIONS
+
+    correction = OperatorCorrectionEvent(
+        action_id=action_id,
+        correlation_id=action_doc.get("correlation_id", ""),
+        operator_id=body.operator_id,
+        original_action_type=action_doc.get("action_type", ""),
+        proposed_action=action_doc.get("action_description", ""),
+        correct_action=body.correct_action,
+        quality_score=body.quality_score,
+        feedback_notes=body.feedback_notes,
+        opco_id=action_doc.get("opco_id"),
+        trace_id=action_doc.get("trace_id"),
+    )
+
+    # Persist to MongoDB for offline analytics
+    await db.operator_corrections.insert_one(correction.model_dump())
+
+    # Publish to Kafka (best-effort; non-fatal if Kafka unavailable)
+    kafka_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+    if kafka_servers:
+        try:
+            from kafka.producer import create_producer, publish
+            producer = await create_producer()
+            async with producer:
+                await publish(
+                    producer,
+                    TOPIC_OPERATOR_CORRECTIONS,
+                    correction.model_dump(),
+                    key=action_id,
+                )
+        except Exception as exc:
+            logger.warning("Could not publish operator correction to Kafka: %s", exc)
+
+    logger.info(
+        "Operator feedback: action=%s score=%d operator=%s",
+        action_id, body.quality_score, body.operator_id,
+    )
+    return {
+        "status":        "feedback_recorded",
+        "correction_id": correction.correction_id,
+        "action_id":     action_id,
+        "quality_score": body.quality_score,
+    }
 
 
 # ── Phase 12: Force Sync — per-customer Oracle bypass for SYSTEM_STALE state ──
@@ -970,6 +1284,204 @@ async def noc_websocket(websocket: WebSocket, opco_id: str):
         ws_manager.disconnect(websocket, opco_id)
     except Exception:
         ws_manager.disconnect(websocket, opco_id)
+
+
+# ── Phase 13: Billing — Per-OpCo AI Token Budget ──────────────────────────────
+
+
+@app.get("/billing/usage", tags=["Billing"])
+async def list_token_usage(_: str = Security(require_api_key)):
+    """
+    Phase 13 — List AI token usage for **all** OpCos in the current billing period.
+
+    Returns one document per OpCo showing quota, consumed tokens, remaining tokens,
+    and utilisation percentage.  Use this to monitor budget burn rate and catch
+    runaway OpCos before they exhaust the shared Anthropic API allowance.
+    """
+    _require_mongo()
+    from billing.token_budget import get_usage_report
+    return await get_usage_report()
+
+
+@app.get("/billing/usage/{opco_id}", tags=["Billing"])
+async def get_opco_token_usage(opco_id: str, _: str = Security(require_api_key)):
+    """
+    Phase 13 — AI token usage and quota status for a **single** OpCo.
+
+    Returns current period consumed/remaining tokens and whether the OpCo is
+    within quota.  Useful for per-tenant dashboards and automated alerts.
+    """
+    _require_mongo()
+    from billing.token_budget import check_quota, get_usage_report
+
+    quota  = await check_quota(opco_id)
+    report = await get_usage_report(opco_id)
+
+    return {
+        "opco_id":       quota.opco_id,
+        "quota_tokens":  quota.quota,
+        "consumed":      quota.consumed,
+        "remaining":     quota.remaining,
+        "utilisation_pct": round(quota.consumed / quota.quota * 100, 1) if quota.quota else 0,
+        "allowed":       quota.allowed,
+        "period":        quota.period,
+        "detail":        report[0] if report else {},
+    }
+
+
+# ── Phase 13: Oracle HA Circuit Breaker status ─────────────────────────────────
+
+
+@app.get("/system/oracle-ha", tags=["System"])
+def oracle_ha_status(_: str = Security(require_api_key)):
+    """
+    Phase 13 — Oracle High-Availability circuit breaker state.
+
+    Reports whether the primary Oracle is CLOSED (healthy), OPEN (failed over
+    to standby), or HALF_OPEN (probing recovery).  When OPEN, writes are queued
+    to Kafka and reads are served from the standby replica.
+    """
+    from db.oracle_ha import OracleHAPool
+    pool = OracleHAPool.instance()
+    return {
+        "state":           pool.state.value,
+        "failure_count":   pool.failure_count,
+        "standby_configured": bool(os.getenv("ORA_STANDBY_HOST")),
+        "failure_threshold": int(os.getenv("ORACLE_HA_FAILURE_THRESHOLD", "3")),
+        "half_open_probe_seconds": int(os.getenv("ORACLE_HA_HALF_OPEN_PROBE_SECONDS", "60")),
+    }
+
+
+# ── Phase 15: Predictive RCA ───────────────────────────────────────────────────
+
+
+@app.get("/system/rca/latest", tags=["Intelligence"])
+async def get_latest_rca(
+    opco_id: Optional[str] = None,
+    _: str = Security(require_api_key),
+):
+    """
+    Phase 15 — Return the most recent RCA result for the given OpCo (or all OpCos).
+
+    If 80%+ of the last 100 events share the same postal code or network sector,
+    the RCA engine will have generated a network ticket + mass SMS proposal here.
+    """
+    _require_mongo()
+    from db.mongo import get_db
+    db = await get_db()
+    query: dict[str, Any] = {}
+    if opco_id:
+        query["cluster.opco_id"] = opco_id
+    doc = await db.rca_results.find_one(query, {"_id": 0}, sort=[("run_at", -1)])
+    if not doc:
+        return {"status": "no_rca_results", "opco_id": opco_id}
+    return doc
+
+
+@app.post("/system/rca/run", tags=["Intelligence"])
+async def trigger_rca(
+    opco_id: Optional[str] = None,
+    operator: OperatorInfo = Depends(get_current_operator),
+):
+    """
+    Phase 15 — On-demand RCA scan (requires JWT Bearer auth).
+
+    Scans the last 100 action proposals for spatial/temporal clusters. If a ripe
+    cluster is detected (≥60% same postal code or network sector) it creates a
+    network repair ticket + mass SMS proposal and returns the RCA result.
+    Requires JWT Bearer token — the dashboard calls this from the NOC UI.
+    """
+    _require_mongo()
+    from agent.rca import run_rca
+    result = await run_rca(opco_id)
+    if result is None:
+        return {"status": "no_cluster_detected", "opco_id": opco_id}
+
+    from dataclasses import asdict
+    return {"status": "rca_complete", "result": asdict(result)}
+
+
+# ── Phase 15: Prompt-Optimizer suggestions ─────────────────────────────────────
+
+
+@app.get("/intelligence/prompt-suggestions", tags=["Intelligence"])
+async def list_prompt_suggestions(
+    status_filter: str = "PENDING",
+    _: str = Security(require_api_key),
+):
+    """
+    Phase 15 — List prompt-optimizer suggestions derived from operator corrections.
+
+    Each suggestion targets a specific action_type where the AI was systematically
+    wrong. Status values: PENDING | APPLIED | REJECTED.
+    """
+    _require_mongo()
+    from db.mongo import get_db
+    db = await get_db()
+    cursor = db.prompt_suggestions.find(
+        {"status": status_filter},
+        {"_id": 1, "action_type": 1, "sample_count": 1, "avg_score": 1,
+         "addendum": 1, "status": 1, "created_at": 1, "applied_at": 1, "applied_by": 1},
+    ).sort("created_at", -1).limit(50)
+    docs = await cursor.to_list(length=50)
+    for d in docs:
+        d["id"] = str(d.pop("_id"))
+    return {"suggestions": docs, "count": len(docs)}
+
+
+class SuggestionActionRequest(BaseModel):
+    operator_id: str = Field(..., description="Operator approving or rejecting the suggestion")
+
+
+@app.post("/intelligence/prompt-suggestions/{suggestion_id}/apply", tags=["Intelligence"])
+async def apply_prompt_suggestion(
+    suggestion_id: str,
+    body: SuggestionActionRequest,
+    operator: OperatorInfo = Depends(get_current_operator),
+):
+    """
+    Phase 15 — Apply a PENDING prompt suggestion to the live system prompt.
+
+    The addendum is appended to agent/prompt_addenda.json which the agent reads
+    on next startup. Status moves PENDING → APPLIED. Requires JWT Bearer auth.
+    """
+    _require_mongo()
+    from worker.prompt_optimizer import apply_suggestion
+    success = await apply_suggestion(suggestion_id, body.operator_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Suggestion not found or not in PENDING state")
+
+    await noc_event("ALL", {
+        "event":        "prompt_suggestion_applied",
+        "suggestion_id": suggestion_id,
+        "operator_id":  body.operator_id,
+        "ts":           datetime.utcnow().isoformat(),
+    })
+    return {"status": "applied", "suggestion_id": suggestion_id}
+
+
+@app.post("/intelligence/prompt-suggestions/{suggestion_id}/reject", tags=["Intelligence"])
+async def reject_prompt_suggestion(
+    suggestion_id: str,
+    body: SuggestionActionRequest,
+    operator: OperatorInfo = Depends(get_current_operator),
+):
+    """
+    Phase 15 — Reject a PENDING prompt suggestion (it will not affect the system prompt).
+    Requires JWT Bearer auth.
+    """
+    _require_mongo()
+    from db.mongo import get_db
+    from bson import ObjectId
+    db = await get_db()
+    result = await db.prompt_suggestions.update_one(
+        {"_id": ObjectId(suggestion_id), "status": "PENDING"},
+        {"$set": {"status": "REJECTED", "applied_by": body.operator_id,
+                  "applied_at": datetime.utcnow().isoformat()}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Suggestion not found or not in PENDING state")
+    return {"status": "rejected", "suggestion_id": suggestion_id}
 
 
 # ── Dev runner ─────────────────────────────────────────────────────────────────
