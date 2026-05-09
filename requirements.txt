@@ -46,6 +46,16 @@ python-dotenv>=1.0.0
 # default MongoDB cold store backend used in local dev.
 boto3>=1.34.0             # AWS S3 cold subscriber archive (set COLD_STORE_BACKEND=s3)
 
+# ── Phase 15: JWT auth + rate limiting ────────────────────────────────────────
+python-jose[cryptography]>=3.3.0    # JWT encode/decode (HS256)
+passlib[bcrypt]>=1.7.4              # bcrypt password hashing for operator accounts
+python-multipart>=0.0.9             # OAuth2PasswordRequestForm multipart parsing
+
+# ── Phase 15: Multi-language sentiment (optional backends) ────────────────────
+langdetect>=1.0.9                   # Lightweight offline language detection
+# transformers>=4.40.0              # Uncomment for DistilBERT backend (SENTIMENT_BACKEND=distilbert)
+# torch>=2.2.0                      # Required by transformers on CPU-only instances
+
 # ── Phase 7: Notification providers (optional — only needed for real dispatch) ──
 # twilio>=8.0.0        # Uncomment to enable TwilioProvider
 # sendgrid>=6.11.0     # Uncomment to enable SendGridProvider

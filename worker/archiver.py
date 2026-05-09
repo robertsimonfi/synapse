@@ -123,6 +123,8 @@ async def run_archiver() -> None:
         ARCHIVER_CRON_HOUR, ARCHIVE_INACTIVE_DAYS, ARCHIVER_BATCH_SIZE,
     )
 
+    from worker.prompt_optimizer import run_optimizer
+
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         run_archival_pass,
@@ -130,6 +132,14 @@ async def run_archiver() -> None:
         name="tiered_storage_archival",
         max_instances=1,
         misfire_grace_time=3600,
+    )
+    # Phase 15: run prompt optimizer every 4 hours
+    scheduler.add_job(
+        run_optimizer,
+        "interval",
+        hours=4,
+        name="prompt_optimizer",
+        max_instances=1,
     )
     scheduler.start()
 

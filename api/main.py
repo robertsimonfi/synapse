@@ -44,6 +44,15 @@ Phase 14 — GA Sprint (Sentiment + React Dashboard):
   GET  /system/trace/{trace_id}    — Chronological event timeline for a distributed trace
   POST /actions/{id}/feedback      — Operator correction published to synapse.operator.corrections
 
+Phase 15 — Autonomous Intelligence:
+  POST /auth/token                  — Obtain a JWT access token (operator login)
+  GET  /auth/refresh                — Refresh a valid JWT
+  GET  /system/rca/latest           — Latest predictive Root Cause Analysis result
+  POST /system/rca/run              — Trigger an on-demand RCA scan
+  GET  /intelligence/prompt-suggestions      — List pending prompt-optimizer suggestions
+  POST /intelligence/prompt-suggestions/{id}/apply  — Apply a suggestion to the system prompt
+  POST /intelligence/prompt-suggestions/{id}/reject — Reject a suggestion
+
 Observability:
   GET  /metrics                    — Prometheus metrics (scraped by Prometheus)
 
@@ -77,7 +86,7 @@ from agent.agent import (
     run_customer_360,
 )
 from agent.memory import memory_stats
-from api.security import require_api_key
+from api.security import require_api_key, auth_router, get_current_operator, OperatorInfo
 from api.websocket_manager import manager as ws_manager, noc_event, VALID_OPCO_IDS
 from api.canary_routes import router as canary_router  # Phase 12
 from models.action import ApproveRequest, ForceApproveRequest, RejectRequest
@@ -136,6 +145,21 @@ _OPENAPI_TAGS = [
             "Anthropic API allowance.  Quotas are configured via OPCO_TOKEN_QUOTAS env var."
         ),
     },
+    {
+        "name": "Auth",
+        "description": (
+            "Phase 15 — JWT operator authentication.  "
+            "POST /auth/token to obtain a Bearer token.  All dashboard endpoints accept "
+            "Bearer tokens in addition to the legacy X-API-Key header."
+        ),
+    },
+    {
+        "name": "Intelligence",
+        "description": (
+            "Phase 15 — Autonomous intelligence: predictive RCA cluster detection and "
+            "AI prompt self-optimization driven by operator correction feedback."
+        ),
+    },
 ]
 
 app = FastAPI(
@@ -164,6 +188,9 @@ app.mount("/metrics", make_asgi_app())
 
 # Phase 12: canary analysis routes
 app.include_router(canary_router)
+
+# Phase 15: JWT auth routes
+app.include_router(auth_router)
 
 
 # ── Resolve schemas ────────────────────────────────────────────────────────────
@@ -1323,6 +1350,138 @@ def oracle_ha_status(_: str = Security(require_api_key)):
         "failure_threshold": int(os.getenv("ORACLE_HA_FAILURE_THRESHOLD", "3")),
         "half_open_probe_seconds": int(os.getenv("ORACLE_HA_HALF_OPEN_PROBE_SECONDS", "60")),
     }
+
+
+# ── Phase 15: Predictive RCA ───────────────────────────────────────────────────
+
+
+@app.get("/system/rca/latest", tags=["Intelligence"])
+async def get_latest_rca(
+    opco_id: Optional[str] = None,
+    _: str = Security(require_api_key),
+):
+    """
+    Phase 15 — Return the most recent RCA result for the given OpCo (or all OpCos).
+
+    If 80%+ of the last 100 events share the same postal code or network sector,
+    the RCA engine will have generated a network ticket + mass SMS proposal here.
+    """
+    _require_mongo()
+    from db.mongo import get_db
+    db = await get_db()
+    query: dict[str, Any] = {}
+    if opco_id:
+        query["cluster.opco_id"] = opco_id
+    doc = await db.rca_results.find_one(query, {"_id": 0}, sort=[("run_at", -1)])
+    if not doc:
+        return {"status": "no_rca_results", "opco_id": opco_id}
+    return doc
+
+
+@app.post("/system/rca/run", tags=["Intelligence"])
+async def trigger_rca(
+    opco_id: Optional[str] = None,
+    operator: OperatorInfo = Depends(get_current_operator),
+):
+    """
+    Phase 15 — On-demand RCA scan (requires JWT Bearer auth).
+
+    Scans the last 100 action proposals for spatial/temporal clusters. If a ripe
+    cluster is detected (≥60% same postal code or network sector) it creates a
+    network repair ticket + mass SMS proposal and returns the RCA result.
+    Requires JWT Bearer token — the dashboard calls this from the NOC UI.
+    """
+    _require_mongo()
+    from agent.rca import run_rca
+    result = await run_rca(opco_id)
+    if result is None:
+        return {"status": "no_cluster_detected", "opco_id": opco_id}
+
+    from dataclasses import asdict
+    return {"status": "rca_complete", "result": asdict(result)}
+
+
+# ── Phase 15: Prompt-Optimizer suggestions ─────────────────────────────────────
+
+
+@app.get("/intelligence/prompt-suggestions", tags=["Intelligence"])
+async def list_prompt_suggestions(
+    status_filter: str = "PENDING",
+    _: str = Security(require_api_key),
+):
+    """
+    Phase 15 — List prompt-optimizer suggestions derived from operator corrections.
+
+    Each suggestion targets a specific action_type where the AI was systematically
+    wrong. Status values: PENDING | APPLIED | REJECTED.
+    """
+    _require_mongo()
+    from db.mongo import get_db
+    db = await get_db()
+    cursor = db.prompt_suggestions.find(
+        {"status": status_filter},
+        {"_id": 1, "action_type": 1, "sample_count": 1, "avg_score": 1,
+         "addendum": 1, "status": 1, "created_at": 1, "applied_at": 1, "applied_by": 1},
+    ).sort("created_at", -1).limit(50)
+    docs = await cursor.to_list(length=50)
+    for d in docs:
+        d["id"] = str(d.pop("_id"))
+    return {"suggestions": docs, "count": len(docs)}
+
+
+class SuggestionActionRequest(BaseModel):
+    operator_id: str = Field(..., description="Operator approving or rejecting the suggestion")
+
+
+@app.post("/intelligence/prompt-suggestions/{suggestion_id}/apply", tags=["Intelligence"])
+async def apply_prompt_suggestion(
+    suggestion_id: str,
+    body: SuggestionActionRequest,
+    operator: OperatorInfo = Depends(get_current_operator),
+):
+    """
+    Phase 15 — Apply a PENDING prompt suggestion to the live system prompt.
+
+    The addendum is appended to agent/prompt_addenda.json which the agent reads
+    on next startup. Status moves PENDING → APPLIED. Requires JWT Bearer auth.
+    """
+    _require_mongo()
+    from worker.prompt_optimizer import apply_suggestion
+    success = await apply_suggestion(suggestion_id, body.operator_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Suggestion not found or not in PENDING state")
+
+    await noc_event("ALL", {
+        "event":        "prompt_suggestion_applied",
+        "suggestion_id": suggestion_id,
+        "operator_id":  body.operator_id,
+        "ts":           datetime.utcnow().isoformat(),
+    })
+    return {"status": "applied", "suggestion_id": suggestion_id}
+
+
+@app.post("/intelligence/prompt-suggestions/{suggestion_id}/reject", tags=["Intelligence"])
+async def reject_prompt_suggestion(
+    suggestion_id: str,
+    body: SuggestionActionRequest,
+    operator: OperatorInfo = Depends(get_current_operator),
+):
+    """
+    Phase 15 — Reject a PENDING prompt suggestion (it will not affect the system prompt).
+    Requires JWT Bearer auth.
+    """
+    _require_mongo()
+    from db.mongo import get_db
+    from bson import ObjectId
+    db = await get_db()
+    result = await db.prompt_suggestions.update_one(
+        {"_id": ObjectId(suggestion_id), "status": "PENDING"},
+        {"$set": {"status": "REJECTED", "applied_by": body.operator_id,
+                  "applied_at": datetime.utcnow().isoformat()}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Suggestion not found or not in PENDING state")
+    return {"status": "rejected", "suggestion_id": suggestion_id}
 
 
 # ── Dev runner ─────────────────────────────────────────────────────────────────

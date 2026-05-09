@@ -71,9 +71,27 @@ class FalloutResolution:
             self.action_proposals = []
 
 
+def _load_prompt_addenda() -> str:
+    """Phase 15: load operator-approved prompt addenda from prompt_optimizer."""
+    import json as _json
+    addenda_path = os.path.join(os.path.dirname(__file__), "prompt_addenda.json")
+    try:
+        with open(addenda_path) as f:
+            items: list[dict] = _json.load(f)
+        if not items:
+            return ""
+        lines = ["Operator-approved AI behaviour guidelines (derived from correction analysis):"]
+        for item in items:
+            lines.append(f"- [{item.get('action_type', 'ALL')}] {item.get('addendum', '')}")
+        return "\n".join(lines) + "\n"
+    except FileNotFoundError:
+        return ""
+
+
 def build_system_prompt(
     rag_context: str, memory_context: str, expert_addendum: str = ""
 ) -> str:
+    addenda = _load_prompt_addenda()
     return f"""You are a Telco Fallout Resolution Agent for a major US carrier (T-Mobile style BSS/OSS).
 
 Your job is to:
@@ -87,7 +105,7 @@ Your job is to:
 {rag_context}
 
 {memory_context}
-{expert_addendum}
+{addenda}{expert_addendum}
 Guidelines:
 - Always call at minimum 2-3 tools to build a complete picture before concluding.
 - Correlate provisioning failures with active network alarms when relevant.

@@ -167,6 +167,28 @@ async def _handle_task(msg_value: dict) -> None:
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
+_rca_check_counter = 0
+_RCA_INTERVAL = int(os.getenv("RCA_CHECK_INTERVAL_MESSAGES", "50"))
+
+
+async def _maybe_run_rca(opco_id: str | None) -> None:
+    """Phase 15: periodic RCA check every RCA_INTERVAL messages."""
+    global _rca_check_counter
+    _rca_check_counter += 1
+    if _rca_check_counter % _RCA_INTERVAL != 0:
+        return
+    try:
+        from agent.rca import run_rca
+        result = await run_rca(opco_id)
+        if result and result.cluster:
+            logger.info(
+                "rca: cluster detected %s=%s pct=%.0f%% — proposals created",
+                result.cluster.dimension, result.cluster.value, result.cluster.pct * 100,
+            )
+    except Exception as exc:
+        logger.warning("rca: check failed — %s", exc)
+
+
 async def run_thinker() -> None:
     await ensure_indexes()
 
@@ -181,6 +203,7 @@ async def run_thinker() -> None:
             task = msg.value
             try:
                 await _handle_task(task)
+                await _maybe_run_rca(task.get("opco_id"))
             except Exception:
                 logger.exception(
                     "Thinker handler failed for correlation_id=%s",

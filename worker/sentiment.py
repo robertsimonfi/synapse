@@ -204,11 +204,27 @@ async def run() -> None:
                 raw = json.loads(msg.value.decode("utf-8"))
                 feedback = CustomerFeedbackEvent(**raw)
 
-                score, label = _score_text(feedback.raw_text)
-                logger.info(
-                    "Scored feedback_id=%s score=%.3f label=%s",
-                    feedback.feedback_id, score, label,
-                )
+                # Phase 15: use the ML backend when SENTIMENT_BACKEND != keyword
+                _backend = os.getenv("SENTIMENT_BACKEND", "keyword").lower()
+                if _backend != "keyword":
+                    try:
+                        from worker.sentiment_ml import score_text_async
+                        ml_result = await score_text_async(feedback.raw_text)
+                        score, label = ml_result.score, ml_result.label
+                        logger.info(
+                            "ML-scored feedback_id=%s score=%.3f label=%s lang=%s backend=%s",
+                            feedback.feedback_id, score, label,
+                            ml_result.language, ml_result.backend,
+                        )
+                    except Exception as ml_exc:
+                        logger.warning("ML sentiment failed (%s) — falling back to keyword", ml_exc)
+                        score, label = _score_text(feedback.raw_text)
+                else:
+                    score, label = _score_text(feedback.raw_text)
+                    logger.info(
+                        "Scored feedback_id=%s score=%.3f label=%s",
+                        feedback.feedback_id, score, label,
+                    )
 
                 await _update_engagement_sentiment(
                     feedback.engagement_id or "",

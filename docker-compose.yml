@@ -398,6 +398,28 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ── Phase 15: Prompt Optimizer — runs every 4 h, analysing operator_corrections ─
+
+  prompt-optimizer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telco-agent:local
+    container_name: synapse-prompt-optimizer
+    command: ["python", "-m", "worker.prompt_optimizer"]
+    environment:
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB: synapse
+      OPTIMIZER_MIN_CORRECTIONS: "5"
+      OPTIMIZER_MAX_SCORE: "2"
+      SENTIMENT_BACKEND: claude
+    env_file:
+      - .env
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   telco_data:
     driver: local
