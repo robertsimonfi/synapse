@@ -1,17 +1,23 @@
 # Synapse — Phase 9 full local-dev stack.
 #
 # Architecture:
-#   kafka          — Kafka 3.7 (KRaft mode, no ZooKeeper)
-#   mongodb        — Action state store + ODS subscribers + outbox
-#   api            — FastAPI: resolve, HITL endpoints, Prometheus /metrics
-#   thinker        — Kafka consumer → Claude → MongoDB action proposals
-#   executor       — APPROVED actions → execute → MongoDB outbox write
-#   watchdog       — PENDING/APPROVED drift check → Kafka re-analysis
-#   hydrator       — Oracle CDC simulation → Kafka → MongoDB ODS
-#   relay          — MongoDB outbox → Kafka legacy.commands.writeback
-#   oracle_adapter — Kafka → Oracle DML write-back
-#   prometheus     — Scrapes /metrics from the API
-#   ui             — Streamlit Operator Portal (HITL review dashboard)
+#   kafka           — Kafka 3.7 (KRaft mode, no ZooKeeper)
+#   mongodb         — Action state store + ODS subscribers + outbox
+#   api             — FastAPI: resolve, HITL endpoints, Prometheus /metrics
+#   thinker         — Kafka consumer → Claude → MongoDB action proposals
+#   executor        — APPROVED actions → execute → MongoDB outbox write
+#   watchdog        — PENDING/APPROVED drift check → Kafka re-analysis
+#   hydrator        — Oracle CDC simulation → Kafka → MongoDB ODS
+#   relay           — MongoDB outbox → Kafka legacy.commands.writeback
+#   oracle_adapter  — Kafka → Oracle DML write-back
+#   prefetch        — Phase 12: predictive subscriber pre-hydration
+#   canary          — Phase 12: model quality A/B scoring
+#   sentiment       — Phase 14: customer feedback Kafka consumer
+#   prompt-optimizer— Phase 15: autonomous prompt improvement
+#   archiver        — Phase 15: cold-tier ODS document archival
+#   prometheus      — Scrapes /metrics from the API
+#   frontend        — React NOC Dashboard (Phase 14)
+#   ui              — Streamlit Operator Portal (fallback)
 #
 # Kafka replaces RabbitMQ for all inter-service messaging (Phase 9).
 # For production: replace SQLite with managed Oracle, local ChromaDB with
@@ -22,27 +28,30 @@ services:
   # ── Infrastructure ──────────────────────────────────────────────────────────
 
   kafka:
-    image: bitnami/kafka:3.7
+    image: apache/kafka:3.7.0
     container_name: synapse-kafka
     ports:
       - "9092:9092"
+      - "9094:9094"
     environment:
       # KRaft mode — no ZooKeeper required
-      - KAFKA_CFG_NODE_ID=0
-      - KAFKA_CFG_PROCESS_ROLES=controller,broker
-      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_EXTERNAL://:9094
-      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_EXTERNAL://localhost:9094
-      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_EXTERNAL:PLAINTEXT
-      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka:9093
-      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
-      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
-      - KAFKA_CFG_LOG_RETENTION_HOURS=168
-      - KAFKA_CFG_LOG_SEGMENT_BYTES=536870912
-      - ALLOW_PLAINTEXT_LISTENER=yes
+      KAFKA_NODE_ID: 0
+      KAFKA_PROCESS_ROLES: controller,broker
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 536870912
+      # Fixed cluster ID for local dev (KRaft requires this to be stable across restarts)
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
     volumes:
-      - kafka_data:/bitnami/kafka
+      - kafka_data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1"]
       interval: 15s
       timeout: 10s
       retries: 10
@@ -120,9 +129,6 @@ services:
     restart: unless-stopped
 
   thinker:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: telco-agent:local
     container_name: synapse-thinker
     command: ["python", "-m", "worker.thinker"]
@@ -148,9 +154,6 @@ services:
     restart: unless-stopped
 
   executor:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: telco-agent:local
     container_name: synapse-executor
     command: ["python", "-m", "worker.executor"]
@@ -167,9 +170,6 @@ services:
     restart: unless-stopped
 
   watchdog:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: telco-agent:local
     container_name: synapse-watchdog
     command: ["python", "-m", "worker.watchdog"]
@@ -189,9 +189,6 @@ services:
     restart: unless-stopped
 
   hydrator:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: telco-agent:local
     container_name: synapse-hydrator
     command: ["python", "-m", "worker.hydrator"]
@@ -212,13 +209,10 @@ services:
       kafka:
         condition: service_healthy
       api:
-        condition: service_healthy    # ensures SQLite is seeded before hydrator starts
+        condition: service_healthy
     restart: unless-stopped
 
   relay:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: telco-agent:local
     container_name: synapse-relay
     command: ["python", "-m", "worker.relay"]
@@ -236,9 +230,6 @@ services:
     restart: unless-stopped
 
   oracle_adapter:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: telco-agent:local
     container_name: synapse-oracle-adapter
     command: ["python", "-m", "worker.oracle_adapter"]
@@ -246,7 +237,6 @@ services:
       MONGODB_URI: mongodb://mongodb:27017
       MONGODB_DB: synapse
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      # Set DB_TYPE=oracle and ORA_* vars to enable real Oracle write-back
       DB_TYPE: sqlite
       SQLITE_PATH: /data/telco_dev.db
       ORACLE_ADAPTER_MAX_RETRIES: "3"
@@ -259,12 +249,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── Phase 12: Predictive Hydration — prefetch service ───────────────────────
-
   prefetch:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: telco-agent:local
     container_name: synapse-prefetch
     command: ["python", "-m", "worker.prefetch"]
@@ -283,12 +268,7 @@ services:
         condition: service_started
     restart: unless-stopped
 
-  # ── Phase 12: Canary Analysis — model quality scoring consumer ───────────────
-
   canary:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: telco-agent:local
     container_name: synapse-canary
     command: ["python", "-m", "worker.canary"]
@@ -299,10 +279,6 @@ services:
       CANARY_WINDOW_MINUTES: "60"
       CANARY_MIN_SUCCESS_RATE: "0.85"
       CANARY_MIN_SAMPLES: "100"
-      # Set these when you want to A/B test a new model:
-      # CANARY_CHAMPION_MODEL: claude-sonnet-4-6
-      # CANARY_CANDIDATE_MODEL: claude-opus-4-7
-      # CANARY_CANDIDATE_TRAFFIC_PCT: "10"
     depends_on:
       mongodb:
         condition: service_healthy
@@ -310,35 +286,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── Phase 13: Tiered Storage Archiver ──────────────────────────────────────
-
-  archiver:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: telco-agent:local
-    container_name: synapse-archiver
-    command: ["python", "-m", "worker.archiver"]
-    environment:
-      MONGODB_URI: mongodb://mongodb:27017
-      MONGODB_DB: synapse
-      COLD_STORE_BACKEND: mongodb
-      ARCHIVE_INACTIVE_DAYS: "30"
-      ARCHIVER_BATCH_SIZE: "500"
-      ARCHIVER_CRON_HOUR: "2"
-    depends_on:
-      mongodb:
-        condition: service_healthy
-      hydrator:
-        condition: service_started
-    restart: unless-stopped
-
-  # ── Phase 14: Sentiment Analysis — customer feedback Kafka consumer ─────────
-
   sentiment:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: telco-agent:local
     container_name: synapse-sentiment
     command: ["python", "-m", "worker.sentiment"]
@@ -353,7 +301,43 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── Phase 14: React NOC Dashboard — replaces Streamlit operator portal ───────
+  prompt-optimizer:
+    image: telco-agent:local
+    container_name: synapse-prompt-optimizer
+    command: ["python", "-m", "worker.prompt_optimizer"]
+    env_file:
+      - .env
+    environment:
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB: synapse
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SQLITE_PATH: /data/telco_dev.db
+    volumes:
+      - telco_data:/data
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  archiver:
+    image: telco-agent:local
+    container_name: synapse-archiver
+    command: ["python", "-m", "worker.archiver"]
+    environment:
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DB: synapse
+      ARCHIVER_COLD_THRESHOLD_DAYS: "30"
+      ARCHIVER_RUN_INTERVAL_HOURS: "6"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Phase 14: React NOC Dashboard ───────────────────────────────────────────
 
   frontend:
     image: node:20-alpine
@@ -372,12 +356,9 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # ── Streamlit portal kept as fallback for ops teams not yet on React ─────────
+  # ── Streamlit portal (fallback) ──────────────────────────────────────────────
 
   ui:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: telco-agent:local
     container_name: synapse-ui
     command:
@@ -395,28 +376,6 @@ services:
       - .env
     depends_on:
       api:
-        condition: service_healthy
-    restart: unless-stopped
-
-  # ── Phase 15: Prompt Optimizer — runs every 4 h, analysing operator_corrections ─
-
-  prompt-optimizer:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: telco-agent:local
-    container_name: synapse-prompt-optimizer
-    command: ["python", "-m", "worker.prompt_optimizer"]
-    environment:
-      MONGODB_URI: mongodb://mongodb:27017
-      MONGODB_DB: synapse
-      OPTIMIZER_MIN_CORRECTIONS: "5"
-      OPTIMIZER_MAX_SCORE: "2"
-      SENTIMENT_BACKEND: claude
-    env_file:
-      - .env
-    depends_on:
-      mongodb:
         condition: service_healthy
     restart: unless-stopped
 

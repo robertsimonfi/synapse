@@ -52,11 +52,8 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR ${APP_HOME}
 
-# Copy application source
-COPY --chown=app:app agent/   ./agent/
-COPY --chown=app:app api/     ./api/
-COPY --chown=app:app rag/     ./rag/
-COPY --chown=app:app db/      ./db/
+# Copy all application source (exclusions are handled by .dockerignore)
+COPY --chown=app:app . .
 COPY --chown=app:app docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 RUN chmod +x /usr/local/bin/entrypoint.sh \

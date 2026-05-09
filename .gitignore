@@ -49,3 +49,10 @@ data/
 
 # Claude Code per-user local settings (project settings.json is committed; .local is not)
 .claude/settings.local.json
+ 
+# Node / frontend 
+frontend/node_modules/ 
+frontend/package-lock.json 
+ 
+# Claude Code workspace 
+.claude/

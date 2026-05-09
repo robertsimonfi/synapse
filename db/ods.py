@@ -100,12 +100,7 @@ async def ensure_ods_indexes() -> None:
         unique=True,
         name="cold_opco_customer",
     )
-    # token_budgets — Phase 13
-    await db.token_budgets.create_index(
-        [("opco_id", pymongo.ASCENDING), ("period_start", pymongo.ASCENDING)],
-        unique=True,
-        name="token_budget_opco_period",
-    )
+    # token_budgets indexes are managed by billing/token_budget.py::ensure_budget_indexes()
     # outbox
     await db.outbox.create_index([("status", 1), ("created_at", 1)])
     await db.outbox.create_index("action_id", unique=True)

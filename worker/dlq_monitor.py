@@ -40,7 +40,7 @@ def _motor_db():
 async def _ensure_dlq_indexes() -> None:
     db = _motor_db()
     await db.dlq_events.create_index([("status", 1), ("failed_at", -1)])
-    await db.dlq_events.create_index("outbox_id", unique=True)
+    await db.dlq_events.create_index("outbox_id", unique=True, sparse=True)
     await db.dlq_events.create_index("action_type")
     logger.info("DLQ indexes ensured")
 
