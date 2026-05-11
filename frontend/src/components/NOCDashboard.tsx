@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
 import toast from "react-hot-toast";
 import { clsx } from "clsx";
-import { fetchActions, fetchQueueDepths, fetchSystemStatus } from "../api/client";
+import { fetchActions, fetchQueueDepths, fetchSystemStatus, setStoredToken } from "../api/client";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { ActionCard } from "./ActionCard";
 import { Timeline } from "./Timeline";
@@ -14,21 +14,27 @@ const OPERATOR_ID =
     ? localStorage.getItem("synapse_operator_id") ?? "noc-operator"
     : "noc-operator";
 
+const OPERATOR_ROLE =
+  typeof window !== "undefined"
+    ? localStorage.getItem("synapse_role") ?? "operator"
+    : "operator";
+
 const OPCO_OPTIONS = [
   "DEFAULT",
-  "VODAFONE_UK",
-  "VODAFONE_DE",
-  "VODAFONE_ES",
-  "VODAFONE_IT",
+  "UK_REGION",
+  "DE_REGION",
+  "ES_REGION",
+  "IT_REGION",
   "ALL",
 ];
 
-type Tab = "PENDING" | "APPROVED" | "EXECUTED" | "ALL";
+type Tab = "PENDING" | "APPROVED" | "EXECUTED" | "DLQ" | "ALL";
 
 const TAB_STATUS: Record<Tab, string | undefined> = {
   PENDING:  "PENDING",
   APPROVED: "APPROVED",
   EXECUTED: "EXECUTED",
+  DLQ:      "FAILED",
   ALL:      undefined,
 };
 
@@ -43,11 +49,11 @@ function AuroraBackground() {
 
   useEffect(() => {
     function onMove(e: MouseEvent) {
-      const x = (e.clientX / window.innerWidth  - 0.5) * 60;
-      const y = (e.clientY / window.innerHeight - 0.5) * 60;
-      if (orb1.current) orb1.current.style.transform = `translate(${x * 0.35}px, ${y * 0.35}px)`;
-      if (orb2.current) orb2.current.style.transform = `translate(${-x * 0.25}px, ${y * 0.20}px)`;
-      if (orb3.current) orb3.current.style.transform = `translate(${x * 0.20}px, ${-y * 0.25}px)`;
+      const x = (e.clientX / window.innerWidth  - 0.5) * 30;
+      const y = (e.clientY / window.innerHeight - 0.5) * 30;
+      if (orb1.current) orb1.current.style.transform = `translate(${x * 0.18}px, ${y * 0.18}px)`;
+      if (orb2.current) orb2.current.style.transform = `translate(${-x * 0.12}px, ${y * 0.10}px)`;
+      if (orb3.current) orb3.current.style.transform = `translate(${x * 0.10}px, ${-y * 0.12}px)`;
     }
     window.addEventListener("mousemove", onMove, { passive: true });
     return () => window.removeEventListener("mousemove", onMove);
@@ -120,8 +126,12 @@ function StatusBar({
 
 // ── Main dashboard ────────────────────────────────────────────────────────
 
-export function NOCDashboard() {
-  const [opcoId, setOpcoId] = useState("ALL");
+export function NOCDashboard({ onLogout }: { onLogout?: () => void }) {
+  // OPERATOR role: auto-filter to assigned region; MANAGER can see ALL
+  const assignedOpco =
+    typeof window !== "undefined" ? localStorage.getItem("synapse_opco_id") : null;
+  const defaultOpco = OPERATOR_ROLE === "operator" && assignedOpco ? assignedOpco : "ALL";
+  const [opcoId, setOpcoId] = useState(defaultOpco);
   const [tab, setTab] = useState<Tab>("PENDING");
   const [traceId, setTraceId] = useState<string | null>(null);
   const [sentimentMap, setSentimentMap] = useState<SentimentMap>(new Map());
@@ -187,7 +197,7 @@ export function NOCDashboard() {
   const { connected } = useWebSocket({ opcoId, onEvent: handleWsEvent });
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden bg-[#030712]">
+    <div className="flex flex-col h-screen overflow-hidden bg-[#0f0a1e]">
       <AuroraBackground />
 
       <div className="relative z-10 flex flex-col h-full">
@@ -204,7 +214,7 @@ export function NOCDashboard() {
               initial={{ scale: 0.5, rotate: -20 }}
               animate={{ scale: 1, rotate: 0 }}
               transition={{ type: "spring", stiffness: 260, damping: 20, delay: 0.15 }}
-              className="w-8 h-8 rounded-xl bg-gradient-to-br from-blue-500 to-violet-600 flex items-center justify-center text-sm font-black shadow-lg shadow-blue-500/30 shrink-0"
+              className="w-8 h-8 rounded-xl bg-gradient-to-br from-violet-500 to-purple-700 flex items-center justify-center text-sm font-black shadow-lg shadow-violet-500/40 shrink-0"
             >
               S
             </motion.div>
@@ -228,9 +238,33 @@ export function NOCDashboard() {
                 <option key={o} value={o}>{o}</option>
               ))}
             </select>
-            <span className="text-xs text-gray-600 hidden sm:inline font-mono">
-              {OPERATOR_ID}
-            </span>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-gray-600 hidden sm:inline font-mono">
+                {OPERATOR_ID}
+              </span>
+              <span className={clsx(
+                "text-[10px] px-1.5 py-0.5 rounded-full font-bold uppercase tracking-wider",
+                OPERATOR_ROLE === "manager"
+                  ? "bg-violet-500/15 text-violet-300 border border-violet-500/25"
+                  : "bg-white/5 text-gray-500 border border-white/8",
+              )}>
+                {OPERATOR_ROLE}
+              </span>
+              {onLogout && (
+                <button
+                  onClick={() => {
+                    setStoredToken(null);
+                    localStorage.removeItem("synapse_operator_id");
+                    localStorage.removeItem("synapse_role");
+                    localStorage.removeItem("synapse_opco_id");
+                    onLogout();
+                  }}
+                  className="text-xs text-gray-600 hover:text-red-400 transition-colors px-2 py-1 rounded-lg hover:bg-red-500/8 border border-transparent hover:border-red-500/15"
+                >
+                  Sign out
+                </button>
+              )}
+            </div>
           </div>
         </motion.header>
 
@@ -249,35 +283,54 @@ export function NOCDashboard() {
           transition={{ duration: 0.4, delay: 0.2 }}
           className="flex border-b border-white/5 glass-subtle shrink-0 px-4"
         >
-          {(["PENDING", "APPROVED", "EXECUTED", "ALL"] as Tab[]).map((t) => (
-            <button
-              key={t}
-              onClick={() => setTab(t)}
-              className={clsx(
-                "relative px-4 py-2.5 text-xs font-semibold transition-colors duration-200",
-                tab === t ? "text-blue-400" : "text-gray-600 hover:text-gray-300",
-              )}
-            >
-              {tab === t && (
-                <motion.div
-                  layoutId="active-tab"
-                  className="absolute bottom-0 left-0 right-0 h-0.5 bg-gradient-to-r from-blue-500 to-violet-500 rounded-full"
-                  transition={{ type: "spring", stiffness: 420, damping: 36 }}
-                />
-              )}
-              {t}
-              {t === "PENDING" && (depths as Record<string, number> | undefined)?.PENDING ? (
-                <motion.span
-                  key={(depths as Record<string, number>).PENDING}
-                  initial={{ scale: 0.6 }}
-                  animate={{ scale: 1 }}
-                  className="ml-1.5 px-1.5 py-0.5 bg-amber-500/15 text-amber-300/90 rounded-full text-[10px] border border-amber-500/25"
-                >
-                  {(depths as Record<string, number>).PENDING}
-                </motion.span>
-              ) : null}
-            </button>
-          ))}
+          {(["PENDING", "APPROVED", "EXECUTED", "DLQ", "ALL"] as Tab[]).map((t) => {
+            const depthMap = depths as Record<string, number> | undefined;
+            const badgeCount =
+              t === "PENDING" ? depthMap?.PENDING :
+              t === "DLQ"     ? depthMap?.FAILED  : undefined;
+            const isDlq = t === "DLQ";
+            return (
+              <button
+                key={t}
+                onClick={() => setTab(t)}
+                className={clsx(
+                  "relative px-4 py-2.5 text-xs font-semibold transition-colors duration-200",
+                  tab === t
+                    ? isDlq ? "text-red-400" : "text-violet-400"
+                    : "text-gray-600 hover:text-gray-300",
+                )}
+              >
+                {tab === t && (
+                  <motion.div
+                    layoutId="active-tab"
+                    className={clsx(
+                      "absolute bottom-0 left-0 right-0 h-0.5 rounded-full",
+                      isDlq
+                        ? "bg-gradient-to-r from-red-500 to-orange-400"
+                        : "bg-gradient-to-r from-violet-500 to-purple-400",
+                    )}
+                    transition={{ type: "spring", stiffness: 420, damping: 36 }}
+                  />
+                )}
+                {isDlq ? "DLQ / REPAIR" : t}
+                {badgeCount ? (
+                  <motion.span
+                    key={badgeCount}
+                    initial={{ scale: 0.6 }}
+                    animate={{ scale: 1 }}
+                    className={clsx(
+                      "ml-1.5 px-1.5 py-0.5 rounded-full text-[10px] border",
+                      isDlq
+                        ? "bg-red-500/15 text-red-300/90 border-red-500/25"
+                        : "bg-amber-500/15 text-amber-300/90 border-amber-500/25",
+                    )}
+                  >
+                    {badgeCount}
+                  </motion.span>
+                ) : null}
+              </button>
+            );
+          })}
         </motion.div>
 
         {/* Action grid */}

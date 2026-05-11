@@ -2,8 +2,8 @@
 Per-OpCo AI Token Budget Manager — Phase 13.
 
 Enforces monthly token quotas per OpCo so that a high-traffic tenant
-(e.g. VODAFONE_UK) cannot exhaust the shared Anthropic API budget and
-leave other OpCos (e.g. VODAFONE_DE) unable to process fallouts.
+(e.g. UK_REGION) cannot exhaust the shared Anthropic API budget and
+leave other OpCos (e.g. DE_REGION) unable to process fallouts.
 
 Architecture:
   • MongoDB `token_budgets` collection — one document per (opco_id, period_start)
@@ -14,7 +14,7 @@ Architecture:
 
 Data model (one document per OpCo per billing period):
   {
-    opco_id:         "VODAFONE_UK",
+    opco_id:         "UK_REGION",
     quota_tokens:    1_000_000,
     consumed_tokens: 437_821,
     period_start:    "2026-05-01T00:00:00+00:00",
@@ -25,7 +25,7 @@ Data model (one document per OpCo per billing period):
 Environment
 -----------
   OPCO_TOKEN_QUOTAS       CSV of opco_id:monthly_quota pairs, e.g.
-                          VODAFONE_UK:1000000,VODAFONE_DE:500000,DEFAULT:100000
+                          UK_REGION:1000000,DE_REGION:500000,DEFAULT:100000
   DEFAULT_OPCO_TOKEN_QUOTA  fallback quota for any unspecified OpCo (default: 500000)
   TOKEN_BUDGET_ENABLED    "true" (default) | "false" to disable enforcement
 """
@@ -45,7 +45,7 @@ _DEFAULT_QUOTA         = int(os.getenv("DEFAULT_OPCO_TOKEN_QUOTA", "500000"))
 
 
 def _parse_quotas() -> dict[str, int]:
-    """Parse OPCO_TOKEN_QUOTAS=VODAFONE_UK:1000000,VODAFONE_DE:500000 into a dict."""
+    """Parse OPCO_TOKEN_QUOTAS=UK_REGION:1000000,DE_REGION:500000 into a dict."""
     raw    = os.getenv("OPCO_TOKEN_QUOTAS", "")
     quotas: dict[str, int] = {}
     for item in raw.split(","):

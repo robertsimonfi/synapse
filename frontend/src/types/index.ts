@@ -31,6 +31,7 @@ export interface ActionProposal {
   retry_count: number;
   executed_at: string | null;
   execution_error: string | null;
+  chain_of_thought: Record<string, string> | null;
 }
 
 // ── Timeline / Trace ───────────────────────────────────────────────────────────

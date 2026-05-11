@@ -6,12 +6,18 @@ interface Props {
   action: ActionProposal;
 }
 
-function buildChainOfThought(action: ActionProposal): string[] {
+const COT_STEPS: { key: string; label: string; color: string }[] = [
+  { key: "observation",      label: "Observation",      color: "text-sky-400" },
+  { key: "constraint_check", label: "Constraint Check", color: "text-amber-400" },
+  { key: "strategy",         label: "Strategy",         color: "text-violet-400" },
+  { key: "recommendation",   label: "Recommendation",   color: "text-emerald-400" },
+];
+
+function buildFallbackThoughts(action: ActionProposal): string[] {
   const lines: string[] = [];
   const payload = action.action_payload as Record<string, unknown>;
 
-  if (payload.confidence)
-    lines.push(`Confidence: ${payload.confidence}`);
+  if (payload.confidence) lines.push(`Confidence: ${payload.confidence}`);
 
   const before = action.predicted_before_state;
   if (before) {
@@ -30,33 +36,41 @@ function buildChainOfThought(action: ActionProposal): string[] {
   if (payload.reasoning) lines.push(String(payload.reasoning));
   if (payload.rationale) lines.push(String(payload.rationale));
   if (payload.risk_level) lines.push(`Risk level: ${payload.risk_level}`);
-  if (payload.policy_checks)
-    lines.push(`Policy checks: ${JSON.stringify(payload.policy_checks)}`);
 
   if (!lines.length)
-    lines.push(`Action type "${action.action_type}" was proposed based on the current customer state and runbook analysis.`);
+    lines.push(
+      `Action "${action.action_type}" was proposed based on current customer state and runbook analysis.`,
+    );
 
   return lines;
 }
 
 export function AIThoughtPanel({ action }: Props) {
   const [open, setOpen] = useState(false);
-  const thoughts = buildChainOfThought(action);
+  const cot = (action as ActionProposal & { chain_of_thought?: Record<string, string> | null })
+    .chain_of_thought;
+  const hasStructuredCot = cot && typeof cot === "object" && Object.keys(cot).length > 0;
+  const fallbackLines = hasStructuredCot ? [] : buildFallbackThoughts(action);
 
   return (
     <div className="mt-1">
       <button
         onClick={() => setOpen((o) => !o)}
-        className="flex items-center gap-1.5 text-xs text-blue-400/70 hover:text-blue-300 transition-colors group"
+        className="flex items-center gap-1.5 text-xs text-violet-400/70 hover:text-violet-300 transition-colors group"
       >
         <motion.span
           animate={{ rotate: open ? 90 : 0 }}
           transition={{ duration: 0.18 }}
-          className="text-blue-500/60 group-hover:text-blue-400 transition-colors"
+          className="text-violet-500/60 group-hover:text-violet-400 transition-colors"
         >
           ▸
         </motion.span>
         AI Thought Process
+        {hasStructuredCot && (
+          <span className="ml-1 text-[9px] px-1.5 py-0.5 bg-violet-500/12 text-violet-400/80 border border-violet-500/20 rounded-full uppercase tracking-wider">
+            Full CoT
+          </span>
+        )}
       </button>
 
       <AnimatePresence>
@@ -68,17 +82,38 @@ export function AIThoughtPanel({ action }: Props) {
             transition={{ duration: 0.22 }}
             className="overflow-hidden"
           >
-            <div className="mt-2 rounded-xl bg-blue-950/20 border border-blue-500/12 p-3 space-y-1.5 backdrop-blur-sm">
-              <p className="text-[10px] font-bold text-blue-400/70 uppercase tracking-widest mb-2">
+            <div className="mt-2 rounded-xl bg-violet-950/20 border border-violet-500/12 p-3 space-y-2.5 backdrop-blur-sm">
+              <p className="text-[10px] font-bold text-violet-400/70 uppercase tracking-widest">
                 Chain of Thought — {action.action_type}
               </p>
-              {thoughts.map((line, i) => (
-                <div key={i} className="flex gap-2 text-xs text-gray-400">
-                  <span className="text-blue-500/50 shrink-0">→</span>
-                  <span>{line}</span>
-                </div>
-              ))}
-              <div className="pt-1.5 border-t border-blue-500/10 mt-2">
+
+              {hasStructuredCot ? (
+                COT_STEPS.map(({ key, label, color }) => {
+                  const text = cot[key];
+                  if (!text) return null;
+                  return (
+                    <div key={key} className="flex gap-2.5 text-xs">
+                      <div className="shrink-0 pt-0.5">
+                        <span className={`font-bold text-[10px] uppercase tracking-widest ${color}`}>
+                          {label}
+                        </span>
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-gray-300 leading-relaxed">{text}</p>
+                      </div>
+                    </div>
+                  );
+                })
+              ) : (
+                fallbackLines.map((line, i) => (
+                  <div key={i} className="flex gap-2 text-xs text-gray-400">
+                    <span className="text-violet-500/50 shrink-0">→</span>
+                    <span>{line}</span>
+                  </div>
+                ))
+              )}
+
+              <div className="pt-1.5 border-t border-violet-500/10 mt-2">
                 <p className="text-[10px] text-gray-600">
                   Correlation:{" "}
                   <span className="font-mono text-gray-500">{action.correlation_id}</span>

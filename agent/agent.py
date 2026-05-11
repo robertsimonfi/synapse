@@ -65,6 +65,8 @@ class FalloutResolution:
     policy_violations:   list[str] = field(default_factory=list)
     # Phase 13: cumulative token usage across all API calls in this resolution
     token_usage:         dict = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0})
+    # Phase 16: structured Chain-of-Thought (Observation/Constraint/Strategy/Recommendation)
+    chain_of_thought:    dict | None = None
 
     def __post_init__(self):
         if self.action_proposals is None:
@@ -111,6 +113,18 @@ Guidelines:
 - Correlate provisioning failures with active network alarms when relevant.
 - Check billing account health for any order-related issues.
 - Be specific: cite data values (order IDs, error codes, system names) in your reasoning.
+- Before the <resolution> block, emit a <cot> block containing your full reasoning monologue in
+  this exact JSON format so that NOC operators can audit every step of your thinking:
+
+<cot>
+{{
+  "observation":        "What I see in the data — facts from tool outputs, no inference yet.",
+  "constraint_check":   "Applicable regional policies, account flags, or business rules that constrain the options.",
+  "strategy":           "Which protocol or framework I am applying and why.",
+  "recommendation":     "The concrete action I will propose and the expected outcome."
+}}
+</cot>
+
 - At the end, respond with a JSON block wrapped in <resolution>...</resolution> tags.
 
 Resolution JSON format:
@@ -220,6 +234,28 @@ def _mock_resolution(fallout_input: FalloutInput) -> FalloutResolution:
         critic_violations=[],
         policy_violations=[],
         token_usage={"input_tokens": 0, "output_tokens": 0},
+        chain_of_thought={
+            "observation":      (
+                f"Subscriber {customer_id} has a TERMINATED data subscription. "
+                f"HLR shows the MSISDN is registered but the EPC bearer is missing. "
+                f"Error code: {error_code}."
+            ),
+            "constraint_check": (
+                f"Customer is in region {fallout_input.domain or 'DEFAULT'}. "
+                "Regional policy permits a one-time grace reactivation for TERMINATED subscriptions "
+                "within 30 days of the last successful payment."
+            ),
+            "strategy": (
+                "Applying the 'Graceful Recovery' protocol (Runbook: provisioning_failure.txt). "
+                "Re-trigger the provisioning workflow with a PROV_RESYNC command to re-align "
+                "OCS and HSS subscription state."
+            ),
+            "recommendation": (
+                f"Retry provisioning for customer {customer_id} / order {order_id} "
+                "with the PROV_RESYNC override flag. "
+                "Expected outcome: subscription_status transitions from TERMINATED → ACTIVE."
+            ),
+        },
     )
 
 
@@ -428,6 +464,7 @@ def run_agent(fallout_input: FalloutInput, correlation_id: str | None = None) ->
         critic_violations=critic_violations,
         policy_violations=policy_violations,
         token_usage=_token_usage,
+        chain_of_thought=_parse_cot(raw_reasoning),
     )
 
 
@@ -471,7 +508,6 @@ def _parse_resolution(text: str) -> dict:
     import re
     match = re.search(r"<resolution>(.*?)</resolution>", text, re.DOTALL)
     if not match:
-        # Fallback: try to find a raw JSON block
         match = re.search(r"\{[\s\S]*\"root_cause\"[\s\S]*\}", text)
         if not match:
             return {}
@@ -483,6 +519,24 @@ def _parse_resolution(text: str) -> dict:
         return json.loads(raw)
     except json.JSONDecodeError:
         return {}
+
+
+def _parse_cot(text: str) -> dict[str, str] | None:
+    """Extract structured Chain-of-Thought from <cot>...</cot> tags."""
+    import re
+    match = re.search(r"<cot>(.*?)</cot>", text, re.DOTALL)
+    if not match:
+        return None
+    raw = match.group(1).strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return {k: str(v) for k, v in data.items()}
+    except json.JSONDecodeError:
+        pass
+    return None
 
 
 def resolution_to_dict(r: FalloutResolution) -> dict:

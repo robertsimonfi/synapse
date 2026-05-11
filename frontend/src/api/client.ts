@@ -8,10 +8,21 @@ import type {
 const BASE = import.meta.env.VITE_API_BASE_URL ?? "/api";
 const API_KEY = import.meta.env.VITE_API_KEY ?? "";
 
+export function getStoredToken(): string | null {
+  return localStorage.getItem("synapse_jwt");
+}
+
+export function setStoredToken(token: string | null): void {
+  if (token) localStorage.setItem("synapse_jwt", token);
+  else localStorage.removeItem("synapse_jwt");
+}
+
 function headers(): HeadersInit {
+  const token = getStoredToken();
   return {
     "Content-Type": "application/json",
     ...(API_KEY ? { "X-API-Key": API_KEY } : {}),
+    ...(token ? { "Authorization": `Bearer ${token}` } : {}),
   };
 }
 
@@ -26,6 +37,28 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   return res.json() as Promise<T>;
 }
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+
+export interface LoginResponse {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+}
+
+export const loginOperator = async (username: string, password: string): Promise<LoginResponse> => {
+  const body = new URLSearchParams({ username, password });
+  const res = await fetch(`${BASE}/auth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`${res.status} ${text}`);
+  }
+  return res.json() as Promise<LoginResponse>;
+};
 
 // ── Actions ───────────────────────────────────────────────────────────────────
 

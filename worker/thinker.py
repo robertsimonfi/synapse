@@ -39,6 +39,7 @@ def _build_proposals(
     order_id: str | None,
     customer_id: str | None,
     reanalysis_count: int = 0,
+    chain_of_thought: dict | None = None,
 ) -> list[ActionProposal]:
     """
     Convert agent output into ActionProposal documents.
@@ -70,6 +71,7 @@ def _build_proposals(
             predicted_before_state=raw.get("predicted_before_state", {}),
             predicted_after_state=raw.get("predicted_after_state",  {}),
             reanalysis_count=reanalysis_count,
+            chain_of_thought=chain_of_thought,
         ))
     return proposals
 
@@ -154,6 +156,7 @@ async def _handle_task(msg_value: dict) -> None:
             order_id=fallout_input.order_id,
             customer_id=fallout_input.customer_id,
             reanalysis_count=reanalysis_count,
+            chain_of_thought=resolution.chain_of_thought,
         )
 
         for proposal in proposals:

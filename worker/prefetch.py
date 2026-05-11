@@ -19,7 +19,7 @@ High-Signal event schema (published by CDC producer when anomalies are detected)
 {
     "event_type":     "HIGH_SIGNAL",
     "signal_type":    "OUTAGE" | "MASS_FALLOUT" | "CRITICAL_SPIKE",
-    "opco_id":        "VODAFONE_UK",
+    "opco_id":        "UK_REGION",
     "affected_count": 1420,          # estimated
     "sector":         "HLR-East",    # optional
     "ts":             "2026-05-08T12:00:00+00:00",

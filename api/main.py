@@ -169,7 +169,7 @@ app = FastAPI(
         "AI-powered BSS/OSS fallout detection, root cause analysis, HITL action management, "
         "and resolution.  Powered by Claude.\n\n"
         "**Multi-tenant** — each request is scoped to an `opco_id` "
-        "(e.g. `VODAFONE_UK`, `VODAFONE_DE`) for data residency and quota isolation.\n\n"
+        "(e.g. `UK_REGION`, `DE_REGION`) for data residency and quota isolation.\n\n"
         "**WebSocket NOC dashboard** — connect to `WS /ws/noc/{opco_id}` for live events."
     ),
     version="3.0.0",
@@ -225,7 +225,7 @@ class ResolveRequest(BaseModel):
                 "domain": "PROVISIONING",
                 "severity": "HIGH",
                 "free_text": "Third retry attempt — still failing on HLR-East cluster",
-                "opco_id": "VODAFONE_UK",
+                "opco_id": "UK_REGION",
             }
         }
     }
@@ -284,7 +284,7 @@ class Customer360Request(BaseModel):
             "example": {
                 "customer_id": 7,
                 "query": "Why did my bill increase last month?",
-                "opco_id": "VODAFONE_UK",
+                "opco_id": "UK_REGION",
             }
         }
     }
@@ -985,114 +985,131 @@ async def get_trace_timeline(
 
     events: list[dict[str, Any]] = []
 
+    def _safe_str(v: Any) -> str:
+        return str(v) if v is not None else ""
+
     # ── Action proposals ──────────────────────────────────────────────────
-    async for doc in db.action_proposals.find(q, {"_id": 0}):
-        ts = doc.get("created_at", "")
-        correlation_id = doc.get("correlation_id", "")
-        events.append({
-            "event_id":   str(doc.get("id", uuid.uuid4())),
-            "trace_id":   trace_id,
-            "node_type":  "AI_REASONING",
-            "event_type": "ACTION_CREATED",
-            "timestamp":  ts,
-            "label":      f"AI proposed: {doc.get('action_type', '?')}",
-            "detail": {
-                "action_id":     doc.get("id"),
-                "action_type":   doc.get("action_type"),
-                "description":   doc.get("action_description"),
-                "confidence":    doc.get("action_payload", {}).get("confidence"),
-                "correlation_id": correlation_id,
-            },
-        })
-        # Status transition events from the same action
-        for status, field, evt, node in [
-            ("APPROVED",  "updated_at", "ACTION_APPROVED",  "OPERATOR_HITL"),
-            ("REJECTED",  "updated_at", "ACTION_REJECTED",  "OPERATOR_HITL"),
-            ("EXECUTED",  "executed_at", "ORACLE_WRITE_COMPLETED", "ORACLE_WRITE"),
-            ("FAILED",    "updated_at", "ACTION_FAILED",    "DLQ_FAILURE"),
-            ("ESCALATED_STALE", "updated_at", "ACTION_ESCALATED", "OPERATOR_HITL"),
-        ]:
-            if doc.get("status") == status and doc.get(field):
+    try:
+        async for doc in db.action_proposals.find(q, {"_id": 0}):
+            ts             = _safe_str(doc.get("created_at", ""))
+            correlation_id = _safe_str(doc.get("correlation_id", ""))
+            payload        = doc.get("action_payload") or {}
+            events.append({
+                "event_id":   str(doc.get("id") or uuid.uuid4()),
+                "trace_id":   trace_id,
+                "node_type":  "AI_REASONING",
+                "event_type": "ACTION_CREATED",
+                "timestamp":  ts,
+                "label":      f"AI proposed: {doc.get('action_type') or '?'}",
+                "detail": {
+                    "action_id":      doc.get("id"),
+                    "action_type":    doc.get("action_type"),
+                    "description":    doc.get("action_description"),
+                    "confidence":     payload.get("confidence") if isinstance(payload, dict) else None,
+                    "correlation_id": correlation_id,
+                    "chain_of_thought": doc.get("chain_of_thought"),
+                },
+            })
+            for status_val, ts_field, evt, node in [
+                ("APPROVED",       "updated_at",  "ACTION_APPROVED",      "OPERATOR_HITL"),
+                ("REJECTED",       "updated_at",  "ACTION_REJECTED",      "OPERATOR_HITL"),
+                ("EXECUTED",       "executed_at", "ORACLE_WRITE_COMPLETED","ORACLE_WRITE"),
+                ("FAILED",         "updated_at",  "ACTION_FAILED",        "DLQ_FAILURE"),
+                ("ESCALATED_STALE","updated_at",  "ACTION_ESCALATED",     "OPERATOR_HITL"),
+            ]:
+                if doc.get("status") == status_val and doc.get(ts_field):
+                    events.append({
+                        "event_id":   str(uuid.uuid4()),
+                        "trace_id":   trace_id,
+                        "node_type":  node,
+                        "event_type": evt,
+                        "timestamp":  _safe_str(doc.get(ts_field, "")),
+                        "label":      f"{evt.replace('_', ' ').title()}: {doc.get('action_type') or '?'}",
+                        "detail": {
+                            "action_id":        doc.get("id"),
+                            "operator":         doc.get("approved_by"),
+                            "rejection_reason": doc.get("rejection_reason"),
+                            "execution_error":  doc.get("execution_error"),
+                        },
+                    })
+    except Exception as exc:
+        logger.warning("trace: action_proposals query failed for trace_id=%s — %s", trace_id, exc)
+
+    # ── DLQ events ────────────────────────────────────────────────────────
+    try:
+        async for doc in db.dlq_events.find(q, {"_id": 0}):
+            events.append({
+                "event_id":   str(doc.get("dlq_id") or uuid.uuid4()),
+                "trace_id":   trace_id,
+                "node_type":  "DLQ_FAILURE",
+                "event_type": "DLQ_FAILURE",
+                "timestamp":  _safe_str(doc.get("failed_at", "")),
+                "label":      f"DLQ: {doc.get('action_type') or '?'} — {doc.get('table_name') or '?'}",
+                "detail": {
+                    "outbox_id":     doc.get("outbox_id"),
+                    "error_context": doc.get("error_context"),
+                    "attempts":      doc.get("attempts"),
+                    "table_name":    doc.get("table_name"),
+                },
+            })
+    except Exception as exc:
+        logger.warning("trace: dlq_events query failed for trace_id=%s — %s", trace_id, exc)
+
+    # ── Engagement / customer interaction events ───────────────────────────
+    try:
+        async for doc in db.engagement_logs.find(q, {"_id": 0}):
+            events.append({
+                "event_id":   str(doc.get("id") or uuid.uuid4()),
+                "trace_id":   trace_id,
+                "node_type":  "ENGAGEMENT",
+                "event_type": "ENGAGEMENT_SENT",
+                "timestamp":  _safe_str(doc.get("sent_at") or doc.get("created_at", "")),
+                "label":      f"Customer notified via {doc.get('channel') or '?'}",
+                "detail": {
+                    "channel":           doc.get("channel"),
+                    "template":          doc.get("template_used"),
+                    "status":            doc.get("status"),
+                    "customer_response": doc.get("customer_response"),
+                    "sentiment_score":   doc.get("sentiment_score"),
+                    "sentiment_label":   doc.get("sentiment_label"),
+                },
+            })
+            if doc.get("response_received_at"):
                 events.append({
                     "event_id":   str(uuid.uuid4()),
                     "trace_id":   trace_id,
-                    "node_type":  node,
-                    "event_type": evt,
-                    "timestamp":  doc.get(field, ""),
-                    "label":      f"{evt.replace('_', ' ').title()}: {doc.get('action_type', '?')}",
+                    "node_type":  "ENGAGEMENT",
+                    "event_type": "CUSTOMER_REPLIED",
+                    "timestamp":  _safe_str(doc.get("response_received_at", "")),
+                    "label":      f"Customer replied ({doc.get('sentiment_label') or 'UNKNOWN'})",
                     "detail": {
-                        "action_id":       doc.get("id"),
-                        "operator":        doc.get("approved_by"),
-                        "rejection_reason": doc.get("rejection_reason"),
-                        "execution_error": doc.get("execution_error"),
+                        "response":        doc.get("customer_response"),
+                        "sentiment_score": doc.get("sentiment_score"),
+                        "sentiment_label": doc.get("sentiment_label"),
                     },
                 })
-
-    # ── DLQ events ────────────────────────────────────────────────────────
-    async for doc in db.dlq_events.find(q, {"_id": 0}):
-        events.append({
-            "event_id":   str(doc.get("dlq_id", uuid.uuid4())),
-            "trace_id":   trace_id,
-            "node_type":  "DLQ_FAILURE",
-            "event_type": "DLQ_FAILURE",
-            "timestamp":  doc.get("failed_at", ""),
-            "label":      f"DLQ: {doc.get('action_type', '?')} — {doc.get('table_name', '?')}",
-            "detail": {
-                "outbox_id":     doc.get("outbox_id"),
-                "error_context": doc.get("error_context"),
-                "attempts":      doc.get("attempts"),
-                "table_name":    doc.get("table_name"),
-            },
-        })
-
-    # ── Engagement / customer interaction events ───────────────────────────
-    async for doc in db.engagement_logs.find(q, {"_id": 0}):
-        events.append({
-            "event_id":   str(doc.get("id", uuid.uuid4())),
-            "trace_id":   trace_id,
-            "node_type":  "ENGAGEMENT",
-            "event_type": "ENGAGEMENT_SENT",
-            "timestamp":  doc.get("sent_at") or doc.get("created_at", ""),
-            "label":      f"Customer notified via {doc.get('channel', '?')}",
-            "detail": {
-                "channel":          doc.get("channel"),
-                "template":         doc.get("template_used"),
-                "status":           doc.get("status"),
-                "customer_response": doc.get("customer_response"),
-                "sentiment_score":  doc.get("sentiment_score"),
-                "sentiment_label":  doc.get("sentiment_label"),
-            },
-        })
-        if doc.get("response_received_at"):
-            events.append({
-                "event_id":   str(uuid.uuid4()),
-                "trace_id":   trace_id,
-                "node_type":  "ENGAGEMENT",
-                "event_type": "CUSTOMER_REPLIED",
-                "timestamp":  doc.get("response_received_at", ""),
-                "label":      f"Customer replied ({doc.get('sentiment_label', 'UNKNOWN')})",
-                "detail": {
-                    "response":        doc.get("customer_response"),
-                    "sentiment_score": doc.get("sentiment_score"),
-                    "sentiment_label": doc.get("sentiment_label"),
-                },
-            })
+    except Exception as exc:
+        logger.warning("trace: engagement_logs query failed for trace_id=%s — %s", trace_id, exc)
 
     # ── Audit trail entries ───────────────────────────────────────────────
-    async for doc in db.audit_events.find(
-        {"$or": [{"trace_id": trace_id}, {"metadata.correlation_id": trace_id}]},
-        {"_id": 0},
-    ):
-        if doc.get("new_status") in ("APPROVED", "REJECTED", "FORCE_APPROVED"):
-            events.append({
-                "event_id":   str(doc.get("id", uuid.uuid4())),
-                "trace_id":   trace_id,
-                "node_type":  "OPERATOR_HITL",
-                "event_type": f"AUDIT_{doc.get('new_status', 'TRANSITION')}",
-                "timestamp":  doc.get("timestamp", ""),
-                "label":      f"Operator: {doc.get('new_status', '?')} by {doc.get('actor', '?')}",
-                "detail":     doc.get("metadata", {}),
-            })
+    try:
+        async for doc in db.audit_events.find(
+            {"$or": [{"trace_id": trace_id}, {"metadata.correlation_id": trace_id}]},
+            {"_id": 0},
+        ):
+            new_status = doc.get("new_status")
+            if new_status in ("APPROVED", "REJECTED", "FORCE_APPROVED"):
+                events.append({
+                    "event_id":   str(doc.get("id") or uuid.uuid4()),
+                    "trace_id":   trace_id,
+                    "node_type":  "OPERATOR_HITL",
+                    "event_type": f"AUDIT_{new_status}",
+                    "timestamp":  _safe_str(doc.get("timestamp", "")),
+                    "label":      f"Operator: {new_status or '?'} by {doc.get('actor') or '?'}",
+                    "detail":     doc.get("metadata") or {},
+                })
+    except Exception as exc:
+        logger.warning("trace: audit_events query failed for trace_id=%s — %s", trace_id, exc)
 
     if not events:
         raise HTTPException(
@@ -1164,8 +1181,14 @@ async def submit_action_feedback(
         trace_id=action_doc.get("trace_id"),
     )
 
-    # Persist to MongoDB for offline analytics
-    await db.operator_corrections.insert_one(correction.model_dump())
+    # Persist to MongoDB for offline analytics.
+    # TRAINING_READY=True flags corrections for prompt-optimizer ingestion:
+    # triggered when the AI made a clear mistake (score ≤ 2) or the operator
+    # provided an explicit correct_action override.
+    training_ready = body.quality_score <= 2 or bool(body.correct_action)
+    correction_doc = correction.model_dump()
+    correction_doc["training_ready"] = training_ready
+    await db.operator_corrections.insert_one(correction_doc)
 
     # Publish to Kafka (best-effort; non-fatal if Kafka unavailable)
     kafka_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
@@ -1188,10 +1211,11 @@ async def submit_action_feedback(
         action_id, body.quality_score, body.operator_id,
     )
     return {
-        "status":        "feedback_recorded",
-        "correction_id": correction.correction_id,
-        "action_id":     action_id,
-        "quality_score": body.quality_score,
+        "status":         "feedback_recorded",
+        "correction_id":  correction.correction_id,
+        "action_id":      action_id,
+        "quality_score":  body.quality_score,
+        "training_ready": training_ready,
     }
 
 
@@ -1219,8 +1243,8 @@ class ForceSyncRequest(BaseModel):
     model_config = {
         "json_schema_extra": {
             "example": {
-                "opco_id":       "VODAFONE_UK",
-                "operator_id":   "noc-lead@vodafone.com",
+                "opco_id":       "UK_REGION",
+                "operator_id":   "noc-lead@synapse.io",
                 "justification": "Customer on live call — Kafka lag at 480s, need fresh ODS now",
             }
         }
@@ -1300,7 +1324,7 @@ async def noc_websocket(websocket: WebSocket, opco_id: str):
     Connect with your OpCo ID to receive live events scoped to your boundary.
     Use "ALL" for a super-user view across all OpCos.
 
-    Valid opco_id values: VODAFONE_UK, VODAFONE_DE, VODAFONE_ES, VODAFONE_IT,
+    Valid opco_id values: UK_REGION, DE_REGION, ES_REGION, IT_REGION,
                           DEFAULT, ALL
 
     Event types pushed:

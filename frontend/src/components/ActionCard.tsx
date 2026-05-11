@@ -78,11 +78,11 @@ export function ActionCard({
 
   const isAngry = sentimentLabel === "ANGRY";
 
-  // 3-D tilt via framer-motion springs
+  // Subtle 3-D tilt — reduced to ±2° for a calmer enterprise feel
   const rawX = useMotionValue(0);
   const rawY = useMotionValue(0);
-  const rotateX = useSpring(useTransform(rawY, [-1, 1], [5, -5]), { stiffness: 380, damping: 42 });
-  const rotateY = useSpring(useTransform(rawX, [-1, 1], [-5, 5]), { stiffness: 380, damping: 42 });
+  const rotateX = useSpring(useTransform(rawY, [-1, 1], [2, -2]), { stiffness: 200, damping: 60 });
+  const rotateY = useSpring(useTransform(rawX, [-1, 1], [-2, 2]), { stiffness: 200, damping: 60 });
 
   useEffect(() => {
     if (triggerShake || isAngry) {
@@ -146,11 +146,10 @@ export function ActionCard({
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
       className={clsx(
-        "rounded-2xl glass border p-4 flex flex-col gap-3 relative overflow-hidden",
-        "transition-shadow duration-300",
+        "rounded-2xl glass border p-4 flex flex-col gap-3 relative overflow-hidden card-hover-glow",
         isAngry
           ? "shadow-xl shadow-red-900/30 hover:shadow-2xl hover:shadow-red-900/40"
-          : "hover:shadow-2xl hover:shadow-black/50",
+          : "hover:shadow-2xl hover:shadow-violet-950/60",
         borderClass,
         shaking && "animate-shake",
       )}
@@ -162,7 +161,7 @@ export function ActionCard({
           isHovering ? "opacity-100" : "opacity-0",
         )}
         style={{
-          background: `radial-gradient(circle at ${glowPos.x}% ${glowPos.y}%, rgba(79,130,246,0.10) 0%, transparent 62%)`,
+          background: `radial-gradient(circle at ${glowPos.x}% ${glowPos.y}%, rgba(139,92,246,0.12) 0%, transparent 62%)`,
         }}
       />
 

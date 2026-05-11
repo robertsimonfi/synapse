@@ -23,7 +23,7 @@ from typing import DefaultDict
 
 from fastapi import WebSocket
 
-VALID_OPCO_IDS = {"VODAFONE_UK", "VODAFONE_DE", "VODAFONE_ES", "VODAFONE_IT", "DEFAULT"}
+VALID_OPCO_IDS = {"UK_REGION", "DE_REGION", "ES_REGION", "IT_REGION", "DEFAULT"}
 
 
 class ConnectionManager:
