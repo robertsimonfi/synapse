@@ -29,8 +29,7 @@ function buildChainOfThought(action: ActionProposal): string[] {
 
   if (payload.reasoning) lines.push(String(payload.reasoning));
   if (payload.rationale) lines.push(String(payload.rationale));
-  if (payload.risk_level)
-    lines.push(`Risk level: ${payload.risk_level}`);
+  if (payload.risk_level) lines.push(`Risk level: ${payload.risk_level}`);
   if (payload.policy_checks)
     lines.push(`Policy checks: ${JSON.stringify(payload.policy_checks)}`);
 
@@ -45,12 +44,18 @@ export function AIThoughtPanel({ action }: Props) {
   const thoughts = buildChainOfThought(action);
 
   return (
-    <div className="mt-2">
+    <div className="mt-1">
       <button
         onClick={() => setOpen((o) => !o)}
-        className="flex items-center gap-1.5 text-xs text-blue-400 hover:text-blue-300 transition-colors"
+        className="flex items-center gap-1.5 text-xs text-blue-400/70 hover:text-blue-300 transition-colors group"
       >
-        <span className="text-base">{open ? "▾" : "▸"}</span>
+        <motion.span
+          animate={{ rotate: open ? 90 : 0 }}
+          transition={{ duration: 0.18 }}
+          className="text-blue-500/60 group-hover:text-blue-400 transition-colors"
+        >
+          ▸
+        </motion.span>
         AI Thought Process
       </button>
 
@@ -60,22 +65,23 @@ export function AIThoughtPanel({ action }: Props) {
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: "auto" }}
             exit={{ opacity: 0, height: 0 }}
-            transition={{ duration: 0.2 }}
+            transition={{ duration: 0.22 }}
             className="overflow-hidden"
           >
-            <div className="mt-2 rounded-lg bg-blue-950/40 border border-blue-800/50 p-3 space-y-1.5">
-              <p className="text-xs font-semibold text-blue-300 mb-2">
+            <div className="mt-2 rounded-xl bg-blue-950/20 border border-blue-500/12 p-3 space-y-1.5 backdrop-blur-sm">
+              <p className="text-[10px] font-bold text-blue-400/70 uppercase tracking-widest mb-2">
                 Chain of Thought — {action.action_type}
               </p>
               {thoughts.map((line, i) => (
-                <div key={i} className="flex gap-2 text-xs text-gray-300">
-                  <span className="text-blue-500 shrink-0">→</span>
+                <div key={i} className="flex gap-2 text-xs text-gray-400">
+                  <span className="text-blue-500/50 shrink-0">→</span>
                   <span>{line}</span>
                 </div>
               ))}
-              <div className="pt-1 border-t border-blue-800/40 mt-2">
-                <p className="text-xs text-gray-500">
-                  Correlation: <span className="font-mono text-gray-400">{action.correlation_id}</span>
+              <div className="pt-1.5 border-t border-blue-500/10 mt-2">
+                <p className="text-[10px] text-gray-600">
+                  Correlation:{" "}
+                  <span className="font-mono text-gray-500">{action.correlation_id}</span>
                 </p>
               </div>
             </div>
