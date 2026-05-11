@@ -114,7 +114,7 @@ async def create_producer(ensure_topics: bool = True) -> AIOKafkaProducer:
         key_serializer=lambda k: k.encode("utf-8") if isinstance(k, str) else k,
         acks="all",                  # wait for all in-sync replicas
         enable_idempotence=True,     # exactly-once producer semantics
-        compression_type="lz4",
+        compression_type="gzip",      # lz4 requires an extra package; gzip is stdlib-safe
         **_kafka_tls_kwargs(),       # Phase 12: mTLS when KAFKA_SECURITY_PROTOCOL=SSL
     )
     await producer.start()

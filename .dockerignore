@@ -58,3 +58,11 @@ tests/
 Dockerfile
 .dockerignore
 docker-compose*.yml
+
+# Frontend build deps — not needed in the Python image and contain
+# Windows-incompatible file modes that break Docker Desktop's tar archiver
+frontend/node_modules/
+frontend/package-lock.json
+
+# Claude Code worktree scratch data
+.claude/

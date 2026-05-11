@@ -46,6 +46,12 @@ services:
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_LOG_RETENTION_HOURS: 168
       KAFKA_LOG_SEGMENT_BYTES: 536870912
+      # Single-broker overrides — apache/kafka defaults to RF=3 which breaks a
+      # one-node KRaft cluster. __consumer_offsets and __transaction_state must
+      # be created with RF=1 so the GroupCoordinator can initialise.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       # Fixed cluster ID for local dev (KRaft requires this to be stable across restarts)
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
     volumes:
@@ -372,6 +378,7 @@ services:
       - "8501:8501"
     environment:
       API_BASE_URL: http://api:8000
+      SYNAPSE_API_KEY: dev-local-key-synapse
     env_file:
       - .env
     depends_on:

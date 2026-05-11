@@ -155,6 +155,74 @@ Resolution JSON format:
 }}"""
 
 
+def _mock_resolution(fallout_input: FalloutInput) -> FalloutResolution:
+    """
+    Return a realistic-looking hardcoded resolution without calling the Anthropic API.
+    Enabled by setting CLAUDE_MOCK=true in the environment.
+
+    The mock always proposes one concrete action so the full HITL pipeline fires:
+      MongoDB (PENDING) → Operator Portal → Executor → Relay → Oracle Adapter → SQLite
+    """
+    error_code = fallout_input.error_code or "UNKNOWN"
+    customer_id = fallout_input.customer_id or 0
+    order_id = fallout_input.order_id or 99999
+
+    return FalloutResolution(
+        classification={
+            "domain":      fallout_input.domain or "PROVISIONING",
+            "issue_type":  "SubscriptionActivationFailure",
+            "severity":    fallout_input.severity or "HIGH",
+        },
+        root_cause=(
+            f"[MOCK] Subscriber {customer_id} has a TERMINATED data subscription that was "
+            f"not re-activated after plan upgrade. The HLR shows the MSISDN is registered "
+            f"but the EPC bearer is missing, causing {error_code}. "
+            "Root cause: provisioning state machine left the subscription in a partial "
+            "ACTIVE/TERMINATED split across OCS and HSS."
+        ),
+        recommended_actions=[
+            f"Re-trigger provisioning workflow for customer {customer_id} / order {order_id}",
+            "Sync OCS and HSS subscription state via PROV_RESYNC command",
+            "Issue compensatory data credit of 5 GB for service disruption",
+        ],
+        runbook_references=["provisioning_failure.txt", "order_fallout.txt"],
+        confidence="HIGH",
+        raw_reasoning="[MOCK MODE — no Claude API call was made]",
+        action_proposals=[
+            {
+                # "retry_provisioning" matches the executor handler registry AND
+                # _outbox_params() so the full path fires:
+                #   Executor -> MongoDB outbox -> Relay -> Kafka legacy.commands.writeback
+                #   -> Oracle Adapter -> SQLite ORDER_FALLOUT update
+                "action_type":        "retry_provisioning",
+                "action_description": (
+                    f"Re-trigger provisioning workflow for customer {customer_id} "
+                    f"to resolve {error_code} activation failure"
+                ),
+                "action_payload": {
+                    "customer_id": customer_id,
+                    "order_id":    order_id,
+                    "error_code":  error_code,
+                    "command":     "PROV_RESYNC",
+                    "target_system": "HLR",
+                    # fallout_id is used by _outbox_params for the WHERE clause
+                    "fallout_id":  f"FALLOUT-{order_id}",
+                    "msisdn":      "unknown",
+                    "system":      "HLR",
+                },
+                "predicted_before_state": {"subscription_status": "TERMINATED"},
+                "predicted_after_state":  {"subscription_status": "ACTIVE"},
+            }
+        ],
+        critique={"quality": "good", "issues": [], "lesson": None},
+        routing_domain=fallout_input.domain or "PROVISIONING",
+        routing_confidence=0.99,
+        critic_violations=[],
+        policy_violations=[],
+        token_usage={"input_tokens": 0, "output_tokens": 0},
+    )
+
+
 def run_agent(fallout_input: FalloutInput, correlation_id: str | None = None) -> FalloutResolution:
     """
     Main agent entry point. Returns a FalloutResolution.
@@ -163,7 +231,13 @@ def run_agent(fallout_input: FalloutInput, correlation_id: str | None = None) ->
       - IntentRouter classifies intent → selects Expert tool subset + prompt addendum
       - InternalCritic reviews draft → triggers one revision pass on violations
       - PolicyEngine validates credit/discount actions against hard business rules
+
+    Set CLAUDE_MOCK=true in the environment to skip all Anthropic API calls and
+    return a realistic hardcoded resolution instead (useful for KT / demo runs).
     """
+    if os.getenv("CLAUDE_MOCK", "false").lower() == "true":
+        return _mock_resolution(fallout_input)
+
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
     # Build the issue description for retrieval
@@ -221,6 +295,11 @@ def run_agent(fallout_input: FalloutInput, correlation_id: str | None = None) ->
     max_iterations = 10
     # Phase 13: accumulate token usage across all API calls for budget tracking
     _token_usage: dict = {"input_tokens": 0, "output_tokens": 0}
+    # Track whether last_response has already been appended to messages.
+    # If the loop exhausts max_iterations on a tool_use turn, the response is
+    # already in the history; the critic section must not append it again or it
+    # creates a dangling tool_use block with no following tool_result.
+    _last_response_in_messages = False
 
     for _ in range(max_iterations):
         last_response = client.messages.create(
@@ -239,6 +318,7 @@ def run_agent(fallout_input: FalloutInput, correlation_id: str | None = None) ->
                 raw_reasoning_parts.append(block.text)
 
         if last_response.stop_reason == "end_turn":
+            _last_response_in_messages = False
             break
 
         if last_response.stop_reason == "tool_use":
@@ -253,7 +333,9 @@ def run_agent(fallout_input: FalloutInput, correlation_id: str | None = None) ->
                     })
             messages.append({"role": "assistant", "content": last_response.content})
             messages.append({"role": "user",      "content": tool_results})
+            _last_response_in_messages = True
         else:
+            _last_response_in_messages = False
             break
 
     raw_reasoning   = "\n".join(raw_reasoning_parts)
@@ -270,8 +352,11 @@ def run_agent(fallout_input: FalloutInput, correlation_id: str | None = None) ->
     )
 
     if critic_violations and last_response is not None:
-        # Append the final assistant turn then inject critic feedback for one revision pass
-        messages.append({"role": "assistant", "content": last_response.content})
+        # Only append the final assistant turn if it isn't already in messages.
+        # (It's already there when the main loop exhausted max_iterations on a
+        # tool_use turn; appending it again would create a dangling tool_use.)
+        if not _last_response_in_messages:
+            messages.append({"role": "assistant", "content": last_response.content})
         messages.append({"role": "user", "content": critic.format_feedback(critic_violations)})
 
         for _ in range(5):

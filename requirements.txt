@@ -1,62 +1,54 @@
-# ── Core AI ────────────────────────────────────────────────────────────────────
+# -- Core AI ------------------------------------------------------------------
 anthropic>=0.28.0
 
-# ── Vector DB / RAG ────────────────────────────────────────────────────────────
+# -- Vector DB / RAG ----------------------------------------------------------
 chromadb>=0.5.0
 
-# ── API ────────────────────────────────────────────────────────────────────────
+# -- API ----------------------------------------------------------------------
 fastapi>=0.111.0
 uvicorn[standard]>=0.30.0
 pydantic>=2.7.0
 
-# ── Database ───────────────────────────────────────────────────────────────────
-oracledb>=2.3.0         # Oracle (production)
-# sqlite3 is part of Python stdlib — no install needed for local dev
+# -- Database -----------------------------------------------------------------
+oracledb>=2.3.0
+# sqlite3 is part of Python stdlib
 
-# ── MongoDB state store (Phase 1) ──────────────────────────────────────────────
-motor>=3.3.0            # Async MongoDB driver
-pymongo>=4.6.0          # Sync driver used by motor; also needed for ReturnDocument
+# -- MongoDB state store ------------------------------------------------------
+motor>=3.3.0
+pymongo>=4.6.0
 
-# ── Message bus / Kafka (Phase 9 — replaces RabbitMQ) ─────────────────────────
-aiokafka>=0.11.0        # Async Kafka client (producer + consumer)
+# -- Message bus / Kafka ------------------------------------------------------
+aiokafka>=0.11.0
+lz4>=4.0.0
 
-# ── Observability (Phase 2) ────────────────────────────────────────────────────
+# -- Observability ------------------------------------------------------------
 prometheus-client>=0.20.0
 opentelemetry-sdk>=1.23.0
-opentelemetry-exporter-otlp-proto-grpc>=1.23.0   # Optional; graceful fallback if absent
+opentelemetry-exporter-otlp-proto-grpc>=1.23.0
 
-# ── Scheduler / auto-expiry (Phase 2) ─────────────────────────────────────────
+# -- Scheduler ----------------------------------------------------------------
 apscheduler>=3.10.4
 
-# ── Operator Portal UI (Phase 3) ───────────────────────────────────────────────
+# -- Operator Portal UI -------------------------------------------------------
 streamlit>=1.32.0
-pandas>=2.2.0           # Used by the diff table in operator_portal.py
+pandas>=2.2.0
 
-# ── Slack notifications (auto-expiry alerts) ───────────────────────────────────
-aiohttp>=3.9.0          # Used by jobs/expiry.py for Slack webhook POST
+# -- Slack / HTTP -------------------------------------------------------------
+aiohttp>=3.9.0
 
-# ── Seed data generation ───────────────────────────────────────────────────────
+# -- Seed data ----------------------------------------------------------------
 faker>=25.0.0
 
-# ── Utilities ──────────────────────────────────────────────────────────────────
+# -- Utilities ----------------------------------------------------------------
 python-dotenv>=1.0.0
 
-# ── Phase 13: Cold Store S3 backend (optional) ─────────────────────────────────
-# Install boto3 when COLD_STORE_BACKEND=s3 (production).  Not required for the
-# default MongoDB cold store backend used in local dev.
-boto3>=1.34.0             # AWS S3 cold subscriber archive (set COLD_STORE_BACKEND=s3)
+# -- Cold Store (optional S3 backend) -----------------------------------------
+boto3>=1.34.0
 
-# ── Phase 15: JWT auth + rate limiting ────────────────────────────────────────
-python-jose[cryptography]>=3.3.0    # JWT encode/decode (HS256)
-passlib[bcrypt]>=1.7.4              # bcrypt password hashing for operator accounts
-python-multipart>=0.0.9             # OAuth2PasswordRequestForm multipart parsing
+# -- JWT auth + rate limiting --------------------------------------------------
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+python-multipart>=0.0.9
 
-# ── Phase 15: Multi-language sentiment (optional backends) ────────────────────
-langdetect>=1.0.9                   # Lightweight offline language detection
-# transformers>=4.40.0              # Uncomment for DistilBERT backend (SENTIMENT_BACKEND=distilbert)
-# torch>=2.2.0                      # Required by transformers on CPU-only instances
-
-# ── Phase 7: Notification providers (optional — only needed for real dispatch) ──
-# twilio>=8.0.0        # Uncomment to enable TwilioProvider
-# sendgrid>=6.11.0     # Uncomment to enable SendGridProvider
-# aiohttp is already listed above and is used by the Twilio/SendGrid stubs
+# -- Sentiment (optional backends) --------------------------------------------
+langdetect>=1.0.9
