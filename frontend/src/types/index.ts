@@ -32,6 +32,7 @@ export interface ActionProposal {
   executed_at: string | null;
   execution_error: string | null;
   chain_of_thought: Record<string, string> | null;
+  opco_id?: string;
 }
 
 // ── Timeline / Trace ───────────────────────────────────────────────────────────

@@ -232,7 +232,14 @@ export function NOCDashboard({ onLogout }: { onLogout?: () => void }) {
             <select
               value={opcoId}
               onChange={(e) => setOpcoId(e.target.value)}
-              className="bg-white/4 border border-white/8 rounded-lg px-2.5 py-1 text-xs text-gray-300 focus:outline-none focus:border-blue-500/50 transition-colors"
+              disabled={OPERATOR_ROLE === "operator"}
+              title={OPERATOR_ROLE === "operator" ? "Region locked to your assigned OpCo" : undefined}
+              className={clsx(
+                "bg-white/4 border border-white/8 rounded-lg px-2.5 py-1 text-xs text-gray-300 transition-colors",
+                OPERATOR_ROLE === "operator"
+                  ? "opacity-60 cursor-not-allowed"
+                  : "focus:outline-none focus:border-blue-500/50",
+              )}
             >
               {OPCO_OPTIONS.map((o) => (
                 <option key={o} value={o}>{o}</option>

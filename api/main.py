@@ -87,7 +87,7 @@ from agent.agent import (
     run_customer_360,
 )
 from agent.memory import memory_stats
-from api.security import require_api_key, auth_router, get_current_operator, OperatorInfo
+from api.security import require_api_key, require_any_auth, auth_router, get_current_operator, OperatorInfo
 from api.websocket_manager import manager as ws_manager, noc_event, VALID_OPCO_IDS
 from api.canary_routes import router as canary_router  # Phase 12
 from models.action import ApproveRequest, ForceApproveRequest, RejectRequest
@@ -104,13 +104,14 @@ _mongo_enabled = bool(os.getenv("MONGODB_URI"))
 async def lifespan(app: FastAPI):
     # Startup
     if _mongo_enabled:
-        from db.mongo import ensure_indexes
+        from db.mongo import ensure_indexes, seed_roles_permissions
         from db.ods import ensure_ods_indexes
         from billing.token_budget import ensure_budget_indexes
         await ensure_indexes()
         await ensure_ods_indexes()
         await ensure_budget_indexes()
-        logger.info("MongoDB indexes ready (actions, ODS, token_budgets)")
+        await seed_roles_permissions()
+        logger.info("MongoDB indexes ready (actions, ODS, token_budgets, roles_permissions)")
 
     from jobs.expiry import setup_expiry_scheduler
     scheduler = setup_expiry_scheduler()
@@ -332,6 +333,8 @@ class ActionOut(BaseModel):
     approval_method:          Optional[str]
     force_approval_reason:    Optional[str]
     safety_checks_bypassed:   bool
+    chain_of_thought:         Optional[dict[str, str]] = None
+    opco_id:                  str = "DEFAULT"
 
 
 class AuditOut(BaseModel):
@@ -374,6 +377,8 @@ def _action_to_out(a) -> ActionOut:
         approval_method=getattr(a, "approval_method", None),
         force_approval_reason=getattr(a, "force_approval_reason", None),
         safety_checks_bypassed=getattr(a, "safety_checks_bypassed", False),
+        chain_of_thought=getattr(a, "chain_of_thought", None),
+        opco_id=getattr(a, "opco_id", "DEFAULT"),
     )
 
 
@@ -608,10 +613,11 @@ async def get_action_endpoint(action_id: str, _: str = Security(require_api_key)
 async def approve_action(
     action_id: str,
     body: ApproveRequest,
-    _: str = Security(require_api_key),
+    operator: Optional[OperatorInfo] = Depends(require_any_auth),
 ):
     """
     Operator approves a PENDING action.
+    Phase 17: RBAC — OPERATOR role may only approve actions in their assigned region.
 
     approval_method="STANDARD" (default): transitions to APPROVED; executor runs the
     pre-flight drift check before execution.
@@ -635,6 +641,18 @@ async def approve_action(
     action = await get_action(action_id)
     if not action:
         raise HTTPException(status_code=404, detail=f"Action {action_id} not found")
+
+    # Phase 17 RBAC: operators are restricted to their assigned region
+    if operator and operator.role == "operator" and operator.opco_id:
+        action_opco = getattr(action, "opco_id", "DEFAULT")
+        if action_opco and action_opco not in ("DEFAULT", operator.opco_id):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Permission denied: action belongs to region '{action_opco}' "
+                    f"but your token is restricted to '{operator.opco_id}'"
+                ),
+            )
 
     target_status = ActionStatus.FORCE_APPROVED if force_mode else ActionStatus.APPROVED
     extra: dict = {
@@ -690,10 +708,11 @@ async def approve_action(
 async def force_approve_action(
     action_id: str,
     body: ForceApproveRequest,
-    _: str = Security(require_api_key),
+    operator: Optional[OperatorInfo] = Depends(require_any_auth),
 ):
     """
     Phase 10 — Operator manual override for ESCALATED_STALE actions.
+    Phase 17: RBAC — OPERATOR role may only force-approve actions in their assigned region.
 
     Transitions the action to FORCE_APPROVED, which the Executor picks up and
     executes immediately, skipping the pre-flight drift check. Requires a
@@ -706,6 +725,18 @@ async def force_approve_action(
     action = await get_action(action_id)
     if not action:
         raise HTTPException(status_code=404, detail=f"Action {action_id} not found")
+
+    # Phase 17 RBAC: operators restricted to their assigned region
+    if operator and operator.role == "operator" and operator.opco_id:
+        action_opco = getattr(action, "opco_id", "DEFAULT")
+        if action_opco and action_opco not in ("DEFAULT", operator.opco_id):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Permission denied: action belongs to region '{action_opco}' "
+                    f"but your token is restricted to '{operator.opco_id}'"
+                ),
+            )
 
     if action.status != ActionStatus.ESCALATED_STALE:
         raise HTTPException(
@@ -958,10 +989,11 @@ async def acknowledge_dlq_event_endpoint(
 @app.get("/system/trace/{trace_id}", tags=["System"])
 async def get_trace_timeline(
     trace_id: str,
-    _: str = Security(require_api_key),
+    operator: Optional[OperatorInfo] = Depends(require_any_auth),
 ):
     """
     Phase 14 — Distributed Trace Timeline.
+    Phase 17 — Dual auth (Bearer JWT or X-API-Key) + UUID/ObjectId-safe query.
 
     Aggregates all events that share the given trace_id (W3C traceparent) into a
     chronological JSON array.  Each event carries a `node_type` tag used by the
@@ -979,9 +1011,26 @@ async def get_trace_timeline(
 
     db = await get_db()
 
-    # Primary key for the trace is the W3C traceparent; many documents store
-    # the correlation_id *as* their trace_id, so we search both fields.
-    q = {"$or": [{"trace_id": trace_id}, {"correlation_id": trace_id}]}
+    # Build a list of all ID variants to query (string, UUID canonical form,
+    # and ObjectId) so that any storage format resolves correctly.
+    id_variants: list = [trace_id]
+    try:
+        import uuid as _uuid
+        canonical = str(_uuid.UUID(trace_id))
+        if canonical != trace_id:
+            id_variants.append(canonical)
+    except (ValueError, AttributeError):
+        pass
+    try:
+        from bson import ObjectId
+        id_variants.append(ObjectId(trace_id))
+    except Exception:
+        pass
+
+    q = {"$or": [
+        *[{"trace_id": v} for v in id_variants],
+        *[{"correlation_id": v} for v in id_variants],
+    ]}
 
     events: list[dict[str, Any]] = []
 

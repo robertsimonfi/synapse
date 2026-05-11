@@ -194,6 +194,63 @@ async def get_ws_operator(
     )
 
 
+# ── Phase 17: dual-auth dependencies ─────────────────────────────────────────
+
+async def get_optional_operator(
+    token: Optional[str] = Depends(oauth2_scheme),
+) -> Optional[OperatorInfo]:
+    """Returns OperatorInfo if a valid JWT Bearer is present, otherwise None."""
+    if not token:
+        return None
+    try:
+        payload = _decode_token(token)
+        operator_id = payload.get("sub")
+        if not operator_id:
+            return None
+        return OperatorInfo(
+            operator_id=operator_id,
+            opco_id=payload.get("opco_id"),
+            role=payload.get("role", "operator"),
+        )
+    except HTTPException:
+        return None
+
+
+async def require_any_auth(
+    api_key: str | None = Security(_api_key_scheme),
+    token: Optional[str] = Depends(oauth2_scheme),
+) -> Optional[OperatorInfo]:
+    """
+    Phase 17 — Dual authentication.
+
+    Accepts Bearer JWT (dashboard) or X-API-Key (machine-to-machine).
+    JWT returns an OperatorInfo for RBAC; API-key auth returns None.
+    Raises 401 if neither is valid.
+    """
+    if token:
+        try:
+            payload = _decode_token(token)
+            operator_id = payload.get("sub")
+            if operator_id:
+                await check_rate_limit(operator_id)
+                return OperatorInfo(
+                    operator_id=operator_id,
+                    opco_id=payload.get("opco_id"),
+                    role=payload.get("role", "operator"),
+                )
+        except HTTPException:
+            pass  # fall through to API key
+
+    if ALLOWED_KEYS and api_key and any(secrets.compare_digest(api_key, k) for k in ALLOWED_KEYS):
+        return None  # API-key auth — no operator context, RBAC skipped
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Authentication required: provide X-API-Key or Bearer JWT",
+        headers={"WWW-Authenticate": 'Bearer, APIKey realm="Synapse"'},
+    )
+
+
 # ── Auth router (mounted at /auth in api/main.py) ─────────────────────────────
 
 auth_router = APIRouter(prefix="/auth", tags=["Auth"])

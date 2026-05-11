@@ -118,10 +118,11 @@ Guidelines:
 
 <cot>
 {{
-  "observation":        "What I see in the data — facts from tool outputs, no inference yet.",
-  "constraint_check":   "Applicable regional policies, account flags, or business rules that constrain the options.",
-  "strategy":           "Which protocol or framework I am applying and why.",
-  "recommendation":     "The concrete action I will propose and the expected outcome."
+  "observation":              "What I see in the data — facts from tool outputs, no inference yet.",
+  "constraint_check":         "Applicable regional policies, account flags, or business rules that constrain the options.",
+  "strategy":                 "Which protocol or framework I am applying and why.",
+  "recommendation":           "The concrete action I will propose and the expected outcome.",
+  "natural_language_summary": "A 2-3 sentence human-readable explanation of your full reasoning. Include specific customer context (e.g. tenure, loyalty tier, account status) that shaped this decision. Write as if briefing a senior NOC manager."
 }}
 </cot>
 
@@ -254,6 +255,15 @@ def _mock_resolution(fallout_input: FalloutInput) -> FalloutResolution:
                 f"Retry provisioning for customer {customer_id} / order {order_id} "
                 "with the PROV_RESYNC override flag. "
                 "Expected outcome: subscription_status transitions from TERMINATED → ACTIVE."
+            ),
+            "natural_language_summary": (
+                f"Customer {customer_id} is experiencing a provisioning split-state caused by "
+                f"error {error_code}: the MSISDN is registered on the HLR but the EPC bearer is "
+                "absent, leaving the subscription in a TERMINATED/ACTIVE deadlock. "
+                "Regional grace policy allows a one-time PROV_RESYNC to re-align OCS and HSS "
+                "without requiring a new order, making this the lowest-risk resolution path. "
+                "I am recommending an automated retry to restore service immediately while "
+                "preserving the existing order record."
             ),
         },
     )

@@ -87,6 +87,17 @@ export function AIThoughtPanel({ action }: Props) {
                 Chain of Thought — {action.action_type}
               </p>
 
+              {hasStructuredCot && cot["natural_language_summary"] && (
+                <div className="rounded-lg bg-violet-500/8 border border-violet-500/18 px-3 py-2.5">
+                  <p className="text-[10px] font-bold text-violet-400/60 uppercase tracking-widest mb-1">
+                    AI Summary
+                  </p>
+                  <p className="text-sm text-gray-200 leading-relaxed">
+                    {cot["natural_language_summary"]}
+                  </p>
+                </div>
+              )}
+
               {hasStructuredCot ? (
                 COT_STEPS.map(({ key, label, color }) => {
                   const text = cot[key];

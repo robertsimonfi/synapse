@@ -122,6 +122,9 @@ class ActionProposal(BaseModel):
     # Phase 16: structured Chain-of-Thought reasoning monologue
     chain_of_thought: dict[str, str] | None = None
 
+    # Phase 17: region/OpCo this action belongs to (used for RBAC approval checks)
+    opco_id: str = "DEFAULT"
+
 
 class AuditEvent(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))

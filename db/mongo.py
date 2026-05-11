@@ -57,7 +57,33 @@ async def ensure_indexes() -> None:
     await db.engagement_log.create_index([("correlation_id", ASCENDING)])
     await db.engagement_log.create_index([("customer_id", ASCENDING)])
     await db.engagement_log.create_index([("created_at", DESCENDING)])
+    # Phase 17 — RBAC roles_permissions index
+    await db.roles_permissions.create_index([("role", ASCENDING)], unique=True)
     logger.info("MongoDB indexes ensured")
+
+
+async def seed_roles_permissions() -> None:
+    """Phase 17: seed the roles_permissions collection with standard role definitions."""
+    db = _db()
+    roles = [
+        {
+            "role": "MANAGER",
+            "permissions": ["execute_global", "read_all", "manage_users"],
+            "scope": "GLOBAL",
+        },
+        {
+            "role": "OPERATOR",
+            "permissions": ["execute_regional", "read_regional"],
+            "scope": "LOCAL",
+        },
+    ]
+    for role_doc in roles:
+        await db.roles_permissions.update_one(
+            {"role": role_doc["role"]},
+            {"$setOnInsert": role_doc},
+            upsert=True,
+        )
+    logger.info("roles_permissions seeded (%d roles)", len(roles))
 
 
 # ── Customer document helpers ─────────────────────────────────────────────────

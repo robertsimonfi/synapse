@@ -40,6 +40,7 @@ def _build_proposals(
     customer_id: str | None,
     reanalysis_count: int = 0,
     chain_of_thought: dict | None = None,
+    opco_id: str = "DEFAULT",
 ) -> list[ActionProposal]:
     """
     Convert agent output into ActionProposal documents.
@@ -72,6 +73,7 @@ def _build_proposals(
             predicted_after_state=raw.get("predicted_after_state",  {}),
             reanalysis_count=reanalysis_count,
             chain_of_thought=chain_of_thought,
+            opco_id=opco_id,
         ))
     return proposals
 
@@ -157,6 +159,7 @@ async def _handle_task(msg_value: dict) -> None:
             customer_id=fallout_input.customer_id,
             reanalysis_count=reanalysis_count,
             chain_of_thought=resolution.chain_of_thought,
+            opco_id=opco_id,
         )
 
         for proposal in proposals:

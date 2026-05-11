@@ -150,14 +150,14 @@ export function LoginPage({ onLogin }: Props) {
           </p>
 
           {/* Role legend */}
-          <div className="mt-4 pt-4 border-t border-white/5 flex gap-3 text-[10px] text-gray-600">
-            <div className="flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-violet-400 inline-block" />
-              <span>MANAGER — full execute + global view</span>
+          <div className="mt-4 pt-4 border-t border-white/5 space-y-1.5 text-[10px] text-gray-600">
+            <div className="flex items-start gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-violet-400 inline-block mt-0.5 shrink-0" />
+              <span>MANAGER — Full Execution + Global Regional Access</span>
             </div>
-            <div className="flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-gray-500 inline-block" />
-              <span>OPERATOR — read + regional filter</span>
+            <div className="flex items-start gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-gray-500 inline-block mt-0.5 shrink-0" />
+              <span>OPERATOR — Full Execution + Restricted to Assigned Region</span>
             </div>
           </div>
         </div>
