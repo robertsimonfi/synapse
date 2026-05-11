@@ -164,3 +164,23 @@ token_quota_exceeded_total = Counter(
     "Number of times an OpCo's monthly quota was exhausted",
     ["opco_id"],
 )
+
+# ── Defensive Execution: drift / failure / force-approve ──────────────────────
+
+drift_detections_total = Counter(
+    "synapse_drift_detections_total",
+    "Pre-flight drift detections that aborted execution (APPROVED → STALE)",
+    ["opco_id", "action_type"],
+)
+
+handler_failures_total = Counter(
+    "synapse_handler_failures_total",
+    "Actions that failed after exhausting all handler retry attempts",
+    ["action_type"],
+)
+
+force_approved_total = Counter(
+    "synapse_force_approved_total",
+    "Actions approved via Force Approve, bypassing pre-flight drift checks",
+    ["operator", "action_type"],
+)

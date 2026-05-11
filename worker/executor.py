@@ -30,7 +30,10 @@ from db.ods import create_outbox_entry
 from models.action import ActionProposal, ActionStatus
 from observability.metrics import (
     actions_failed_total,
+    drift_detections_total,
     execution_latency_seconds,
+    force_approved_total,
+    handler_failures_total,
     pending_queue_depth,
 )
 from observability.tracing import traced_span
@@ -214,22 +217,29 @@ def _outbox_params(action: ActionProposal) -> tuple[str, str, dict, dict] | None
 
 # ── Phase 8: Pre-flight drift check ───────────────────────────────────────────
 
-async def _pre_flight_check(action: ActionProposal) -> tuple[bool, str]:
+async def _pre_flight_check(action: ActionProposal) -> tuple[bool, str, dict | None]:
     """
     Read live CRM state and compare against predicted_before_state.
-    Returns (True, "ok") if safe to proceed, (False, reason) to abort.
+    Returns (safe, reason, live_state). live_state is None when CRM is unavailable.
     Runs before acquiring the EXECUTING lock so APPROVED → STALE is a valid transition.
     """
+    logger.info("Executor: [action_id: %s] Running pre-flight drift check...", action.id)
+    logger.info("Executor: Predicted state: %s", action.predicted_before_state)
+
     try:
         live_state = await asyncio.to_thread(read_live_crm_state, action)
     except Exception as exc:
         logger.warning("Pre-flight CRM read failed for action %s: %s — proceeding", action.id, exc)
-        return True, "crm_read_error_skipped"
+        return True, "crm_read_error_skipped", None
 
     if live_state is None:
-        return True, "sqlite_unavailable"
+        return True, "sqlite_unavailable", None
 
-    return check_state_drift(action, live_state)
+    logger.info("Executor: Current state: %s", live_state)
+    ok, reason = check_state_drift(action, live_state)
+    if not ok:
+        logger.warning("Executor: ⚠️  STATE DRIFT DETECTED — marking action STALE")
+    return ok, reason, live_state
 
 
 # ── Phase 8: Post-write state verification ────────────────────────────────────
@@ -295,12 +305,20 @@ async def _execute_action(action: ActionProposal) -> None:
             # Runs APPROVED → STALE if CRM state has drifted since the agent's analysis.
             # Only one executor replica will win the CAS; others will see the version
             # mismatch and skip cleanly (same path as the EXECUTING lock contention).
-            drift_ok, drift_reason = await _pre_flight_check(action)
+            drift_ok, drift_reason, live_state = await _pre_flight_check(action)
             if not drift_ok:
+                opco_id = action.action_payload.get("opco_id", "unknown")
+                drift_detections_total.labels(
+                    opco_id=opco_id, action_type=action.action_type
+                ).inc()
                 stale = await transition_action(
                     action.id, action.version, ActionStatus.STALE,
                     actor=ACTOR,
-                    extra_updates={"stale_reason": drift_reason},
+                    extra_updates={
+                        "stale_reason": drift_reason,
+                        "predicted_state_at_check": action.predicted_before_state,
+                        "current_state_at_check": live_state,
+                    },
                 )
                 if stale is not None:
                     logger.warning(
@@ -310,9 +328,16 @@ async def _execute_action(action: ActionProposal) -> None:
                 return
         else:
             logger.warning(
-                "FORCE_EXECUTE action=%s type=%s — drift check skipped by operator override",
-                action.id, action.action_type,
+                "Executor: ⚠️  FORCE_APPROVED: Skipping pre-flight drift check per operator request"
             )
+            logger.warning(
+                "Executor: ⚠️  WARNING: Safety checks bypassed. Operator: %s, action_id=%s",
+                action.approved_by, action.id,
+            )
+            force_approved_total.labels(
+                operator=action.approved_by or "unknown",
+                action_type=action.action_type,
+            ).inc()
 
         # Acquire execution lock via optimistic CAS: APPROVED|FORCE_APPROVED → EXECUTING
         locked = await transition_action(
@@ -397,6 +422,11 @@ async def _execute_action(action: ActionProposal) -> None:
                 last_error = str(exc)
                 if attempt < action.max_retries:
                     backoff = 2 ** (attempt - 1)
+                    logger.warning("Executor: Handler threw: %s", type(exc).__name__)
+                    logger.info(
+                        "Executor: Retrying... (attempt %d/%d)",
+                        attempt, action.max_retries,
+                    )
                     logger.warning(
                         "Action %s attempt %d/%d failed: %s — retrying in %ds",
                         action.id, attempt, action.max_retries, last_error, backoff,
@@ -405,19 +435,31 @@ async def _execute_action(action: ActionProposal) -> None:
 
         # All retries exhausted → run compensation then FAILED (DLQ signal)
         compensation = _COMPENSATIONS.get(action.action_type)
+        comp_type: str | None = None
+        comp_result: dict | None = None
         if compensation:
+            comp_type = action.action_type
             try:
-                await compensation(action)
+                comp_result = await compensation(action)
             except Exception as comp_exc:
                 logger.error(
                     "COMPENSATION_FAILED action=%s after exhausted retries: %s",
                     action.id, comp_exc,
                 )
 
+        logger.error("Executor: ❌ HANDLER FAILED after %d attempts", action.max_retries)
+        handler_failures_total.labels(action_type=action.action_type).inc()
+
         await transition_action(
             action.id, current_version, ActionStatus.FAILED,
             actor=ACTOR,
-            extra_updates={"execution_error": last_error, "retry_count": action.max_retries},
+            extra_updates={
+                "execution_error": last_error,
+                "retry_count": action.max_retries,
+                "handler_attempt_count": action.max_retries,
+                "compensation_type": comp_type,
+                "compensation_result": comp_result,
+            },
         )
         actions_failed_total.labels(action_type=action.action_type).inc()
         logger.error(

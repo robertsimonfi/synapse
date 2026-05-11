@@ -117,7 +117,7 @@ def render_sidebar() -> str:
 def render_main(operator_id: str) -> None:
     st.title("Action Review Queue")
 
-    tab_pending, tab_approved, tab_history, tab_failed, tab_stale, tab_dlq, tab_engagement = st.tabs([
+    tab_pending, tab_approved, tab_history, tab_failed, tab_stale, tab_dlq, tab_engagement, tab_audit = st.tabs([
         "⏳ Pending Review",
         "✅ Approved",
         "📋 History",
@@ -125,6 +125,7 @@ def render_main(operator_id: str) -> None:
         "⚠️ Stale / Escalated",
         "☠️ DLQ",
         "📣 Customer Engagement",
+        "📒 Audit Log",
     ])
 
     with tab_pending:
@@ -172,11 +173,23 @@ def render_main(operator_id: str) -> None:
         with col_fail:
             st.subheader("Failed (DLQ)")
             actions = _get("/actions", status="FAILED", limit=50) or []
+            if not actions:
+                st.info("No failed actions.")
             for a in actions:
-                st.markdown(
-                    f"💥 `{a['id'][:8]}` **{a['action_type']}** — "
-                    f"_{a.get('execution_error', 'unknown error')[:60]}_"
-                )
+                err   = a.get("execution_error") or "unknown error"
+                tries = a.get("handler_attempt_count") or a.get("retry_count", "?")
+                label = f"💥 `{a['id'][:8]}` **{a['action_type']}** — {err[:60]}"
+                with st.expander(label, expanded=False):
+                    st.error(f"**Error:** {err}")
+                    st.markdown(f"**Retry attempts:** {tries}")
+                    comp_type   = a.get("compensation_type")
+                    comp_result = a.get("compensation_result")
+                    if comp_type:
+                        st.info(f"**Compensation:** `{comp_type}`")
+                        if comp_result:
+                            st.write("**Compensation result:**")
+                            st.json(comp_result)
+                    st.caption(f"Customer: {a.get('customer_id', '—')} | Order: {a.get('order_id', '—')}")
         with col_exp:
             st.subheader("Expired")
             actions = _get("/actions", status="EXPIRED", limit=50) or []
@@ -194,6 +207,9 @@ def render_main(operator_id: str) -> None:
 
     with tab_engagement:
         _render_engagement_tab()
+
+    with tab_audit:
+        _render_audit_log_tab()
 
 
 # ── Stale / Escalated tab (Phase 8) ──────────────────────────────────────────
@@ -227,6 +243,18 @@ def _render_stale_tab(operator_id: str) -> None:
                 st.markdown(f"**Order:** `{a.get('order_id', '—')}`")
                 st.markdown(f"**Re-analysis attempt:** {reanalysis} / 2")
                 st.warning(f"**Drift reason:** {reason}")
+
+                predicted = a.get("predicted_state_at_check")
+                current   = a.get("current_state_at_check")
+                if predicted or current:
+                    sc1, sc2 = st.columns(2)
+                    with sc1:
+                        st.write("**Predicted state (at check):**")
+                        st.code(str(predicted or "—"))
+                    with sc2:
+                        st.write("**Current state (at check):**")
+                        st.code(str(current or "—"))
+
                 st.caption(f"Created: {a.get('created_at', '—')[:19]}")
 
     with col_esc:
@@ -473,6 +501,80 @@ def _render_engagement_tab() -> None:
                     st.caption("Awaiting customer response…")
 
 
+# ── Audit Log tab ─────────────────────────────────────────────────────────────
+
+def _render_audit_log_tab() -> None:
+    st.subheader("Audit Log — Force Approved & Failed Actions")
+    st.caption(
+        "All FORCE_APPROVED and FAILED actions. Use the filters to narrow the view, "
+        "then export to CSV for compliance or post-incident review."
+    )
+
+    col1, col2, col3 = st.columns([2, 2, 1])
+    with col1:
+        date_from = st.date_input("From date", key="audit_from")
+    with col2:
+        date_to   = st.date_input("To date",   key="audit_to")
+    with col3:
+        st.write("")
+        refresh = st.button("🔄 Refresh", key="audit_refresh")
+
+    col4, col5 = st.columns(2)
+    with col4:
+        status_filter = st.selectbox(
+            "Status", ["ALL", "FORCE_APPROVED", "FAILED"], index=0, key="audit_status"
+        )
+    with col5:
+        action_type_filter = st.text_input(
+            "Action type (optional)", placeholder="e.g. retry_provisioning", key="audit_type"
+        )
+
+    # Collect actions for chosen statuses
+    statuses = (
+        ["FORCE_APPROVED", "FAILED"]
+        if status_filter == "ALL"
+        else [status_filter]
+    )
+    rows = []
+    for s in statuses:
+        actions = _get("/actions", status=s, limit=500) or []
+        for a in actions:
+            if action_type_filter and action_type_filter not in a.get("action_type", ""):
+                continue
+            created = a.get("created_at", "")[:10]
+            if str(date_from) > created or created > str(date_to):
+                continue
+            rows.append({
+                "Timestamp":    a.get("updated_at", a.get("created_at", ""))[:19],
+                "Operator":     a.get("approved_by", "—"),
+                "Action type":  a.get("action_type", "—"),
+                "Order ID":     a.get("order_id", "—"),
+                "Customer ID":  a.get("customer_id", "—"),
+                "Status":       a.get("status", "—"),
+                "Approval method": a.get("approval_method") or "—",
+                "Reason / Error": (
+                    a.get("force_approval_reason")
+                    or (a.get("execution_error") or "")[:120]
+                    or "—"
+                ),
+            })
+
+    if not rows:
+        st.info("No matching audit records for the selected filters.")
+        return
+
+    df = pd.DataFrame(rows).sort_values("Timestamp", ascending=False)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    csv = df.to_csv(index=False)
+    st.download_button(
+        label="⬇️ Download as CSV",
+        data=csv,
+        file_name="synapse_audit_log.csv",
+        mime="text/csv",
+    )
+
+
 # ── Action card ────────────────────────────────────────────────────────────────
 
 def _render_action_card(action: dict, operator_id: str, show_controls: bool) -> None:
@@ -507,7 +609,7 @@ def _render_action_card(action: dict, operator_id: str, show_controls: bool) -> 
 
         if show_controls:
             st.divider()
-            col_approve, col_sep, col_reject = st.columns([2, 0.2, 3])
+            col_approve, col_force, col_reject = st.columns([2, 2, 3])
 
             with col_approve:
                 if st.button("✅ Approve", key=f"approve_{action_id}", type="primary"):
@@ -516,11 +618,15 @@ def _render_action_card(action: dict, operator_id: str, show_controls: bool) -> 
                     else:
                         result = _post(
                             f"/actions/{action_id}/approve",
-                            {"operator_id": operator_id},
+                            {"operator_id": operator_id, "approval_method": "STANDARD"},
                         )
                         if result:
-                            st.success(f"Approved — executor will pick this up shortly.")
+                            st.success("Approved — executor will pick this up shortly.")
                             st.rerun()
+
+            with col_force:
+                if st.button("⚡ Force Approve", key=f"force_btn_{action_id}"):
+                    st.session_state[f"show_force_modal_{action_id}"] = True
 
             with col_reject:
                 reason = st.text_input(
@@ -541,6 +647,68 @@ def _render_action_card(action: dict, operator_id: str, show_controls: bool) -> 
                         if result:
                             st.warning("Action rejected and recorded.")
                             st.rerun()
+
+            if st.session_state.get(f"show_force_modal_{action_id}"):
+                _render_force_approval_modal(action, operator_id)
+
+
+def _render_force_approval_modal(action: dict, operator_id: str) -> None:
+    action_id = action["id"]
+    st.divider()
+    st.markdown("### ⚠️ SAFETY CHECK BYPASS")
+    st.warning(
+        "You are about to execute this action **WITHOUT** pre-flight drift detection. "
+        "The executor will skip the CRM state check and execute immediately."
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write("**Predicted before state:**")
+        st.code(str(action.get("predicted_before_state", {})))
+    with col2:
+        st.write("**Predicted after state:**")
+        st.code(str(action.get("predicted_after_state", {})))
+
+    force_reason = st.text_area(
+        "Why are you using Force Approve? (required)",
+        key=f"force_reason_{action_id}",
+        placeholder="E.g., Critical outage — customer out of service for 30 mins. Confirmed with NOC.",
+        height=80,
+    )
+    confirm = st.checkbox(
+        "I understand the risks and take full responsibility for bypassing safety checks",
+        key=f"force_confirm_{action_id}",
+        value=False,
+    )
+
+    col_cancel, col_submit = st.columns(2)
+    with col_cancel:
+        if st.button("Cancel", key=f"force_cancel_{action_id}"):
+            st.session_state[f"show_force_modal_{action_id}"] = False
+            st.rerun()
+    with col_submit:
+        disabled = not (confirm and force_reason and len(force_reason.strip()) >= 10)
+        if st.button(
+            "⚡ Force Approve — I understand the risks",
+            key=f"force_submit_{action_id}",
+            type="primary",
+            disabled=disabled,
+        ):
+            if not operator_id:
+                st.error("Set your Operator ID in the sidebar first.")
+            else:
+                result = _post(
+                    f"/actions/{action_id}/approve",
+                    {
+                        "operator_id": operator_id,
+                        "approval_method": "FORCE_APPROVED",
+                        "force_approval_reason": force_reason.strip(),
+                    },
+                )
+                if result:
+                    st.success(f"Action {action_id[:8]} force approved — executor will pick it up shortly.")
+                    st.session_state[f"show_force_modal_{action_id}"] = False
+                    st.rerun()
 
 
 def _render_meta(action: dict) -> None:

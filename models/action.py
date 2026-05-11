@@ -35,7 +35,8 @@ class ActionStatus(str, Enum):
 
 VALID_TRANSITIONS: dict[ActionStatus, set[ActionStatus]] = {
     ActionStatus.PENDING:         {ActionStatus.APPROVED, ActionStatus.REJECTED,
-                                   ActionStatus.EXPIRED,  ActionStatus.STALE},
+                                   ActionStatus.EXPIRED,  ActionStatus.STALE,
+                                   ActionStatus.FORCE_APPROVED},
     ActionStatus.APPROVED:        {ActionStatus.EXECUTING, ActionStatus.STALE},
     ActionStatus.EXECUTING:       {ActionStatus.EXECUTED, ActionStatus.FAILED},
     ActionStatus.FAILED:          {ActionStatus.EXECUTING},   # retry
@@ -103,8 +104,20 @@ class ActionProposal(BaseModel):
     executed_at: datetime | None = None
     execution_error: str | None = None
     # Phase 8 — Defensive Execution fields
-    stale_reason:     str | None = None  # reason recorded by drift check or Watchdog
-    reanalysis_count: int = 0            # incremented each time Watchdog re-publishes
+    stale_reason:             str | None = None
+    reanalysis_count:         int = 0
+    predicted_state_at_check: dict[str, Any] | None = None  # snapshot before STALE transition
+    current_state_at_check:   dict[str, Any] | None = None  # live state that caused drift
+
+    # Execution failure detail
+    handler_attempt_count: int | None = None
+    compensation_type:     str | None = None
+    compensation_result:   dict[str, Any] | None = None
+
+    # Force Approve fields
+    approval_method:       str | None = None   # "STANDARD" | "FORCE_APPROVED"
+    force_approval_reason: str | None = None
+    safety_checks_bypassed: bool = False
 
 
 class AuditEvent(BaseModel):
@@ -118,10 +131,18 @@ class AuditEvent(BaseModel):
 
 
 class ApproveRequest(BaseModel):
-    operator_id: str = Field(..., description="Identity of the approving operator")
+    operator_id:           str = Field(..., description="Identity of the approving operator")
+    approval_method:       str = Field(default="STANDARD", description="STANDARD or FORCE_APPROVED")
+    force_approval_reason: str | None = Field(default=None, description="Required when approval_method is FORCE_APPROVED")
 
     model_config = {
-        "json_schema_extra": {"example": {"operator_id": "operator-alice-42"}}
+        "json_schema_extra": {
+            "example": {
+                "operator_id": "operator-alice-42",
+                "approval_method": "STANDARD",
+                "force_approval_reason": None,
+            }
+        }
     }
 
 

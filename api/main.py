@@ -321,6 +321,16 @@ class ActionOut(BaseModel):
     retry_count:            int
     executed_at:            Optional[str]
     execution_error:        Optional[str]
+    # Defensive Execution / Force Approve fields
+    stale_reason:             Optional[str]
+    predicted_state_at_check: Optional[dict[str, Any]]
+    current_state_at_check:   Optional[dict[str, Any]]
+    handler_attempt_count:    Optional[int]
+    compensation_type:        Optional[str]
+    compensation_result:      Optional[dict[str, Any]]
+    approval_method:          Optional[str]
+    force_approval_reason:    Optional[str]
+    safety_checks_bypassed:   bool
 
 
 class AuditOut(BaseModel):
@@ -354,6 +364,15 @@ def _action_to_out(a) -> ActionOut:
         retry_count=a.retry_count,
         executed_at=a.executed_at.isoformat() if a.executed_at else None,
         execution_error=a.execution_error,
+        stale_reason=getattr(a, "stale_reason", None),
+        predicted_state_at_check=getattr(a, "predicted_state_at_check", None),
+        current_state_at_check=getattr(a, "current_state_at_check", None),
+        handler_attempt_count=getattr(a, "handler_attempt_count", None),
+        compensation_type=getattr(a, "compensation_type", None),
+        compensation_result=getattr(a, "compensation_result", None),
+        approval_method=getattr(a, "approval_method", None),
+        force_approval_reason=getattr(a, "force_approval_reason", None),
+        safety_checks_bypassed=getattr(a, "safety_checks_bypassed", False),
     )
 
 
@@ -593,23 +612,43 @@ async def approve_action(
     """
     Operator approves a PENDING action.
 
-    Records the operator's identity in the audit trail and transitions the
-    action to APPROVED. The executor service will pick it up for execution.
+    approval_method="STANDARD" (default): transitions to APPROVED; executor runs the
+    pre-flight drift check before execution.
+
+    approval_method="FORCE_APPROVED": transitions directly to FORCE_APPROVED; executor
+    skips the pre-flight drift check. force_approval_reason is required in this case.
     """
     _require_mongo()
     from db.mongo import get_action, transition_action
     from models.action import ActionStatus
     from observability.metrics import actions_approved_total
 
+    force_mode = body.approval_method == "FORCE_APPROVED"
+
+    if force_mode and not body.force_approval_reason:
+        raise HTTPException(
+            status_code=422,
+            detail="force_approval_reason is required when approval_method is FORCE_APPROVED",
+        )
+
     action = await get_action(action_id)
     if not action:
         raise HTTPException(status_code=404, detail=f"Action {action_id} not found")
 
+    target_status = ActionStatus.FORCE_APPROVED if force_mode else ActionStatus.APPROVED
+    extra: dict = {
+        "approved_by": body.operator_id,
+        "approval_method": body.approval_method,
+    }
+    if force_mode:
+        extra["force_approval_reason"] = body.force_approval_reason
+        extra["safety_checks_bypassed"] = True
+
     try:
         updated = await transition_action(
-            action_id, action.version, ActionStatus.APPROVED,
+            action_id, action.version, target_status,
             actor=body.operator_id,
-            extra_updates={"approved_by": body.operator_id},
+            extra_updates=extra,
         )
     except (ValueError, KeyError) as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -621,15 +660,21 @@ async def approve_action(
         )
 
     actions_approved_total.labels(action_type=action.action_type).inc()
-    logger.info(
-        "Action %s APPROVED by %s (correlation=%s)",
-        action_id, body.operator_id, action.correlation_id,
-    )
-    # Phase 11: broadcast to all NOC subscribers (action doesn't carry opco_id yet)
+    if force_mode:
+        logger.warning(
+            "Action %s FORCE_APPROVED by %s — reason: %s (correlation=%s)",
+            action_id, body.operator_id, body.force_approval_reason, action.correlation_id,
+        )
+    else:
+        logger.info(
+            "Action %s APPROVED by %s (correlation=%s)",
+            action_id, body.operator_id, action.correlation_id,
+        )
+    # Phase 11: broadcast to all NOC subscribers
     await ws_manager.broadcast(
         "ALL",
         noc_event(
-            "action_approved",
+            "force_approved" if force_mode else "action_approved",
             "ALL",
             action_id=action_id,
             action_type=action.action_type,
