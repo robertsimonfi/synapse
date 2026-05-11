@@ -349,14 +349,20 @@ services:
     image: node:20-alpine
     container_name: synapse-frontend
     working_dir: /app
-    command: sh -c "npm install --silent && npm run build && npm run preview"
+    # Dev server: lighter than build+preview, and the server.proxy in
+    # vite.config.ts already forwards /api and /ws to api:8000.
+    # The anonymous volume for node_modules ensures npm installs Linux-native
+    # binaries (e.g. esbuild) instead of reusing any Windows-built ones from
+    # the host mount, which would crash in Alpine.
+    command: sh -c "npm install --silent && npm run dev"
     ports:
       - "3000:3000"
     volumes:
       - ./frontend:/app
+      - /app/node_modules
     environment:
-      VITE_API_BASE_URL: http://api:8000
-      VITE_WS_HOST: api:8000
+      VITE_API_TARGET: http://api:8000
+      VITE_API_KEY: dev-local-key-synapse
     depends_on:
       api:
         condition: service_healthy

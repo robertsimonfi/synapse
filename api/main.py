@@ -77,6 +77,7 @@ from typing import Any, Optional
 from fastapi import Depends, FastAPI, HTTPException, Security, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import make_asgi_app
+import observability.metrics as _metrics  # noqa: F401 -- registers all synapse_* counters in the Prometheus registry at API startup
 from pydantic import BaseModel, Field, field_validator
 
 from agent.agent import (

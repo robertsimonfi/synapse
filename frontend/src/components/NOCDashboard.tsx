@@ -121,7 +121,7 @@ function StatusBar({
 // ── Main dashboard ────────────────────────────────────────────────────────
 
 export function NOCDashboard() {
-  const [opcoId, setOpcoId] = useState("DEFAULT");
+  const [opcoId, setOpcoId] = useState("ALL");
   const [tab, setTab] = useState<Tab>("PENDING");
   const [traceId, setTraceId] = useState<string | null>(null);
   const [sentimentMap, setSentimentMap] = useState<SentimentMap>(new Map());
