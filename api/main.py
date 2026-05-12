@@ -198,15 +198,18 @@ app.include_router(auth_router)
 # ── Resolve schemas ────────────────────────────────────────────────────────────
 
 class ResolveRequest(BaseModel):
-    order_id:      Optional[int]   = Field(None, description="Order ID from ORDER_HEADER")
-    order_number:  Optional[str]   = Field(None, description="e.g. ORD-2024001")
-    customer_id:   Optional[int]   = Field(None, description="Customer ID from CUSTOMER")
-    error_code:    str             = Field("",   description="e.g. PROV_001, BILL_003")
-    error_message: str             = Field("",   description="Human-readable error message")
-    domain:        str             = Field("",   description="BSS, OSS, BILLING, NETWORK, etc.")
-    severity:      str             = Field("MEDIUM", description="CRITICAL, HIGH, MEDIUM, LOW")
-    free_text:     Optional[str]   = Field(None, description="Any additional operator context")
-    opco_id:       str             = Field("DEFAULT", description="OpCo for multi-tenancy isolation")
+    order_id:              Optional[int]   = Field(None, description="Order ID from ORDER_HEADER")
+    order_number:          Optional[str]   = Field(None, description="e.g. ORD-2024001")
+    customer_id:           Optional[int]   = Field(None, description="Customer ID from CUSTOMER")
+    # String customer ID passed by the Chatbot Gateway for WebSocket session routing.
+    # May differ from customer_id (which is coerced to int and can be None for demo IDs).
+    chatbot_customer_id:   Optional[str]   = Field(None, description="Chatbot session ID for HITL callback")
+    error_code:            str             = Field("",   description="e.g. PROV_001, BILL_003")
+    error_message:         str             = Field("",   description="Human-readable error message")
+    domain:                str             = Field("",   description="BSS, OSS, BILLING, NETWORK, etc.")
+    severity:              str             = Field("MEDIUM", description="CRITICAL, HIGH, MEDIUM, LOW")
+    free_text:             Optional[str]   = Field(None, description="Any additional operator context")
+    opco_id:               str             = Field("DEFAULT", description="OpCo for multi-tenancy isolation")
 
     @field_validator("opco_id")
     @classmethod
@@ -488,13 +491,17 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
         from observability.metrics import actions_pending_total
 
         for raw in resolution.action_proposals:
+            # Inject chatbot_customer_id into payload so approve_action can callback.
+            merged_payload = dict(raw.get("action_payload", {}))
+            if request.chatbot_customer_id:
+                merged_payload["chatbot_customer_id"] = request.chatbot_customer_id
             proposal = ActionProposal(
                 correlation_id=correlation_id,
                 order_id=str(request.order_id) if request.order_id else None,
                 customer_id=str(request.customer_id) if request.customer_id else None,
                 action_type=raw.get("action_type", "unknown"),
                 action_description=raw.get("action_description", ""),
-                action_payload=raw.get("action_payload", {}),
+                action_payload=merged_payload,
                 predicted_before_state=raw.get("predicted_before_state", {}),
                 predicted_after_state=raw.get("predicted_after_state", {}),
             )
@@ -701,6 +708,32 @@ async def approve_action(
             correlation_id=action.correlation_id,
         ),
     )
+
+    # Phase 5.1: notify chatbot gateway so the customer UI resolves from HITL wait.
+    chatbot_cid = (action.action_payload or {}).get("chatbot_customer_id")
+    if chatbot_cid:
+        import httpx
+        chatbot_url = os.getenv("CHATBOT_GATEWAY_URL", "http://synapse-chatbot-gateway:8001")
+        action_label = action.action_type.replace("_", " ").title()
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as _client:
+                await _client.post(
+                    f"{chatbot_url}/internal/action-update",
+                    json={
+                        "customer_id": chatbot_cid,
+                        "action_id":   action_id,
+                        "status":      "APPROVED",
+                        "summary":     (
+                            f"Your {action_label} request has been reviewed and approved "
+                            "by our specialist team."
+                        ),
+                    },
+                    headers={"X-Internal-Service-Key": os.getenv("INTERNAL_SERVICE_KEY", "")},
+                )
+            logger.info("Chatbot notified for session %s action=%s", chatbot_cid, action_id)
+        except Exception as _exc:
+            logger.warning("Chatbot notification failed for session %s: %s", chatbot_cid, _exc)
+
     return _action_to_out(updated)
 
 
