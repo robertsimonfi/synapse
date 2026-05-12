@@ -121,6 +121,9 @@ services:
       EXPIRY_CHECK_INTERVAL_MINUTES: "15"
     volumes:
       - telco_data:/data
+    networks:
+      - default
+      - synapse-net
     depends_on:
       mongodb:
         condition: service_healthy
@@ -401,3 +404,9 @@ volumes:
     driver: local
   prometheus_data:
     driver: local
+
+networks:
+  default:
+    driver: bridge
+  synapse-net:
+    external: true
