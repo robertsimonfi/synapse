@@ -570,6 +570,54 @@ async def customer_360(request: Customer360Request, _: str = Security(require_ap
     )
 
 
+# ── Customer lookup (Phase 6 Identity Bridge) ─────────────────────────────────
+
+# Lightweight mock profile store — keyed by the chatbot's string customer IDs.
+# In production this would query the ODS / CRM.
+_CUSTOMER_PROFILES: dict[str, dict] = {
+    "demo-customer-1":  {"name": "Jane Customer",  "segment": "General", "plan": "Flex 50",     "opco_id": "UK_REGION"},
+    "vvip-customer-1":  {"name": "Robert VIP",     "segment": "VVIP",    "plan": "Premium Plus", "opco_id": "UK_REGION"},
+    "es-customer-1":    {"name": "Carlos García",  "segment": "General", "plan": "Flex 30",     "opco_id": "ES_REGION"},
+    "mgr-001":          {"name": "Alex Manager",   "segment": "Staff",   "plan": None,           "opco_id": "UK_REGION"},
+    "ops-de-001":       {"name": "Dieter Operator","segment": "Staff",   "plan": None,           "opco_id": "DE_REGION"},
+}
+
+
+@app.get("/customers/{customer_id}", tags=["Customers"])
+async def get_customer(
+    customer_id: str,
+    operator: Optional[OperatorInfo] = Depends(require_any_auth),
+):
+    """
+    Phase 6 — Return a customer's profile for the chatbot greeting and proxy dashboard.
+
+    Accepts X-API-Key (machine-to-machine) or a Bearer JWT (chatbot gateway).
+    Tries the MongoDB ODS first; falls back to the in-process mock profile store.
+    """
+    # Try MongoDB ODS if available
+    if _mongo_enabled:
+        try:
+            from db.ods import get_ods_document
+            ods = await get_ods_document(customer_id)
+            if ods:
+                return {
+                    "customer_id": customer_id,
+                    "name":        ods.get("name") or f"Customer {customer_id}",
+                    "segment":     ods.get("segment", "General"),
+                    "plan":        ods.get("current_plan"),
+                    "opco_id":     ods.get("opco_id", "DEFAULT"),
+                }
+        except Exception:
+            pass  # fall through to mock
+
+    profile = _CUSTOMER_PROFILES.get(customer_id)
+    if profile:
+        return {"customer_id": customer_id, **profile}
+
+    # Unknown customer — return minimal record so the chatbot can still proceed.
+    return {"customer_id": customer_id, "name": None, "segment": "General", "plan": None, "opco_id": "DEFAULT"}
+
+
 # ── HITL action management endpoints ──────────────────────────────────────────
 
 @app.get("/actions/depths", tags=["HITL"])

@@ -75,11 +75,22 @@ def require_api_key(api_key: str | None = Security(_api_key_scheme)) -> str:
     return api_key
 
 
-# ── JWT configuration (Phase 15) ──────────────────────────────────────────────
+# ── JWT configuration (Phase 15 / Phase 6 Identity Bridge) ────────────────────
 
-JWT_SECRET_KEY   = os.getenv("JWT_SECRET_KEY", "change-me-in-production-use-32+-char-secret")
+JWT_SECRET_KEY        = os.getenv("JWT_SECRET_KEY", "change-me-in-production-use-32+-char-secret")
+# Optional secondary secret issued by the Chatbot Gateway (Phase 6).
+# Set CHATBOT_JWT_SECRET to the same value as JWT_SECRET in the chatbot .env.
+CHATBOT_JWT_SECRET    = os.getenv("CHATBOT_JWT_SECRET", os.getenv("JWT_SECRET", ""))
 JWT_ALGORITHM    = os.getenv("JWT_ALGORITHM", "HS256")
 TOKEN_EXPIRE_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+
+# Chatbot uses uppercase role names; map them to Core's convention.
+_CHATBOT_ROLE_MAP: dict[str, str] = {
+    "MANAGER":  "manager",
+    "OPERATOR": "operator",
+    "CUSTOMER": "customer",
+    "CHATBOT":  "customer",
+}
 
 pwd_context   = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token", auto_error=False)
@@ -133,14 +144,21 @@ def _create_access_token(data: dict) -> str:
 
 
 def _decode_token(token: str) -> dict:
-    try:
-        return jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
-    except JWTError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid or expired token: {exc}",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    """Decode a JWT, trying the primary key then the chatbot gateway key."""
+    for secret in filter(None, [JWT_SECRET_KEY, CHATBOT_JWT_SECRET or None]):
+        try:
+            payload = jwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
+            # Normalise chatbot uppercase role names to Core's lowercase convention.
+            if "role" in payload:
+                payload["role"] = _CHATBOT_ROLE_MAP.get(payload["role"], payload["role"])
+            return payload
+        except JWTError:
+            continue
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or expired token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 # ── FastAPI dependencies ───────────────────────────────────────────────────────
