@@ -42,6 +42,7 @@ export type NodeType =
   | "ORACLE_WRITE"
   | "DLQ_FAILURE"
   | "OPERATOR_HITL"
+  | "OPERATOR_FEEDBACK"
   | "ENGAGEMENT"
   | "ENGAGEMENT_SENT"
   | "CUSTOMER_REPLIED";

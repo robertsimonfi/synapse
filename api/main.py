@@ -828,6 +828,28 @@ async def approve_action(
                 ),
             )
 
+    # Correction intercept: if the operator previously submitted a correct_action
+    # override for this action, mutate action_type in action_states before the
+    # Executor picks it up — ensures the pipeline runs the human's intended action.
+    from db.mongo import get_db as _get_approve_db
+    _adb = await _get_approve_db()
+    _correction = await _adb.operator_corrections.find_one(
+        {"action_id": action_id, "correct_action": {"$ne": None, "$exists": True}},
+        sort=[("submitted_at", -1)],
+    )
+    if _correction and _correction.get("correct_action"):
+        _new_type = _correction["correct_action"]
+        await _adb.action_states.update_one(
+            {"_id": action_id},
+            {"$set": {"action_type": _new_type}},
+        )
+        # Reload so transition_action & downstream use the corrected type
+        action = await get_action(action_id) or action
+        logger.info(
+            "Correction intercept: action=%s type overridden → %s by %s",
+            action_id, _new_type, body.operator_id,
+        )
+
     target_status = ActionStatus.FORCE_APPROVED if force_mode else ActionStatus.APPROVED
     extra: dict = {
         "approved_by": body.operator_id,
@@ -1374,8 +1396,50 @@ async def get_trace_timeline(
                     "label":      f"Operator: {new_status or '?'} by {doc.get('actor') or '?'}",
                     "detail":     doc.get("metadata") or {},
                 })
+            elif new_status == "OPERATOR_FEEDBACK":
+                meta = doc.get("metadata") or {}
+                events.append({
+                    "event_id":   str(doc.get("id") or uuid.uuid4()),
+                    "trace_id":   trace_id,
+                    "node_type":  "OPERATOR_FEEDBACK",
+                    "event_type": "OPERATOR_FEEDBACK_SUBMITTED",
+                    "timestamp":  _safe_str(doc.get("timestamp", "")),
+                    "label":      f"Feedback: score={meta.get('quality_score')} by {doc.get('actor') or '?'}",
+                    "detail":     meta,
+                })
     except Exception as exc:
         logger.warning("trace: audit_events query failed for trace_id=%s — %s", trace_id, exc)
+
+    # ── Operator corrections — direct query for OPERATOR_FEEDBACK nodes ───────
+    try:
+        _feedback_q: dict[str, Any] = (
+            {"action_id": {"$in": _action_ids}}
+            if _action_ids
+            else {"correlation_id": trace_id}
+        )
+        _seen_corrections: set[str] = set()
+        async for doc in db.operator_corrections.find(_feedback_q, {"_id": 0}):
+            cid = str(doc.get("correction_id") or "")
+            if cid in _seen_corrections:
+                continue
+            _seen_corrections.add(cid)
+            events.append({
+                "event_id":   cid or str(uuid.uuid4()),
+                "trace_id":   trace_id,
+                "node_type":  "OPERATOR_FEEDBACK",
+                "event_type": "OPERATOR_FEEDBACK_SUBMITTED",
+                "timestamp":  _safe_str(doc.get("submitted_at", "")),
+                "label":      f"Feedback: score={doc.get('quality_score')} by {doc.get('operator_id') or '?'}",
+                "detail": {
+                    "quality_score":  doc.get("quality_score"),
+                    "correct_action": doc.get("correct_action"),
+                    "feedback_notes": doc.get("feedback_notes"),
+                    "training_ready": doc.get("training_ready"),
+                    "correction_id":  cid,
+                },
+            })
+    except Exception as exc:
+        logger.warning("trace: operator_corrections query failed for trace_id=%s — %s", trace_id, exc)
 
     # ── Outbox FAILED entries — catch rowcount=0 / silent write failures ─────
     try:
@@ -1484,6 +1548,26 @@ async def submit_action_feedback(
     correction_doc = correction.model_dump()
     correction_doc["training_ready"] = training_ready
     await db.operator_corrections.insert_one(correction_doc)
+
+    # Write OPERATOR_FEEDBACK audit event so it surfaces in the Trace timeline.
+    import datetime as _dt
+    audit_feedback_doc = {
+        "id":              str(uuid.uuid4()),
+        "action_id":       action_id,
+        "previous_status": action_doc.get("status"),
+        "new_status":      "OPERATOR_FEEDBACK",
+        "actor":           body.operator_id,
+        "timestamp":       _dt.datetime.utcnow().isoformat(),
+        "metadata": {
+            "quality_score":  body.quality_score,
+            "correct_action": body.correct_action,
+            "feedback_notes": body.feedback_notes,
+            "correlation_id": action_doc.get("correlation_id", ""),
+            "training_ready": training_ready,
+            "correction_id":  correction.correction_id,
+        },
+    }
+    await db.action_audit_trail.insert_one(audit_feedback_doc)
 
     # Publish to Kafka (best-effort; non-fatal if Kafka unavailable)
     kafka_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS")

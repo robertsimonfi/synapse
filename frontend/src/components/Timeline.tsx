@@ -6,23 +6,25 @@ import type { NodeType, TraceEvent } from "../types";
 import { clsx } from "clsx";
 
 const NODE_STYLE: Record<NodeType, { dot: string; ring: string; label: string }> = {
-  AI_REASONING:    { dot: "bg-blue-500",    ring: "ring-blue-700",    label: "AI" },
-  ORACLE_WRITE:    { dot: "bg-emerald-500", ring: "ring-emerald-700", label: "Oracle" },
-  DLQ_FAILURE:     { dot: "bg-red-500",     ring: "ring-red-700",     label: "DLQ" },
-  OPERATOR_HITL:   { dot: "bg-amber-500",   ring: "ring-amber-700",   label: "Operator" },
-  ENGAGEMENT:      { dot: "bg-violet-500",  ring: "ring-violet-700",  label: "Engagement" },
-  ENGAGEMENT_SENT: { dot: "bg-violet-500",  ring: "ring-violet-700",  label: "Engagement" },
-  CUSTOMER_REPLIED:{ dot: "bg-violet-400",  ring: "ring-violet-600",  label: "Reply" },
+  AI_REASONING:      { dot: "bg-blue-500",    ring: "ring-blue-700",    label: "AI" },
+  ORACLE_WRITE:      { dot: "bg-emerald-500", ring: "ring-emerald-700", label: "Oracle" },
+  DLQ_FAILURE:       { dot: "bg-red-500",     ring: "ring-red-700",     label: "DLQ" },
+  OPERATOR_HITL:     { dot: "bg-amber-500",   ring: "ring-amber-700",   label: "Operator" },
+  OPERATOR_FEEDBACK: { dot: "bg-pink-500",    ring: "ring-pink-700",    label: "Feedback" },
+  ENGAGEMENT:        { dot: "bg-violet-500",  ring: "ring-violet-700",  label: "Engagement" },
+  ENGAGEMENT_SENT:   { dot: "bg-violet-500",  ring: "ring-violet-700",  label: "Engagement" },
+  CUSTOMER_REPLIED:  { dot: "bg-violet-400",  ring: "ring-violet-600",  label: "Reply" },
 };
 
 const NODE_BADGE: Partial<Record<NodeType, string>> = {
-  AI_REASONING:    "bg-blue-500/12 text-blue-300 border border-blue-500/25",
-  ORACLE_WRITE:    "bg-emerald-500/12 text-emerald-300 border border-emerald-500/25",
-  DLQ_FAILURE:     "bg-red-500/12 text-red-300 border border-red-500/25",
-  OPERATOR_HITL:   "bg-amber-500/12 text-amber-300 border border-amber-500/25",
-  ENGAGEMENT:      "bg-violet-500/12 text-violet-300 border border-violet-500/25",
-  ENGAGEMENT_SENT: "bg-violet-500/12 text-violet-300 border border-violet-500/25",
-  CUSTOMER_REPLIED:"bg-violet-400/12 text-violet-200 border border-violet-400/25",
+  AI_REASONING:      "bg-blue-500/12 text-blue-300 border border-blue-500/25",
+  ORACLE_WRITE:      "bg-emerald-500/12 text-emerald-300 border border-emerald-500/25",
+  DLQ_FAILURE:       "bg-red-500/12 text-red-300 border border-red-500/25",
+  OPERATOR_HITL:     "bg-amber-500/12 text-amber-300 border border-amber-500/25",
+  OPERATOR_FEEDBACK: "bg-pink-500/12 text-pink-300 border border-pink-500/25",
+  ENGAGEMENT:        "bg-violet-500/12 text-violet-300 border border-violet-500/25",
+  ENGAGEMENT_SENT:   "bg-violet-500/12 text-violet-300 border border-violet-500/25",
+  CUSTOMER_REPLIED:  "bg-violet-400/12 text-violet-200 border border-violet-400/25",
 };
 
 function fmtTime(ts: string) {
