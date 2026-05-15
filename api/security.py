@@ -57,20 +57,44 @@ ALLOWED_KEYS: set[str] = {k.strip() for k in _RAW.split(",") if k.strip()}
 _api_key_scheme = APIKeyHeader(name=API_KEY_HEADER, auto_error=False)
 
 
+_DEV_FALLBACK_KEY = os.getenv("DEV_API_KEY", "synapse-dev-key")
+# When ENV=development and TELCO_AGENT_API_KEYS is not set, accept the
+# DEV_API_KEY so local curl testing works without editing the .env.
+_IS_DEVELOPMENT = os.getenv("ENV", "development").lower() in ("development", "dev", "local")
+
+
 def require_api_key(api_key: str | None = Security(_api_key_scheme)) -> str:
-    """FastAPI dependency — X-API-Key header (machine-to-machine)."""
-    if not ALLOWED_KEYS:
+    """FastAPI dependency — X-API-Key header (machine-to-machine).
+
+    In development (ENV=development, default) an empty TELCO_AGENT_API_KEYS
+    is not fatal: the DEV_API_KEY env var (default 'synapse-dev-key') is
+    accepted instead so local curl tests work without a full .env setup.
+
+    Rejection reasons are logged at WARNING so they appear in stdout without
+    enabling DEBUG mode.
+    """
+    # Dev fallback: no configured keys → accept the dev key
+    effective_keys = ALLOWED_KEYS or ({_DEV_FALLBACK_KEY} if _IS_DEVELOPMENT else set())
+
+    if not effective_keys:
+        logger.warning("api-key: rejected — TELCO_AGENT_API_KEYS not configured and ENV != development")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="API key auth is not configured on the server.",
+            detail=(
+                "API key auth is not configured. "
+                "Set TELCO_AGENT_API_KEYS in the environment."
+            ),
         )
     if api_key is None:
+        logger.warning("api-key: rejected — %s header missing", API_KEY_HEADER)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Missing {API_KEY_HEADER} header.",
             headers={"WWW-Authenticate": API_KEY_HEADER},
         )
-    if not any(secrets.compare_digest(api_key, valid) for valid in ALLOWED_KEYS):
+    if not any(secrets.compare_digest(api_key, valid) for valid in effective_keys):
+        # Log a truncated key prefix so you can identify typos without leaking the secret.
+        logger.warning("api-key: rejected — key '%s...' not in allowed set", api_key[:6])
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key.")
     return api_key
 
@@ -144,7 +168,17 @@ def _create_access_token(data: dict) -> str:
 
 
 def _decode_token(token: str) -> dict:
-    """Decode a JWT, trying the primary key then the chatbot gateway key."""
+    """Decode a JWT, trying the primary key then the chatbot gateway key.
+
+    Logs the specific rejection reason at WARNING level so it's visible in
+    stdout without enabling DEBUG:
+      "jwt: rejected — token expired (sub=operator_uk)"
+      "jwt: rejected — signature mismatch on all secrets"
+      "jwt: rejected — missing 'sub' claim"
+    """
+    from jose import ExpiredSignatureError as _Expired
+
+    last_error: str = "unknown"
     for secret in filter(None, [JWT_SECRET_KEY, CHATBOT_JWT_SECRET or None]):
         try:
             payload = jwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
@@ -152,8 +186,31 @@ def _decode_token(token: str) -> dict:
             if "role" in payload:
                 payload["role"] = _CHATBOT_ROLE_MAP.get(payload["role"], payload["role"])
             return payload
-        except JWTError:
+        except _Expired:
+            sub_hint = "(unknown sub)"
+            try:
+                import base64, json as _json
+                padded = token.split(".")[1] + "=="
+                raw = _json.loads(base64.urlsafe_b64decode(padded))
+                sub_hint = f"(sub={raw.get('sub', '?')})"
+            except Exception:
+                pass
+            last_error = f"token expired {sub_hint}"
+            logger.warning("jwt: rejected — %s", last_error)
+            # Expired is definitive — no point trying other secrets.
+            break
+        except JWTError as exc:
+            last_error = f"signature mismatch ({exc})"
             continue
+
+    if "expired" in last_error:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired — please obtain a new token via POST /auth/token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    logger.warning("jwt: rejected — %s", last_error)
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid or expired token",
@@ -283,9 +340,25 @@ async def login(form: OAuth2PasswordRequestForm = Depends()):
     """
     dev_mode = os.getenv("AUTH_DEV_MODE", "true").lower() == "true"
     if dev_mode:
-        if form.password != os.getenv("DEV_PASSWORD", "synapse-dev"):
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bad credentials")
-        token = _create_access_token({"sub": form.username, "role": "operator"})
+        expected_pw = os.getenv("DEV_PASSWORD", "synapse-dev")
+        if form.password != expected_pw:
+            logger.warning(
+                "auth/token: dev-mode password mismatch for user=%s "
+                "(hint: set DEV_PASSWORD env var, default is 'synapse-dev')",
+                form.username,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=(
+                    "Bad credentials. Dev mode is active — "
+                    f"use password '{expected_pw}' (or set DEV_PASSWORD env var)."
+                ),
+            )
+        token = _create_access_token({
+            "sub":     form.username,
+            "role":    "operator",
+            "opco_id": "UK_REGION",
+        })
         logger.info("auth: dev-mode token issued for operator=%s", form.username)
         return TokenResponse(access_token=token)
 
