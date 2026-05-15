@@ -759,17 +759,51 @@ async def chat_message(request: ChatMessageRequest, _: str = Security(require_ap
     # The caller supplies the intent_label it already extracted (e.g. "REFUND").
     # Fall back to the domain when no explicit intent is given.
     intent_for_risk = request.intent_label or request.domain or "GENERAL_INQUIRY"
+    has_360_context = bool(customer_context)
     risk = risk_evaluate(
         intent_label=intent_for_risk,
         domain=request.domain or "",
         severity=effective_severity,
         confidence=request.confidence or 1.0,
+        sentiment_label=sentiment_label,
+        has_360_context=has_360_context,
     )
 
     logger.info(
-        "[CHAT] risk_engine: intent=%s score=%d level=%s auto_approve=%s hitl=%s",
-        intent_for_risk, risk.score, risk.level.value, risk.auto_approve, risk.hitl_required,
+        "[CHAT] risk_engine: intent=%s score=%d level=%s auto=%s hitl=%s discovery=%s",
+        intent_for_risk, risk.score, risk.level.value,
+        risk.auto_approve, risk.hitl_required, risk.needs_discovery,
     )
+
+    # ── 3a. Discovery Turn ─────────────────────────────────────────────────────
+    # ANGRY customer but intent is still GENERAL/unknown — ask a clarifying
+    # question before creating a HITL action. Return early; no agent run.
+    if risk.needs_discovery:
+        clarify_q = (
+            "I can hear your frustration — I'm truly sorry about that. "
+            "To connect you with the right specialist right away, could you tell me: "
+            "is this about your bill, your data or network service, or something else on your account?"
+        )
+        logger.info(
+            "[CHAT] Discovery turn triggered — customer_id=%s sentiment=%s",
+            request.customer_id, sentiment_label,
+        )
+        return {
+            "correlation_id":      str(uuid.uuid4()),
+            "trace_id":            str(uuid.uuid4()),
+            "risk_score":          risk.score,
+            "risk_level":          risk.level.value,
+            "hitl_required":       False,
+            "auto_approve":        False,
+            "needs_discovery":     True,
+            "clarifying_question": clarify_q,
+            "sentiment_label":     sentiment_label,
+            "sentiment_score":     sentiment_score,
+            "noc_escalated":       noc_alerted,
+            "action_proposal_ids": [],
+            "confidence":          request.confidence or 1.0,
+            "reason":              "Gathering required information",
+        }
 
     # ── 4. Delegate to the Core resolve pipeline ───────────────────────────────
     correlation_id = str(uuid.uuid4())
@@ -835,6 +869,9 @@ async def chat_message(request: ChatMessageRequest, _: str = Security(require_ap
                 merged_payload["chatbot_customer_id"] = request.chatbot_customer_id
             if effective_priority:
                 merged_payload["priority"] = effective_priority
+            # Tag chatbot-originated escalations so the NOC card shows provenance.
+            if (request.channel or "").upper() == "CHATBOT":
+                merged_payload["origin"] = "CHATBOT_ESCALATION"
             # Attach risk metadata to every action payload for audit/NOC display.
             merged_payload.update(risk.as_dict())
 
@@ -908,21 +945,24 @@ async def chat_message(request: ChatMessageRequest, _: str = Security(require_ap
             channel=request.channel,
             auto_approved=risk.auto_approve,
             priority=effective_priority,
+            manager_brief=resolution.manager_brief,
         ),
     )
 
     return {
-        "correlation_id":  correlation_id,
-        "trace_id":        correlation_id,
-        "risk_score":      risk.score,
-        "risk_level":      risk.level.value,
-        "hitl_required":   risk.hitl_required,
-        "auto_approve":    risk.auto_approve,
-        "sentiment_label": sentiment_label,
-        "sentiment_score": sentiment_score,
-        "noc_escalated":   noc_alerted,
-        "action_proposal_ids": proposal_ids,
-        "confidence":      resolution.confidence,
+        "correlation_id":       correlation_id,
+        "trace_id":             correlation_id,
+        "risk_score":           risk.score,
+        "risk_level":           risk.level.value,
+        "hitl_required":        risk.hitl_required,
+        "auto_approve":         risk.auto_approve,
+        "needs_discovery":      risk.needs_discovery,
+        "sentiment_label":      sentiment_label,
+        "sentiment_score":      sentiment_score,
+        "noc_escalated":        noc_alerted,
+        "action_proposal_ids":  proposal_ids,
+        "confidence":           resolution.confidence,
+        "manager_brief":        resolution.manager_brief,
     }
 
 

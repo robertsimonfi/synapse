@@ -1,17 +1,27 @@
 """
-Phase 2/3 — Risk Engine for chatbot-originated actions.
+Phase 3 — Weighted Risk Engine for chatbot-originated actions.
 
-Assigns a numeric risk score (0–100) to a chatbot intent and returns a
-routing decision:
-  score < 30 AND confidence >= 0.90  → LOW risk → auto-approve (FORCE_APPROVED)
-  score >= 30                         → HITL required → PENDING, NOC review
+Point-accumulation model:
+  base intent score  +  sentiment modifier  +  360 context bonus  +  domain boost  +  severity boost
+  → total score compared against threshold of 50
 
-Score table keys are normalised to UPPER_SNAKE_CASE so both "Plan Change"
-and "PLAN_CHANGE" resolve correctly.
+Routing decisions:
+  score < 50 AND confidence >= 0.90 AND not needs_discovery  → auto-approve (FORCE_APPROVED)
+  score >= 50 AND not needs_discovery                         → HITL required → PENDING, NOC review
+  needs_discovery (ANGRY + unknown intent)                    → ask clarifying question, no HITL yet
 
-Confidence is the float returned by the Synapse IntentRouter / agent
-(1.0 for mock/explicit chatbot payloads, variable for live Claude output).
-Unknown intents default to 50 (MEDIUM — HITL required).
+Sentiment modifiers:
+  ANGRY    → +30 pts  (pushes billing disputes over the threshold)
+  NEGATIVE → +10 pts  (minor boost, often keeps below threshold)
+
+360 context bonus:
+  has_360_context=True → +10 pts (verified customer data adds signal confidence)
+
+Domain boost:
+  BILLING / BSS → +10 pts (financial risk amplifier)
+
+Severity boost:
+  CRITICAL / HIGH → +15 pts
 """
 
 from __future__ import annotations
@@ -20,18 +30,31 @@ from models.schemas import RiskLevel, RiskScore
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
 
-_AUTO_APPROVE_MAX_SCORE  = 30    # score strictly below this → candidate for auto-approve
+_AUTO_APPROVE_MAX_SCORE  = 50    # score strictly below this → candidate for auto-approve (was 30)
 _AUTO_APPROVE_MIN_CONF   = 0.90  # confidence must be at or above this to auto-approve
-_HIGH_RISK_THRESHOLD     = 60    # score at or above this → HIGH/CRITICAL band
-_CRITICAL_RISK_THRESHOLD = 80    # score at or above this → CRITICAL band
+_HIGH_RISK_THRESHOLD     = 70    # score at or above this → HIGH band (was 60)
+_CRITICAL_RISK_THRESHOLD = 90    # score at or above this → CRITICAL band (was 80)
+
+# ── Sentiment modifiers ───────────────────────────────────────────────────────
+
+_SENTIMENT_MODIFIERS: dict[str, int] = {
+    "ANGRY":    30,
+    "NEGATIVE": 10,
+    "NEUTRAL":  0,
+    "POSITIVE": 0,
+}
+
+# 360 context bonus — verified customer profile means more signal for routing.
+_360_CONTEXT_BONUS = 10
 
 # ── Score table ───────────────────────────────────────────────────────────────
 #
-# 0          → SAFE: read-only query — no action proposal created in Core.
-# 1–29       → LOW: auto-approvable if confidence is sufficient.
-# 30–59      → MEDIUM: HITL required.
-# 60–79      → HIGH: HITL required + urgent NOC flag.
-# 80–100     → CRITICAL: HITL required + immediate NOC escalation.
+# Base intent scores before sentiment / context / domain modifiers.
+# 0          → SAFE: read-only query — answered inline, no action proposal.
+# 1–49       → MEDIUM or below with modifiers: auto-approvable path.
+# 50–69      → HIGH: HITL required.
+# 70–89      → HIGH: HITL required + urgent NOC flag.
+# 90–100     → CRITICAL: HITL required + immediate NOC escalation.
 
 _SCORES: dict[str, int] = {
     # ── Read-only (SAFE) ──────────────────────────────────────────────────────
@@ -42,37 +65,45 @@ _SCORES: dict[str, int] = {
     "DISCOVERY":             0,
     "DISCOVERY_REQUEST":     0,
 
-    # ── Low-risk self-serve (AUTO-APPROVE candidates) ─────────────────────────
-    "ADDRESS_CHANGE":        10,
-    "CONTACT_UPDATE":        10,
-    "NOTIFICATION_PREF":     10,
-    "PROVISIONING_ISSUE":    25,
-    "SIM_SWAP":              25,   # low-risk SIM swap (same number, same customer)
-    "DATA_BOOST":            20,   # one-time data top-up, no recurring commitment
+    # ── Low-risk self-serve (auto-approve candidates) ─────────────────────────
+    "ADDRESS_CHANGE":        5,
+    "CONTACT_UPDATE":        5,
+    "NOTIFICATION_PREF":     5,
+    "DATA_BOOST":            15,   # one-time top-up, low financial impact
+    "SIM_SWAP":              20,   # same number, same customer
 
-    # ── Medium-risk (HITL required) ───────────────────────────────────────────
-    "PLAN_CHANGE":           40,
-    "PLAN_SWITCH":           40,
-    "CONTRACT_EXTENSION":    45,
-    "ROAMING_ENABLE":        30,
-    "INTERNATIONAL_UNLOCK":  35,
+    # ── Technical issues (10 pts base per spec) ───────────────────────────────
+    "PROVISIONING_ISSUE":    10,
+    "NETWORK_OUTAGE":        10,
+    "SERVICE_DEGRADATION":   10,
 
-    # ── High-risk financial (HITL + high priority) ────────────────────────────
-    "BILLING_DISPUTE":       60,
-    "CREDIT_ADJUSTMENT":     65,
-    "LATE_FEE_WAIVER":       60,
-    "REFUND":                80,
-    "REFUND_REQUEST":        80,
+    # ── Medium-risk (below threshold solo; sentiment can push over 50) ────────
+    "BILLING_DISPUTE":       20,   # per spec: 20 base; ANGRY +30 = 50 → HITL
+    "CREDIT_ADJUSTMENT":     25,
+    "LATE_FEE_WAIVER":       20,
+    "ROAMING_ENABLE":        25,
+    "INTERNATIONAL_UNLOCK":  30,
+    "PLAN_CHANGE":           35,   # calm request is auto-approve; angry → HITL
+    "PLAN_SWITCH":           35,
+    "CONTRACT_EXTENSION":    40,
 
-    # ── Retention / churn (HITL + immediate escalation) ──────────────────────
-    "CANCELLATION":          80,
-    "CANCELLATION_REQUEST":  80,
-    "CHURN_RISK":            70,
+    # ── High-risk financial (HITL required regardless of sentiment) ───────────
+    "REFUND":                55,
+    "REFUND_REQUEST":        55,
 
-    # ── Network fault escalations ─────────────────────────────────────────────
-    "NETWORK_OUTAGE":        55,
-    "SERVICE_DEGRADATION":   50,
+    # ── Retention / churn (always HITL) ──────────────────────────────────────
+    "CANCELLATION":          70,
+    "CANCELLATION_REQUEST":  70,
+    "CHURN_RISK":            60,
 }
+
+# Unknown intents default to 50 — exactly at threshold, HITL required.
+_DEFAULT_SCORE = 50
+
+# ── Discovery intents — ANGRY + one of these → Discovery Turn (ask first) ────
+_DISCOVERY_INTENTS = frozenset({
+    "GENERAL_INQUIRY", "DISCOVERY", "DISCOVERY_REQUEST", "GENERAL", "UNKNOWN", "",
+})
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -82,33 +113,52 @@ def evaluate(
     domain: str = "",
     severity: str = "MEDIUM",
     confidence: float = 1.0,
+    sentiment_label: str = "NEUTRAL",
+    has_360_context: bool = False,
 ) -> RiskScore:
     """Score an intent and return an immutable RiskScore routing decision.
 
     Parameters
     ----------
     intent_label : str
-        The chatbot intent label (e.g. "Plan Change", "REFUND_REQUEST").
+        The chatbot intent label (e.g. "Plan Change", "BILLING_DISPUTE").
     domain : str
-        BSS/OSS domain hint from the IntentRouter.  Used to widen the
-        score for billing domains where fraud risk is higher.
+        BSS/OSS domain hint from the IntentRouter.
     severity : str
-        CRITICAL | HIGH | MEDIUM | LOW — operator-assigned severity tag.
-        CRITICAL or HIGH bumps the score by 15 pts (never above 100).
+        CRITICAL | HIGH | MEDIUM | LOW — operator/sentiment-assigned severity.
     confidence : float
         Agent confidence in the intent classification (0.0–1.0).
-        Auto-approve is only granted when confidence >= _AUTO_APPROVE_MIN_CONF.
+    sentiment_label : str
+        ANGRY | NEGATIVE | NEUTRAL | POSITIVE from the sentiment engine.
+    has_360_context : bool
+        True when a verified ODS/SQLite 360-view was loaded for this customer.
     """
-    key   = intent_label.upper().replace(" ", "_")
-    score = _SCORES.get(key, 50)   # default: MEDIUM risk, HITL required
+    key        = intent_label.upper().replace(" ", "_")
+    base_score = _SCORES.get(key, _DEFAULT_SCORE)
 
-    # Domain boost: billing actions carry extra financial risk.
-    if domain.upper() in ("BILLING", "BSS") and score > 0:
-        score = min(100, score + 10)
+    # Sentiment modifier — ANGRY pushes medium-risk items over the HITL threshold.
+    sent           = sentiment_label.upper()
+    sentiment_pts  = _SENTIMENT_MODIFIERS.get(sent, 0)
 
-    # Severity boost for operator-flagged high-impact events.
-    if severity.upper() in ("CRITICAL", "HIGH"):
-        score = min(100, score + 15)
+    # 360 context bonus — verified profile adds routing signal.
+    context_pts = _360_CONTEXT_BONUS if has_360_context else 0
+
+    # Domain boost: billing domain carries extra financial risk.
+    domain_pts = 10 if domain.upper() in ("BILLING", "BSS") and base_score > 0 else 0
+
+    # Severity boost for operator-flagged / sentiment-flagged high-impact events.
+    severity_pts = 15 if severity.upper() in ("CRITICAL", "HIGH") else 0
+
+    # Discovery Turn: ANGRY customer but intent is still unknown/general.
+    # Don't escalate yet — ask a clarifying question first.
+    needs_discovery = (sent == "ANGRY" and key in _DISCOVERY_INTENTS)
+
+    # Accumulate score; cap the score below the HITL threshold for discovery turns
+    # so they don't accidentally trip HITL before we know what the customer wants.
+    score = base_score + sentiment_pts + context_pts + domain_pts + severity_pts
+    if needs_discovery:
+        score = min(score, _AUTO_APPROVE_MAX_SCORE - 1)
+    score = min(100, score)
 
     # Determine qualitative band.
     if score == 0:
@@ -122,17 +172,35 @@ def evaluate(
     else:
         level = RiskLevel.CRITICAL
 
-    # Auto-approve: LOW band AND confidence meets threshold.
-    auto_approve  = (level == RiskLevel.LOW) and (confidence >= _AUTO_APPROVE_MIN_CONF)
-    hitl_required = not auto_approve and level != RiskLevel.SAFE
+    # Auto-approve: below threshold, confidence high, no discovery needed.
+    auto_approve  = (
+        score < _AUTO_APPROVE_MAX_SCORE
+        and confidence >= _AUTO_APPROVE_MIN_CONF
+        and not needs_discovery
+    )
+    # HITL: not auto-approve, not safe, and no discovery turn pending.
+    hitl_required = not auto_approve and level != RiskLevel.SAFE and not needs_discovery
+
+    # Build human-readable reason with full score breakdown.
+    breakdown_parts = [f"base={base_score}"]
+    if sentiment_pts:
+        breakdown_parts.append(f"sentiment({sent})={sentiment_pts:+d}")
+    if context_pts:
+        breakdown_parts.append(f"360_context={context_pts:+d}")
+    if domain_pts:
+        breakdown_parts.append(f"domain={domain_pts:+d}")
+    if severity_pts:
+        breakdown_parts.append(f"severity={severity_pts:+d}")
+    breakdown = " + ".join(breakdown_parts)
 
     verdict = (
         "read-only query"  if level == RiskLevel.SAFE else
+        "discovery_turn"   if needs_discovery         else
         "auto-approve"     if auto_approve             else
         f"HITL required ({level.value})"
     )
     reason = (
-        f"'{intent_label}' → {score} pts "
+        f"'{intent_label}' → {breakdown} = {score} pts "
         f"[confidence={confidence:.2f}] → {verdict}"
     )
 
@@ -142,4 +210,5 @@ def evaluate(
         auto_approve=auto_approve,
         hitl_required=hitl_required,
         reason=reason,
+        needs_discovery=needs_discovery,
     )

@@ -25,24 +25,28 @@ class RiskLevel(str, Enum):
 class RiskScore:
     """Immutable risk assessment for a single chatbot-originated action.
 
-    score        0–100  numeric risk points
-    level        qualitative band (SAFE / LOW / MEDIUM / HIGH / CRITICAL)
-    auto_approve True when Core should FORCE_APPROVE without human review
-    hitl_required True when a NOC operator must approve before execution
-    reason       human-readable routing decision (for audit trail)
+    score            0–100  numeric risk points
+    level            qualitative band (SAFE / LOW / MEDIUM / HIGH / CRITICAL)
+    auto_approve     True when Core should FORCE_APPROVE without human review
+    hitl_required    True when a NOC operator must approve before execution
+    reason           human-readable routing decision (for audit trail)
+    needs_discovery  True when ANGRY + unknown intent — ask a clarifying question
+                     before escalating; suppresses both auto_approve and hitl_required
     """
-    score:         int
-    level:         RiskLevel
-    auto_approve:  bool
-    hitl_required: bool
-    reason:        str
+    score:            int
+    level:            RiskLevel
+    auto_approve:     bool
+    hitl_required:    bool
+    reason:           str
+    needs_discovery:  bool = False
 
     def as_dict(self) -> dict:
         """Serialise for storage in MongoDB action_payload."""
         return {
-            "risk_score":    self.score,
-            "risk_level":    self.level.value,
-            "auto_approve":  self.auto_approve,
-            "hitl_required": self.hitl_required,
-            "risk_reason":   self.reason,
+            "risk_score":      self.score,
+            "risk_level":      self.level.value,
+            "auto_approve":    self.auto_approve,
+            "hitl_required":   self.hitl_required,
+            "risk_reason":     self.reason,
+            "needs_discovery": self.needs_discovery,
         }

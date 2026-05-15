@@ -67,6 +67,11 @@ class FalloutResolution:
     token_usage:         dict = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0})
     # Phase 16: structured Chain-of-Thought (Observation/Constraint/Strategy/Recommendation)
     chain_of_thought:    dict | None = None
+    # Phase 3 (Contextual Smart Escalation): 1-sentence NOC card summary for the HITL approval card.
+    # Example: "Angry Gold Tier customer disputing $40 data overage; ODS shows roaming active in France."
+    manager_brief:       str | None = None
+    # Originating channel tag — set to "CHATBOT_ESCALATION" when routed from the chatbot.
+    origin:              str | None = None
 
     def __post_init__(self):
         if self.action_proposals is None:
@@ -143,6 +148,7 @@ Resolution JSON format:
   ],
   "runbook_references": ["order_fallout.txt", "provisioning_failure.txt"],
   "confidence": "HIGH|MEDIUM|LOW",
+  "manager_brief": "1-sentence NOC card summary for the HITL approval queue. Include: customer tier/segment, the core issue, and one key data point from your tool investigation. Example: 'Angry Gold Tier customer disputing £40 data overage; ODS shows roaming active in France with 3 GB consumed.'",
   "action_proposals": [
     {{
       "action_type": "retry_provisioning|update_billing|create_ticket|escalate|notify_customer|update_subscription|cancel_order",
@@ -235,6 +241,10 @@ def _mock_resolution(fallout_input: FalloutInput) -> FalloutResolution:
         critic_violations=[],
         policy_violations=[],
         token_usage={"input_tokens": 0, "output_tokens": 0},
+        manager_brief=(
+            f"[MOCK] Customer {customer_id} experiencing activation failure ({error_code}); "
+            "HLR shows MSISDN registered but EPC bearer missing — PROV_RESYNC recommended."
+        ),
         chain_of_thought={
             "observation":      (
                 f"Subscriber {customer_id} has a TERMINATED data subscription. "
@@ -475,6 +485,7 @@ def run_agent(fallout_input: FalloutInput, correlation_id: str | None = None) ->
         policy_violations=policy_violations,
         token_usage=_token_usage,
         chain_of_thought=_parse_cot(raw_reasoning),
+        manager_brief=resolution_data.get("manager_brief"),
     )
 
 
