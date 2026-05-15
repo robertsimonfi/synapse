@@ -37,6 +37,11 @@ def _db():
     return _get_client()[os.getenv("MONGODB_DB", "synapse")]
 
 
+async def get_db():
+    """Return the Motor async database handle for direct collection access."""
+    return _db()
+
+
 async def ensure_indexes() -> None:
     db = _db()
     await db.action_states.create_index(

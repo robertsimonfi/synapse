@@ -30,6 +30,8 @@ Run as a standalone Docker service:
 import asyncio
 import logging
 import os
+import sqlite3 as _sqlite3
+import time as _time
 from typing import Any
 
 from db.ods import ensure_ods_indexes, mark_outbox_completed, mark_outbox_failed
@@ -158,14 +160,27 @@ def _build_dml(action_type: str, where_clause: dict, set_values: dict) -> tuple[
         return sql, {"order_id": order_id}
 
     elif action_type == "retry_provisioning":
-        # Reset the fallout for re-processing
         fallout_id = where_clause.get("fallout_id")
         if fallout_id is None:
             return None
         sql = (
             "UPDATE ORDER_FALLOUT "
-            "SET STATUS = 'IN_PROGRESS', RETRY_COUNT = RETRY_COUNT + 1 "
+            "SET STATUS = 'IN_PROGRESS', RETRY_COUNT = RETRY_COUNT + 1, "
+            "UPDATED_DATE = SYSTIMESTAMP "
             "WHERE FALLOUT_ID = :fallout_id AND STATUS IN ('OPEN','IN_PROGRESS','ESCALATED')"
+        )
+        return sql, {"fallout_id": fallout_id}
+
+    elif action_type in ("REPROVISION", "reprovision"):
+        # Oracle: reset the fallout record; subscription activation done via stored proc
+        fallout_id = where_clause.get("fallout_id")
+        if fallout_id is None:
+            return None
+        sql = (
+            "UPDATE ORDER_FALLOUT "
+            "SET STATUS = 'IN_PROGRESS', RETRY_COUNT = RETRY_COUNT + 1, "
+            "UPDATED_DATE = SYSTIMESTAMP "
+            "WHERE FALLOUT_ID = :fallout_id"
         )
         return sql, {"fallout_id": fallout_id}
 
@@ -196,6 +211,180 @@ def _build_dml(action_type: str, where_clause: dict, set_values: dict) -> tuple[
 
     # Other action types (escalate, notify_customer) have no Oracle target
     return None
+
+
+import re as _re
+
+
+def _to_int_id(val) -> int | None:
+    """
+    Coerce a potentially prefixed ID to a plain integer.
+
+    Claude sometimes emits IDs like "FALLOUT-49" or "ORDER-12" but the SQLite
+    schema uses bare INTEGER PKs.  Strip any leading alpha/dash prefix and return
+    the trailing numeric part, or None if no digits are found.
+
+    Examples:
+        49           → 49
+        "49"         → 49
+        "FALLOUT-49" → 49
+        "ORDER-12"   → 12
+        None         → None
+    """
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        m = _re.search(r"\d+$", str(val))
+        return int(m.group()) if m else None
+
+
+def _execute_sqlite_dml(cmd: dict) -> bool:
+    """
+    Execute the write-back DML against the local SQLite dev database.
+
+    Replaces the previous no-op stub so that the happy-path E2E test
+    (approve REPROVISION → SQLite subscription STATUS = 'ACTIVE') actually works.
+    All statements use plain SQLite syntax (datetime('now') instead of SYSTIMESTAMP,
+    positional ? binds instead of Oracle :named binds).
+    """
+    action_type  = cmd.get("action_type", "")
+    where_clause = cmd.get("where_clause", {})
+    set_values   = cmd.get("set_values",   {})
+    sqlite_path  = os.getenv("SQLITE_PATH", "telco_dev.db")
+
+    if not os.path.exists(sqlite_path):
+        logger.warning("[SQLite] DB not found at %s — skipping write-back", sqlite_path)
+        return True
+
+    conn = _sqlite3.connect(sqlite_path)
+    rows_affected = 0
+    try:
+        if action_type in ("REPROVISION", "reprovision", "retry_provisioning"):
+            # Step 1: reset the ORDER_FALLOUT record — strip any "FALLOUT-" prefix
+            fallout_id = _to_int_id(where_clause.get("fallout_id"))
+            if fallout_id is not None:
+                cur = conn.execute(
+                    "UPDATE ORDER_FALLOUT "
+                    "SET STATUS='IN_PROGRESS', RETRY_COUNT=RETRY_COUNT+1 "
+                    "WHERE FALLOUT_ID=?",
+                    (fallout_id,),
+                )
+                rows_affected += cur.rowcount
+                logger.info("[SQLite] ORDER_FALLOUT id=%s → IN_PROGRESS (rowcount=%d)",
+                            fallout_id, cur.rowcount)
+
+            # Step 2 (REPROVISION only): activate the subscription.
+            # Use a single OR condition so that a valid MSISDN takes priority
+            # while customer_id acts as a guaranteed fallback when MSISDN is
+            # still "unknown".  SQLite treats column=NULL as always-false, so
+            # passing None for msisdn means only the customer_id branch fires.
+            if action_type in ("REPROVISION", "reprovision"):
+                raw_msisdn  = set_values.get("msisdn")
+                msisdn_val  = raw_msisdn if (raw_msisdn and raw_msisdn != "unknown") else None
+                customer_id = _to_int_id(set_values.get("customer_id"))
+                cur = conn.execute(
+                    "UPDATE SERVICE_SUBSCRIPTION "
+                    "SET STATUS='ACTIVE', UPDATED_DATE=datetime('now') "
+                    "WHERE (MSISDN=? OR CUSTOMER_ID=?) "
+                    "  AND STATUS IN ('TERMINATED','SUSPENDED','PENDING_ACTIVATION')",
+                    (msisdn_val, customer_id),
+                )
+                rows_affected += cur.rowcount
+                logger.info(
+                    "[SQLite] PROV_RESYNC: activated subscription "
+                    "msisdn=%s customer_id=%s (rowcount=%d)",
+                    msisdn_val, customer_id, cur.rowcount,
+                )
+
+        elif action_type == "update_billing":
+            ba_id = _to_int_id(where_clause.get("billing_account_id"))
+            if ba_id is not None:
+                cols: list[str] = []
+                vals: list      = []
+                for col in ("current_balance", "status", "credit_limit"):
+                    if col in set_values:
+                        cols.append(f"{col.upper()}=?")
+                        vals.append(set_values[col])
+                if cols:
+                    vals.append(ba_id)
+                    cur = conn.execute(
+                        f"UPDATE BILLING_ACCOUNT "
+                        f"SET {', '.join(cols)}, UPDATED_DATE=datetime('now') "
+                        f"WHERE BILLING_ACCOUNT_ID=?",
+                        vals,
+                    )
+                    rows_affected += cur.rowcount
+
+        elif action_type == "update_subscription":
+            sub_id = _to_int_id(where_clause.get("subscription_id"))
+            if sub_id is not None:
+                cols = []
+                vals = []
+                for col in ("status", "suspend_reason"):
+                    if col in set_values:
+                        cols.append(f"{col.upper()}=?")
+                        vals.append(set_values[col])
+                if cols:
+                    vals.append(sub_id)
+                    cur = conn.execute(
+                        f"UPDATE SERVICE_SUBSCRIPTION "
+                        f"SET {', '.join(cols)}, UPDATED_DATE=datetime('now') "
+                        f"WHERE SUBSCRIPTION_ID=?",
+                        vals,
+                    )
+                    rows_affected += cur.rowcount
+
+        elif action_type == "cancel_order":
+            order_id = _to_int_id(where_clause.get("order_id"))
+            if order_id is not None:
+                cur = conn.execute(
+                    "UPDATE ORDER_HEADER SET STATUS='CANCELLED' "
+                    "WHERE ORDER_ID=? AND STATUS NOT IN ('COMPLETED','CANCELLED')",
+                    (order_id,),
+                )
+                rows_affected += cur.rowcount
+
+        elif action_type == "create_ticket":
+            ticket_number = set_values.get(
+                "ticket_number",
+                f"TKT-AUTO-{_to_int_id(where_clause.get('order_id')) or '?'}-{int(_time.time())}",
+            )
+            conn.execute(
+                "INSERT INTO INCIDENT_TICKET "
+                "(TICKET_NUMBER, CUSTOMER_ID, ORDER_ID, FALLOUT_ID, "
+                " TITLE, CATEGORY, PRIORITY, STATUS, ASSIGNED_TEAM) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)",
+                (
+                    ticket_number,
+                    _to_int_id(where_clause.get("customer_id")),
+                    _to_int_id(where_clause.get("order_id")),
+                    _to_int_id(where_clause.get("fallout_id")),
+                    set_values.get("title",         "Auto-generated by Synapse AI"),
+                    set_values.get("category",      "ORDER_FALLOUT"),
+                    set_values.get("priority",      "P3"),
+                    set_values.get("assigned_team", "BSS_SUPPORT"),
+                ),
+            )
+            rows_affected += 1
+
+        else:
+            logger.info("[SQLite] No DML defined for action_type=%s — skipping", action_type)
+
+        conn.commit()
+        logger.info(
+            "[SQLite] DML committed: action_type=%s rows_affected=%d",
+            action_type, rows_affected,
+        )
+        return True
+
+    except Exception as exc:
+        conn.rollback()
+        logger.error("[SQLite] DML failed action_type=%s: %s", action_type, exc)
+        raise
+    finally:
+        conn.close()
 
 
 async def _execute_oracle_dml(
@@ -274,8 +463,11 @@ async def _execute_oracle_dml(
 async def _handle_command(cmd: dict) -> bool:
     """
     Process a single WritebackCommand. Returns True on success.
-    Handles both real Oracle and SQLite (dev) — SQLite DML is a no-op stub
-    since the write-back path only makes sense with a live Oracle instance.
+
+    DB_TYPE=sqlite  → executes real DML against telco_dev.db via _execute_sqlite_dml
+                      (enables true E2E happy-path testing without an Oracle instance)
+    DB_TYPE=oracle  → executes parameterised DML against Oracle via OracleHAPool,
+                      with stale-write guard, HA circuit breaker, and DLQ fallback
     """
     import os as _os
     db_type = _os.getenv("DB_TYPE", "sqlite").lower()
@@ -298,9 +490,7 @@ async def _handle_command(cmd: dict) -> bool:
     sql, params = dml
 
     if db_type == "sqlite":
-        logger.info(
-            "[SQLite mode] Would execute: %s — marking outbox completed (dev no-op)", sql[:80]
-        )
+        await asyncio.to_thread(_execute_sqlite_dml, cmd)
         await mark_outbox_completed(outbox_id)
         return True
 

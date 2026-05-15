@@ -490,11 +490,28 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
         from models.action import ActionProposal
         from observability.metrics import actions_pending_total
 
+        _PROV_TYPES = {"REPROVISION", "reprovision", "retry_provisioning"}
         for raw in resolution.action_proposals:
             # Inject chatbot_customer_id into payload so approve_action can callback.
             merged_payload = dict(raw.get("action_payload", {}))
             if request.chatbot_customer_id:
                 merged_payload["chatbot_customer_id"] = request.chatbot_customer_id
+
+            # Enrich MSISDN from SQLite for provisioning-type actions so that
+            # the outbox PROV_RESYNC command carries a real phone number.
+            if raw.get("action_type") in _PROV_TYPES:
+                msisdn = merged_payload.get("msisdn")
+                if (not msisdn or msisdn == "unknown") and request.customer_id:
+                    try:
+                        from worker.drift import get_primary_msisdn
+                        resolved = await asyncio.to_thread(
+                            get_primary_msisdn, request.customer_id
+                        )
+                        if resolved:
+                            merged_payload["msisdn"] = resolved
+                    except Exception:
+                        pass
+
             proposal = ActionProposal(
                 correlation_id=correlation_id,
                 order_id=str(request.order_id) if request.order_id else None,
@@ -597,14 +614,18 @@ async def get_customer(
     # Try MongoDB ODS if available
     if _mongo_enabled:
         try:
-            from db.ods import get_ods_document
-            ods = await get_ods_document(customer_id)
+            from db.ods import async_get_subscriber
+            cid_int = int(customer_id) if customer_id.isdigit() else None
+            ods = await async_get_subscriber(cid_int) if cid_int else None
             if ods:
+                profile = ods.get("profile") or {}
+                first   = profile.get("first_name") or ""
+                last    = profile.get("last_name")  or ""
                 return {
                     "customer_id": customer_id,
-                    "name":        ods.get("name") or f"Customer {customer_id}",
-                    "segment":     ods.get("segment", "General"),
-                    "plan":        ods.get("current_plan"),
+                    "name":        f"{first} {last}".strip() or f"Customer {customer_id}",
+                    "segment":     profile.get("segment") or ods.get("segment", "General"),
+                    "plan":        (ods.get("subscriptions") or [{}])[0].get("product_name"),
                     "opco_id":     ods.get("opco_id", "DEFAULT"),
                 }
         except Exception:
@@ -616,6 +637,103 @@ async def get_customer(
 
     # Unknown customer — return minimal record so the chatbot can still proceed.
     return {"customer_id": customer_id, "name": None, "segment": "General", "plan": None, "opco_id": "DEFAULT"}
+
+
+@app.get("/customer/{customer_id}/context", tags=["Customers"])
+async def get_customer_context(
+    customer_id: str,
+    operator: Optional[OperatorInfo] = Depends(require_any_auth),
+):
+    """
+    Phase 9 — Return a merged customer context for AI agent resolution.
+
+    Cross-checks the MongoDB ODS (hydrated from Oracle CDC) against the SQLite
+    baseline (telco_dev.db) so the agent always has the freshest available view.
+
+    Priority:
+      1. MongoDB ODS — full golden-record JSON (subscriptions, billing, fallouts)
+      2. SQLite baseline — CUSTOMER + SERVICE_SUBSCRIPTION tables (VVIP flag, status)
+      3. In-process mock profiles — for chatbot demo IDs (e.g. "vvip-customer-1")
+    """
+    import sqlite3 as _sqlite
+
+    context: dict = {"customer_id": customer_id, "sources": []}
+
+    # 1 — MongoDB ODS
+    if _mongo_enabled:
+        try:
+            from db.ods import async_get_subscriber
+            cid_int = int(customer_id) if customer_id.isdigit() else None
+            ods = await async_get_subscriber(cid_int) if cid_int else None
+            if ods:
+                context["ods"] = {
+                    "profile":          ods.get("profile"),
+                    "subscriptions":    ods.get("subscriptions"),
+                    "billing":          ods.get("billing"),
+                    "open_fallouts":    ods.get("open_fallouts"),
+                    "recent_orders":    ods.get("recent_orders"),
+                    "open_tickets":     ods.get("open_tickets"),
+                    "hydrated_at":      ods.get("hydrated_at"),
+                    "opco_id":          ods.get("opco_id", "DEFAULT"),
+                }
+                context["sources"].append("mongodb_ods")
+        except Exception as exc:
+            logger.debug("ODS context lookup failed for %s: %s", customer_id, exc)
+
+    # 2 — SQLite baseline (VVIP flag, live account status)
+    sqlite_path = os.getenv("SQLITE_PATH", "telco_dev.db")
+    if os.path.exists(sqlite_path):
+        try:
+            cid_int = int(customer_id) if customer_id.isdigit() else None
+            if cid_int:
+                def _sqlite_lookup(cid: int) -> dict:
+                    conn = _sqlite.connect(sqlite_path)
+                    conn.row_factory = _sqlite.Row
+                    try:
+                        cust = conn.execute(
+                            "SELECT CUSTOMER_ID, FIRST_NAME, LAST_NAME, STATUS, SEGMENT, "
+                            "       ACCOUNT_TYPE, CREDIT_SCORE "
+                            "FROM CUSTOMER WHERE CUSTOMER_ID = ?", (cid,)
+                        ).fetchone()
+                        if not cust:
+                            return {}
+                        subs = conn.execute(
+                            "SELECT SUBSCRIPTION_ID, STATUS, MSISDN "
+                            "FROM SERVICE_SUBSCRIPTION WHERE CUSTOMER_ID = ? "
+                            "ORDER BY CREATED_DATE DESC LIMIT 3", (cid,)
+                        ).fetchall()
+                        billing = conn.execute(
+                            "SELECT STATUS, CURRENT_BALANCE, CREDIT_LIMIT "
+                            "FROM BILLING_ACCOUNT WHERE CUSTOMER_ID = ?", (cid,)
+                        ).fetchone()
+                        return {
+                            "customer":    dict(cust),
+                            "subscriptions": [dict(s) for s in subs],
+                            "billing":     dict(billing) if billing else {},
+                        }
+                    finally:
+                        conn.close()
+
+                baseline = await asyncio.to_thread(_sqlite_lookup, cid_int)
+                if baseline:
+                    context["baseline"] = baseline
+                    context["sources"].append("sqlite_baseline")
+        except Exception as exc:
+            logger.debug("SQLite context lookup failed for %s: %s", customer_id, exc)
+
+    # 3 — Mock profile fallback for chatbot demo IDs
+    mock = _CUSTOMER_PROFILES.get(customer_id)
+    if mock:
+        context.setdefault("mock_profile", mock)
+        context["sources"].append("mock_profile")
+
+    if not context["sources"]:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No context found for customer_id={customer_id}",
+        )
+
+    return context
 
 
 # ── HITL action management endpoints ──────────────────────────────────────────
@@ -758,12 +876,15 @@ async def approve_action(
     )
 
     # Phase 5.1: notify chatbot gateway so the customer UI resolves from HITL wait.
-    chatbot_cid = (action.action_payload or {}).get("chatbot_customer_id")
-    if chatbot_cid:
-        import httpx
-        chatbot_url = os.getenv("CHATBOT_GATEWAY_URL", "http://synapse-chatbot-gateway:8001")
+    # Guard: only attempt if CHATBOT_GATEWAY_ENABLED=true (avoids [Errno -2] DNS
+    # errors in local dev where synapse-chatbot-gateway is not running).
+    chatbot_cid     = (action.action_payload or {}).get("chatbot_customer_id")
+    chatbot_enabled = os.getenv("CHATBOT_GATEWAY_ENABLED", "false").lower() == "true"
+    if chatbot_cid and chatbot_enabled:
+        chatbot_url  = os.getenv("CHATBOT_GATEWAY_URL", "http://synapse-chatbot-gateway:8001")
         action_label = action.action_type.replace("_", " ").title()
         try:
+            import httpx
             async with httpx.AsyncClient(timeout=3.0) as _client:
                 await _client.post(
                     f"{chatbot_url}/internal/action-update",
@@ -781,6 +902,12 @@ async def approve_action(
             logger.info("Chatbot notified for session %s action=%s", chatbot_cid, action_id)
         except Exception as _exc:
             logger.warning("Chatbot notification failed for session %s: %s", chatbot_cid, _exc)
+    elif chatbot_cid and not chatbot_enabled:
+        logger.info(
+            "[MOCK-CHATBOT] action=%s session=%s status=APPROVED "
+            "(set CHATBOT_GATEWAY_ENABLED=true to enable live callbacks)",
+            action_id, chatbot_cid,
+        )
 
     return _action_to_out(updated)
 
@@ -1114,25 +1241,28 @@ async def get_trace_timeline(
     ]}
 
     events: list[dict[str, Any]] = []
+    _action_ids: list[str] = []  # collected to join with audit trail
 
     def _safe_str(v: Any) -> str:
         return str(v) if v is not None else ""
 
-    # ── Action proposals ──────────────────────────────────────────────────
+    # ── Action proposals (collection: action_states) ──────────────────────
     try:
-        async for doc in db.action_proposals.find(q, {"_id": 0}):
+        async for doc in db.action_states.find(q):
+            action_id_val  = str(doc.get("_id") or uuid.uuid4())
+            _action_ids.append(action_id_val)
             ts             = _safe_str(doc.get("created_at", ""))
             correlation_id = _safe_str(doc.get("correlation_id", ""))
             payload        = doc.get("action_payload") or {}
             events.append({
-                "event_id":   str(doc.get("id") or uuid.uuid4()),
+                "event_id":   action_id_val,
                 "trace_id":   trace_id,
                 "node_type":  "AI_REASONING",
                 "event_type": "ACTION_CREATED",
                 "timestamp":  ts,
                 "label":      f"AI proposed: {doc.get('action_type') or '?'}",
                 "detail": {
-                    "action_id":      doc.get("id"),
+                    "action_id":      action_id_val,
                     "action_type":    doc.get("action_type"),
                     "description":    doc.get("action_description"),
                     "confidence":     payload.get("confidence") if isinstance(payload, dict) else None,
@@ -1156,14 +1286,14 @@ async def get_trace_timeline(
                         "timestamp":  _safe_str(doc.get(ts_field, "")),
                         "label":      f"{evt.replace('_', ' ').title()}: {doc.get('action_type') or '?'}",
                         "detail": {
-                            "action_id":        doc.get("id"),
+                            "action_id":        action_id_val,
                             "operator":         doc.get("approved_by"),
                             "rejection_reason": doc.get("rejection_reason"),
                             "execution_error":  doc.get("execution_error"),
                         },
                     })
     except Exception as exc:
-        logger.warning("trace: action_proposals query failed for trace_id=%s — %s", trace_id, exc)
+        logger.warning("trace: action_states query failed for trace_id=%s — %s", trace_id, exc)
 
     # ── DLQ events ────────────────────────────────────────────────────────
     try:
@@ -1187,7 +1317,7 @@ async def get_trace_timeline(
 
     # ── Engagement / customer interaction events ───────────────────────────
     try:
-        async for doc in db.engagement_logs.find(q, {"_id": 0}):
+        async for doc in db.engagement_log.find(q, {"_id": 0}):
             events.append({
                 "event_id":   str(doc.get("id") or uuid.uuid4()),
                 "trace_id":   trace_id,
@@ -1219,14 +1349,19 @@ async def get_trace_timeline(
                     },
                 })
     except Exception as exc:
-        logger.warning("trace: engagement_logs query failed for trace_id=%s — %s", trace_id, exc)
+        logger.warning("trace: engagement_log query failed for trace_id=%s — %s", trace_id, exc)
 
     # ── Audit trail entries ───────────────────────────────────────────────
     try:
-        async for doc in db.audit_events.find(
-            {"$or": [{"trace_id": trace_id}, {"metadata.correlation_id": trace_id}]},
-            {"_id": 0},
-        ):
+        _audit_q: dict[str, Any] = (
+            {"$or": [
+                {"action_id": {"$in": _action_ids}},
+                {"metadata.correlation_id": trace_id},
+            ]}
+            if _action_ids
+            else {"metadata.correlation_id": trace_id}
+        )
+        async for doc in db.action_audit_trail.find(_audit_q, {"_id": 0}):
             new_status = doc.get("new_status")
             if new_status in ("APPROVED", "REJECTED", "FORCE_APPROVED"):
                 events.append({
@@ -1291,7 +1426,7 @@ async def submit_action_feedback(
     from db.mongo import get_db
 
     db = await get_db()
-    action_doc = await db.action_proposals.find_one({"id": action_id}, {"_id": 0})
+    action_doc = await db.action_states.find_one({"_id": action_id})
     if not action_doc:
         raise HTTPException(status_code=404, detail=f"Action {action_id} not found")
 

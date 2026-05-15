@@ -18,6 +18,7 @@ Phase 10 — Trace injection:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -103,22 +104,50 @@ async def _ensure_topics(bootstrap: str) -> None:
             pass
 
 
-async def create_producer(ensure_topics: bool = True) -> AIOKafkaProducer:
-    """Start and return a long-lived AIOKafkaProducer instance."""
+async def create_producer(
+    ensure_topics: bool = True,
+    max_retries: int = 8,
+) -> AIOKafkaProducer:
+    """
+    Start and return a long-lived AIOKafkaProducer instance.
+
+    Retries with exponential backoff (1s → 2s → 4s → … → 60s cap) so that
+    workers launched before Kafka is ready don't die permanently on Errno 111.
+    """
     if ensure_topics:
-        await _ensure_topics(BOOTSTRAP_SERVERS)
+        try:
+            await _ensure_topics(BOOTSTRAP_SERVERS)
+        except Exception as exc:
+            logger.debug("Topic pre-check skipped (Kafka not ready yet): %s", exc)
 
     producer = AIOKafkaProducer(
         bootstrap_servers=BOOTSTRAP_SERVERS,
         value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
         key_serializer=lambda k: k.encode("utf-8") if isinstance(k, str) else k,
-        acks="all",                  # wait for all in-sync replicas
-        enable_idempotence=True,     # exactly-once producer semantics
-        compression_type="gzip",      # lz4 requires an extra package; gzip is stdlib-safe
-        **_kafka_tls_kwargs(),       # Phase 12: mTLS when KAFKA_SECURITY_PROTOCOL=SSL
+        acks="all",
+        enable_idempotence=True,
+        compression_type="gzip",
+        **_kafka_tls_kwargs(),
     )
-    await producer.start()
-    return producer
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            await producer.start()
+            logger.info("Kafka producer connected to %s", BOOTSTRAP_SERVERS)
+            return producer
+        except Exception as exc:
+            if attempt >= max_retries:
+                logger.error(
+                    "Kafka producer failed after %d attempts — giving up: %s",
+                    max_retries, exc,
+                )
+                raise
+            backoff = min(2 ** (attempt - 1), 60)
+            logger.warning(
+                "Kafka producer connect failed (attempt %d/%d): %s — retrying in %ds",
+                attempt, max_retries, exc, backoff,
+            )
+            await asyncio.sleep(backoff)
 
 
 @asynccontextmanager

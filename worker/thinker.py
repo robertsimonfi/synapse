@@ -162,6 +162,31 @@ async def _handle_task(msg_value: dict) -> None:
             opco_id=opco_id,
         )
 
+        # Enrich MSISDN for provisioning proposals where Claude returned "unknown".
+        # Looks up the customer's live subscription MSISDN from SQLite so the
+        # outbox PROV_RESYNC command carries a real phone number.
+        _PROV_TYPES = {"REPROVISION", "reprovision", "retry_provisioning"}
+        for proposal in proposals:
+            if proposal.action_type not in _PROV_TYPES:
+                continue
+            msisdn = proposal.action_payload.get("msisdn")
+            if msisdn and msisdn != "unknown":
+                continue
+            if fallout_input.customer_id:
+                try:
+                    from worker.drift import get_primary_msisdn
+                    resolved = await asyncio.to_thread(
+                        get_primary_msisdn, int(fallout_input.customer_id)
+                    )
+                    if resolved:
+                        proposal.action_payload["msisdn"] = resolved
+                        logger.info(
+                            "MSISDN enriched: action=%s customer_id=%s msisdn=%s",
+                            proposal.id, fallout_input.customer_id, resolved,
+                        )
+                except Exception as exc:
+                    logger.debug("MSISDN enrichment failed: %s", exc)
+
         for proposal in proposals:
             await create_action(proposal)
             actions_pending_total.labels(action_type=proposal.action_type).inc()

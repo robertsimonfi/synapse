@@ -138,6 +138,32 @@ def _read_provisioning_state(order_id: str) -> dict:
         return {}
 
 
+# ── MSISDN lookup ─────────────────────────────────────────────────────────────
+
+def get_primary_msisdn(customer_id: int) -> str | None:
+    """
+    Return the MSISDN of the most recent non-terminated subscription for a customer.
+
+    Used to enrich REPROVISION / retry_provisioning action payloads when Claude
+    proposes an action without a resolved MSISDN.  Synchronous — callers in async
+    context must wrap with asyncio.to_thread.
+    """
+    try:
+        with _open() as conn:
+            row = conn.execute(
+                """SELECT MSISDN FROM SERVICE_SUBSCRIPTION
+                   WHERE CUSTOMER_ID = ?
+                     AND MSISDN IS NOT NULL
+                     AND STATUS NOT IN ('TERMINATED')
+                   ORDER BY CREATED_DATE DESC LIMIT 1""",
+                (int(customer_id),),
+            ).fetchone()
+        return row["MSISDN"] if row else None
+    except Exception as exc:
+        logger.debug("get_primary_msisdn failed for customer_id=%s: %s", customer_id, exc)
+        return None
+
+
 # ── Live state assembler ───────────────────────────────────────────────────────
 
 def read_live_crm_state(action: ActionProposal) -> Optional[dict]:
@@ -158,7 +184,7 @@ def read_live_crm_state(action: ActionProposal) -> Optional[dict]:
     atype = action.action_type
     state: dict = {}
 
-    if atype == "retry_provisioning":
+    if atype in ("retry_provisioning", "REPROVISION", "reprovision"):
         if cid:
             state["customer_status"] = _read_customer_status(cid)
             state.update(_read_subscription_state(cid, msisdn))

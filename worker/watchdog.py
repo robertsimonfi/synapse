@@ -22,6 +22,7 @@ import asyncio
 import logging
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from db.mongo import ensure_indexes, list_actions, transition_action
 from kafka.producer import create_producer, publish
@@ -152,6 +153,125 @@ async def _sweep(producer) -> None:
                 )
 
 
+# ── Post-execution verification sweep ─────────────────────────────────────────
+
+_VERIFY_WINDOW_SECONDS = int(os.getenv("WATCHDOG_VERIFY_WINDOW_SECONDS", "300"))
+
+
+async def _sweep_executed(producer) -> None:
+    """
+    Deferred after-state verification for recently EXECUTED actions.
+
+    The Executor's post-write verify runs immediately after the Oracle write, but
+    propagation lag means the SQLite sim may not reflect the new state yet.
+    This sweep re-checks actions executed within the last WATCHDOG_VERIFY_WINDOW_SECONDS
+    and triggers REANALYSIS if predicted_after_state still doesn't match live CRM state.
+
+    Actions without a predicted_after_state, or where SQLite is unavailable, are skipped.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=_VERIFY_WINDOW_SECONDS)
+
+    executed = await list_actions(status=ActionStatus.EXECUTED, limit=200)
+    candidates = [
+        a for a in executed
+        if a.predicted_after_state
+        and a.executed_at
+        and a.executed_at.replace(tzinfo=timezone.utc) >= cutoff
+    ]
+
+    if not candidates:
+        return
+
+    logger.debug("Watchdog post-exec verify: %d recently-executed action(s)", len(candidates))
+
+    for action in candidates:
+        if not action.customer_id and not action.order_id:
+            continue
+
+        try:
+            live_state = await asyncio.to_thread(read_live_crm_state, action)
+        except Exception as exc:
+            logger.error(
+                "Watchdog post-exec CRM read failed for action %s: %s", action.id, exc
+            )
+            continue
+
+        if live_state is None:
+            continue
+
+        # Compare predicted_after_state keys against current live state.
+        # Any mismatch on a field known to the drift checker signals state drift.
+        from worker.drift import _EXACT_MATCH_FIELDS, _NUMERIC_TOLERANT_FIELDS
+
+        drift_reason: str | None = None
+        for key, expected_val in action.predicted_after_state.items():
+            live_val = live_state.get(key)
+            if expected_val is None or live_val is None:
+                continue
+            if key in _EXACT_MATCH_FIELDS:
+                if str(expected_val).upper() != str(live_val).upper():
+                    drift_reason = (
+                        f"post-exec: after-state mismatch on {key}: "
+                        f"expected={expected_val!r} live={live_val!r}"
+                    )
+                    break
+            elif key in _NUMERIC_TOLERANT_FIELDS:
+                tol = _NUMERIC_TOLERANT_FIELDS[key]
+                try:
+                    if abs(float(expected_val) - float(live_val)) > tol:
+                        drift_reason = (
+                            f"post-exec: {key} expected≈{expected_val} live={live_val} "
+                            f"(tolerance={tol})"
+                        )
+                        break
+                except (TypeError, ValueError):
+                    pass
+
+        if drift_reason is None:
+            continue
+
+        # After-state not reached — trigger REANALYSIS so Thinker can re-propose.
+        logger.warning(
+            "WATCHDOG_POSTEXEC_DRIFT action=%s type=%s reason=%s",
+            action.id, action.action_type, drift_reason,
+        )
+
+        if producer:
+            try:
+                task = OrchestrationTask(
+                    correlation_id=str(uuid.uuid4()),
+                    task_type="REANALYSIS",
+                    order_id=int(action.order_id)      if action.order_id    else None,
+                    customer_id=int(action.customer_id) if action.customer_id else None,
+                    error_code="WATCHDOG_POSTEXEC_DRIFT",
+                    error_message=drift_reason,
+                    domain="WATCHDOG",
+                    severity="HIGH",
+                    free_text=(
+                        f"Post-execution after-state verification failed. "
+                        f"Original action: {action.id}. {drift_reason}"
+                    ),
+                    reanalysis=True,
+                    reanalysis_count=action.reanalysis_count + 1,
+                    stale_action_id=action.id,
+                )
+                await publish(
+                    producer,
+                    TOPIC_AI_ORCHESTRATION,
+                    task.model_dump(),
+                    key=str(action.customer_id or action.order_id or action.id),
+                )
+                logger.info(
+                    "WATCHDOG_POSTEXEC_REANALYSIS published action=%s attempt=%d/%d",
+                    action.id, action.reanalysis_count + 1, MAX_REANALYSIS_ATTEMPTS,
+                )
+            except Exception as pub_exc:
+                logger.error(
+                    "Watchdog post-exec republish failed for action %s: %s",
+                    action.id, pub_exc,
+                )
+
+
 # ── Poll loop ──────────────────────────────────────────────────────────────────
 
 async def _poll_loop() -> None:
@@ -173,6 +293,11 @@ async def _poll_loop() -> None:
                 await _sweep(producer)
             except Exception:
                 logger.exception("Watchdog sweep error")
+
+            try:
+                await _sweep_executed(producer)
+            except Exception:
+                logger.exception("Watchdog post-exec sweep error")
 
             await asyncio.sleep(POLL_INTERVAL)
     finally:

@@ -97,6 +97,43 @@ async def _h_cancel_order(a: ActionProposal) -> dict:
     return {"result": "order_cancelled", "order_id": a.order_id}
 
 
+async def _h_reprovision(a: ActionProposal) -> dict:
+    system     = a.action_payload.get("system", "HLR")
+    msisdn     = a.action_payload.get("msisdn") or "unknown"
+    fallout_id = a.action_payload.get("fallout_id")
+
+    # Last-chance MSISDN resolution: if the payload still has "unknown" here,
+    # do one final SQLite lookup and write the result back into the payload so
+    # _outbox_params (called immediately after this handler returns) picks it up.
+    if (not msisdn or msisdn == "unknown") and a.customer_id:
+        try:
+            from worker.drift import get_primary_msisdn
+            resolved = await asyncio.to_thread(get_primary_msisdn, int(a.customer_id))
+            if resolved:
+                a.action_payload["msisdn"] = resolved
+                msisdn = resolved
+                logger.info(
+                    "Executor: MSISDN resolved at handler time "
+                    "action=%s customer_id=%s msisdn=%s",
+                    a.id, a.customer_id, msisdn,
+                )
+        except Exception as exc:
+            logger.debug("Executor: MSISDN last-chance resolution failed: %s", exc)
+
+    logger.info(
+        "REPROVISION: Issuing PROV_RESYNC command for MSISDN %s on %s (fallout_id=%s)",
+        msisdn, system, fallout_id,
+    )
+    await asyncio.sleep(0.5)
+    return {
+        "result":     "prov_resync_queued",
+        "command":    "PROV_RESYNC",
+        "system":     system,
+        "msisdn":     msisdn,
+        "fallout_id": fallout_id,
+    }
+
+
 async def _h_default(a: ActionProposal) -> dict:
     logger.warning("No handler for action_type=%s — marking executed", a.action_type)
     return {"result": "no_handler", "action_type": a.action_type}
@@ -104,6 +141,8 @@ async def _h_default(a: ActionProposal) -> dict:
 
 _HANDLERS: dict[str, Handler] = {
     "retry_provisioning":  _h_retry_provisioning,
+    "REPROVISION":         _h_reprovision,
+    "reprovision":         _h_reprovision,
     "update_billing":      _h_update_billing,
     "create_ticket":       _h_create_ticket,
     "escalate":            _h_escalate,
@@ -155,8 +194,18 @@ async def _compensate_subscription(a: ActionProposal) -> dict:
     return {"compensated": True, "action": "subscription_revert_queued"}
 
 
+async def _compensate_reprovision(a: ActionProposal) -> dict:
+    logger.error(
+        "SAGA_COMPENSATE REPROVISION action=%s — "
+        "PROV_RESYNC in unknown state, alerting NOC for manual HLR check", a.id
+    )
+    return {"compensated": True, "action": "noc_alerted_prov_resync_partial_failure"}
+
+
 _COMPENSATIONS: dict[str, Handler] = {
     "retry_provisioning":  _compensate_provisioning,
+    "REPROVISION":         _compensate_reprovision,
+    "reprovision":         _compensate_reprovision,
     "update_billing":      _compensate_billing,
     "cancel_order":        _compensate_cancel_order,
     "update_subscription": _compensate_subscription,
@@ -195,6 +244,18 @@ def _outbox_params(action: ActionProposal) -> tuple[str, str, dict, dict] | None
             "ORDER_FALLOUT", "UPDATE",
             {"fallout_id": p.get("fallout_id")},
             {"status": "IN_PROGRESS"},
+        )
+    elif action.action_type in ("REPROVISION", "reprovision"):
+        return (
+            "ORDER_FALLOUT", "UPDATE",
+            {"fallout_id": p.get("fallout_id") or p.get("order_id")},
+            {
+                "status":      "IN_PROGRESS",
+                "command":     "PROV_RESYNC",
+                "system":      p.get("system", "HLR"),
+                "msisdn":      p.get("msisdn"),
+                "customer_id": action.customer_id,  # fallback for subscription lookup
+            },
         )
     elif action.action_type == "create_ticket":
         return (

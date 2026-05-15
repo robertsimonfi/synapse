@@ -27,7 +27,7 @@ import os
 from db.ods import (
     ensure_ods_indexes,
     list_pending_outbox,
-    mark_outbox_published,
+    mark_outbox_sent,
 )
 from kafka.producer import create_producer, publish
 from kafka.schemas import WritebackCommand
@@ -66,10 +66,10 @@ async def _relay_batch(producer) -> int:
                 cmd.model_dump(),
                 key=entry["action_id"],
             )
-            await mark_outbox_published(entry["outbox_id"])
+            await mark_outbox_sent(entry["outbox_id"])
             published += 1
             logger.info(
-                "Relay published outbox_id=%s action_type=%s → %s",
+                "Relay SENT outbox_id=%s action_type=%s → %s",
                 entry["outbox_id"], entry["action_type"], TOPIC_WRITEBACK,
             )
         except Exception as exc:

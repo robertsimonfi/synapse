@@ -15,6 +15,7 @@ re-delivered (at-least-once semantics).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -47,12 +48,16 @@ async def create_consumer(
     *topics: str,
     group_id: str,
     auto_offset_reset: str = "earliest",
+    max_retries: int = 8,
 ) -> AIOKafkaConsumer:
     """
     Start and return an AIOKafkaConsumer subscribed to the given topics.
 
     Manual commit is enabled (enable_auto_commit=False). Callers must call
     await consumer.commit() after successful message processing.
+
+    Retries with exponential backoff (1s → 2s → 4s → … → 60s cap) so that
+    workers launched before Kafka is ready don't die permanently on Errno 111.
     """
     consumer = AIOKafkaConsumer(
         *topics,
@@ -63,13 +68,29 @@ async def create_consumer(
         value_deserializer=lambda raw: json.loads(raw.decode("utf-8")),
         session_timeout_ms=30_000,
         heartbeat_interval_ms=10_000,
-        **_kafka_tls_kwargs(),       # Phase 12: mTLS when KAFKA_SECURITY_PROTOCOL=SSL
+        **_kafka_tls_kwargs(),
     )
-    await consumer.start()
-    logger.info(
-        "Kafka consumer started group=%s topics=%s", group_id, list(topics)
-    )
-    return consumer
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            await consumer.start()
+            logger.info(
+                "Kafka consumer started group=%s topics=%s", group_id, list(topics)
+            )
+            return consumer
+        except Exception as exc:
+            if attempt >= max_retries:
+                logger.error(
+                    "Kafka consumer failed after %d attempts — giving up: %s",
+                    max_retries, exc,
+                )
+                raise
+            backoff = min(2 ** (attempt - 1), 60)
+            logger.warning(
+                "Kafka consumer connect failed (attempt %d/%d): %s — retrying in %ds",
+                attempt, max_retries, exc, backoff,
+            )
+            await asyncio.sleep(backoff)
 
 
 def parse_message(msg) -> dict[str, Any]:

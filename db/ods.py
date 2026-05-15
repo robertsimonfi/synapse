@@ -353,6 +353,21 @@ async def mark_outbox_published(outbox_id: str) -> None:
     )
 
 
+async def mark_outbox_sent(outbox_id: str) -> None:
+    """
+    Mark an outbox entry as SENT after the Relay successfully published it to Kafka.
+
+    Preserves the entry in MongoDB with a sent_at timestamp so operators have a
+    complete audit trail (PENDING → SENT → COMPLETED|FAILED) rather than entries
+    disappearing from the queue after Kafka delivery.
+    """
+    db = _async_motor_db()
+    await db.outbox.update_one(
+        {"outbox_id": outbox_id},
+        {"$set": {"status": "SENT", "sent_at": datetime.now(timezone.utc)}},
+    )
+
+
 async def mark_outbox_completed(outbox_id: str) -> None:
     db = _async_motor_db()
     await db.outbox.update_one(
