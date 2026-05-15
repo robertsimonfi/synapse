@@ -78,11 +78,11 @@ export function ActionCard({
 
   const isAngry = sentimentLabel === "ANGRY";
 
-  // Subtle 3-D tilt — reduced to ±2° for a calmer enterprise feel
+  // Subtle 3-D tilt — ±5° with slow spring for NOC enterprise float
   const rawX = useMotionValue(0);
   const rawY = useMotionValue(0);
-  const rotateX = useSpring(useTransform(rawY, [-1, 1], [2, -2]), { stiffness: 200, damping: 60 });
-  const rotateY = useSpring(useTransform(rawX, [-1, 1], [-2, 2]), { stiffness: 200, damping: 60 });
+  const rotateX = useSpring(useTransform(rawY, [-1, 1], [5, -5]), { stiffness: 60, damping: 18 });
+  const rotateY = useSpring(useTransform(rawX, [-1, 1], [-5, 5]), { stiffness: 60, damping: 18 });
 
   useEffect(() => {
     if (triggerShake || isAngry) {

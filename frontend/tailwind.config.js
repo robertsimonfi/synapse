@@ -34,6 +34,10 @@ export default {
         "glow-pulse":   "glow-pulse 2s ease-in-out infinite",
       },
       colors: {
+        // Synapse brand palette
+        "synapse-purple": "#6D28D9",
+        "synapse-dark":   "#0F172A",
+        // Timeline node colours
         "node-ai":      "#3B82F6",
         "node-oracle":  "#22C55E",
         "node-dlq":     "#EF4444",

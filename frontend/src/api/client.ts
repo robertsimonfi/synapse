@@ -1,5 +1,6 @@
 import type {
   ActionProposal,
+  DlqEvent,
   EngagementLog,
   HumanFeedbackPayload,
   TraceTimeline,
@@ -99,6 +100,17 @@ export const fetchEngagements = (actionId?: string) =>
   request<EngagementLog[]>(
     `/engagements${actionId ? `?action_id=${actionId}` : ""}`,
   );
+
+// ── DLQ ───────────────────────────────────────────────────────────────────────
+
+export const fetchDlqEvents = (status: "OPEN" | "ACKNOWLEDGED" | "ALL" = "OPEN") =>
+  request<DlqEvent[]>(`/dlq?status=${status}`);
+
+export const acknowledgeDlqEvent = (outboxId: string, operatorId: string) =>
+  request(`/dlq/${outboxId}/acknowledge`, {
+    method: "POST",
+    body: JSON.stringify({ operator_id: operatorId }),
+  });
 
 // ── System ────────────────────────────────────────────────────────────────────
 

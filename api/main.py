@@ -521,6 +521,7 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
                 action_payload=merged_payload,
                 predicted_before_state=raw.get("predicted_before_state", {}),
                 predicted_after_state=raw.get("predicted_after_state", {}),
+                chain_of_thought=resolution.chain_of_thought,
             )
             await create_action(proposal)
             proposal_ids.append(proposal.id)
@@ -1375,6 +1376,35 @@ async def get_trace_timeline(
                 })
     except Exception as exc:
         logger.warning("trace: audit_events query failed for trace_id=%s — %s", trace_id, exc)
+
+    # ── Outbox FAILED entries — catch rowcount=0 / silent write failures ─────
+    try:
+        outbox_q: dict[str, Any] = {
+            "$or": [
+                *[{"correlation_id": v} for v in id_variants],
+                *[{"action_id": aid} for aid in _action_ids],
+            ],
+            "status": "FAILED",
+        }
+        async for doc in db.outbox.find(outbox_q, {"_id": 0}):
+            events.append({
+                "event_id":   str(doc.get("outbox_id") or uuid.uuid4()),
+                "trace_id":   trace_id,
+                "node_type":  "DLQ_FAILURE",
+                "event_type": "OUTBOX_WRITE_FAILED",
+                "timestamp":  _safe_str(doc.get("failed_at") or doc.get("updated_at") or doc.get("created_at", "")),
+                "label":      f"Write-back failed: {doc.get('action_type') or '?'} → {doc.get('table_name') or 'DB'}",
+                "detail": {
+                    "outbox_id":    doc.get("outbox_id"),
+                    "action_type":  doc.get("action_type"),
+                    "table_name":   doc.get("table_name"),
+                    "error":        doc.get("error"),
+                    "attempt_count": doc.get("attempt_count"),
+                    "rows_affected": doc.get("rows_affected"),
+                },
+            })
+    except Exception as exc:
+        logger.warning("trace: outbox FAILED query failed for trace_id=%s — %s", trace_id, exc)
 
     if not events:
         raise HTTPException(

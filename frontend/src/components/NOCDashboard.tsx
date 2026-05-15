@@ -6,6 +6,7 @@ import { clsx } from "clsx";
 import { fetchActions, fetchQueueDepths, fetchSystemStatus, setStoredToken } from "../api/client";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { ActionCard } from "./ActionCard";
+import { DLQPanel } from "./DLQPanel";
 import { Timeline } from "./Timeline";
 import type { NocEvent, SentimentLabel } from "../types";
 
@@ -340,60 +341,64 @@ export function NOCDashboard({ onLogout }: { onLogout?: () => void }) {
           })}
         </motion.div>
 
-        {/* Action grid */}
+        {/* Main content */}
         <main className="flex-1 overflow-y-auto p-5">
-          <AnimatePresence mode="wait">
-            {!actions || actions.length === 0 ? (
-              <motion.div
-                key="empty"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0 }}
-                transition={{ duration: 0.3 }}
-                className="flex flex-col items-center justify-center h-48 text-gray-600 text-sm gap-3"
-              >
-                <span className="text-4xl opacity-30 select-none">◎</span>
-                <span>
-                  No actions in{" "}
-                  <span className="text-gray-500 font-semibold">{tab}</span> state
-                </span>
-              </motion.div>
-            ) : (
-              <motion.div
-                key={tab}
-                className="grid grid-cols-1 xl:grid-cols-2 gap-4"
-              >
-                <AnimatePresence>
-                  {actions.map((action, i) => {
-                    const sentiment = sentimentMap.get(action.correlation_id);
-                    return (
-                      <motion.div
-                        key={action.id}
-                        initial={{ opacity: 0, y: 22 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, scale: 0.96 }}
-                        transition={{
-                          duration: 0.38,
-                          delay: i * 0.055,
-                          ease: [0.22, 1, 0.36, 1],
-                        }}
-                        layout
-                      >
-                        <ActionCard
-                          action={action}
-                          operatorId={OPERATOR_ID}
-                          sentimentLabel={sentiment?.label}
-                          sentimentScore={sentiment?.score}
-                          onViewTrace={(cid) => setTraceId(cid)}
-                          triggerShake={!!sentiment && sentiment.label === "ANGRY"}
-                        />
-                      </motion.div>
-                    );
-                  })}
-                </AnimatePresence>
-              </motion.div>
-            )}
-          </AnimatePresence>
+          {tab === "DLQ" ? (
+            <DLQPanel operatorId={OPERATOR_ID} />
+          ) : (
+            <AnimatePresence mode="wait">
+              {!actions || actions.length === 0 ? (
+                <motion.div
+                  key="empty"
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.3 }}
+                  className="flex flex-col items-center justify-center h-48 text-gray-600 text-sm gap-3"
+                >
+                  <span className="text-4xl opacity-30 select-none">◎</span>
+                  <span>
+                    No actions in{" "}
+                    <span className="text-gray-500 font-semibold">{tab}</span> state
+                  </span>
+                </motion.div>
+              ) : (
+                <motion.div
+                  key={tab}
+                  className="grid grid-cols-1 xl:grid-cols-2 gap-4"
+                >
+                  <AnimatePresence>
+                    {actions.map((action, i) => {
+                      const sentiment = sentimentMap.get(action.correlation_id);
+                      return (
+                        <motion.div
+                          key={action.id}
+                          initial={{ opacity: 0, y: 22 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, scale: 0.96 }}
+                          transition={{
+                            duration: 0.38,
+                            delay: i * 0.055,
+                            ease: [0.22, 1, 0.36, 1],
+                          }}
+                          layout
+                        >
+                          <ActionCard
+                            action={action}
+                            operatorId={OPERATOR_ID}
+                            sentimentLabel={sentiment?.label}
+                            sentimentScore={sentiment?.score}
+                            onViewTrace={(cid) => setTraceId(cid)}
+                            triggerShake={!!sentiment && sentiment.label === "ANGRY"}
+                          />
+                        </motion.div>
+                      );
+                    })}
+                  </AnimatePresence>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          )}
         </main>
 
         {/* Timeline drawer */}

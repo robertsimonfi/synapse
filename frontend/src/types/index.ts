@@ -113,6 +113,24 @@ export interface NocEvent {
   [key: string]: unknown;
 }
 
+// ── DLQ event ─────────────────────────────────────────────────────────────────
+
+export interface DlqEvent {
+  dlq_id:         string;
+  outbox_id:      string;
+  action_id:      string;
+  correlation_id: string;
+  action_type:    string;
+  table_name:     string;
+  where_clause:   Record<string, unknown>;
+  set_values:     Record<string, unknown>;
+  error_context:  string;
+  attempts:       number;
+  status:         "OPEN" | "ACKNOWLEDGED";
+  failed_at:      string;
+  opco_id?:       string;
+}
+
 // ── Human feedback ────────────────────────────────────────────────────────────
 
 export interface HumanFeedbackPayload {
