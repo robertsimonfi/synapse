@@ -1412,6 +1412,39 @@ async def force_approve_action(
             correlation_id=action.correlation_id,
         ),
     )
+
+    # Notify chatbot gateway so the customer UI exits waiting_specialist state.
+    chatbot_cid     = (action.action_payload or {}).get("chatbot_customer_id")
+    chatbot_enabled = os.getenv("CHATBOT_GATEWAY_ENABLED", "false").lower() == "true"
+    if chatbot_cid and chatbot_enabled:
+        chatbot_url  = os.getenv("CHATBOT_GATEWAY_URL", "http://synapse-chatbot-gateway:8001")
+        action_label = action.action_type.replace("_", " ").title()
+        try:
+            import httpx as _httpx
+            async with _httpx.AsyncClient(timeout=3.0) as _client:
+                await _client.post(
+                    f"{chatbot_url}/internal/action-update",
+                    json={
+                        "customer_id": chatbot_cid,
+                        "action_id":   action_id,
+                        "status":      "FORCE_APPROVED",
+                        "summary": (
+                            f"Your {action_label} request has been escalated and approved "
+                            "by our specialist team."
+                        ),
+                    },
+                    headers={"X-Internal-Service-Key": os.getenv("INTERNAL_SERVICE_KEY", "")},
+                )
+            logger.info(
+                "Chatbot notified (force-approve) for session=%s action=%s",
+                chatbot_cid, action_id,
+            )
+        except Exception as _fexc:
+            logger.warning(
+                "Chatbot notification failed (force-approve) session=%s: %s",
+                chatbot_cid, _fexc,
+            )
+
     return _action_to_out(updated)
 
 

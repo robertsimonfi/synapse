@@ -119,6 +119,11 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       ACTION_EXPIRY_HOURS: "4"
       EXPIRY_CHECK_INTERVAL_MINUTES: "15"
+      # Chatbot gateway callback — enables TASK_COMPLETED/TASK_REJECTED pushes
+      # to the customer UI when a NOC operator approves or rejects an action.
+      # The gateway service name on synapse-net is 'gateway' (port 8001).
+      CHATBOT_GATEWAY_ENABLED: "true"
+      CHATBOT_GATEWAY_URL: "http://gateway:8001"
     volumes:
       - telco_data:/data
     networks:
