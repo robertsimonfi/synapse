@@ -838,16 +838,21 @@ async def approve_action(
         sort=[("submitted_at", -1)],
     )
     if _correction and _correction.get("correct_action"):
-        _new_type = _correction["correct_action"]
+        _new_type  = _correction["correct_action"]
+        _orig_type = _correction.get("original_action_type") or action.action_type
+        _override_desc = (
+            f"[HUMAN OVERRIDE] Operator changed '{_orig_type}' → '{_new_type}'. "
+            + (action.action_description or "")
+        )
         await _adb.action_states.update_one(
             {"_id": action_id},
-            {"$set": {"action_type": _new_type}},
+            {"$set": {"action_type": _new_type, "action_description": _override_desc}},
         )
-        # Reload so transition_action & downstream use the corrected type
+        # Reload so transition_action & downstream use the corrected type and description
         action = await get_action(action_id) or action
         logger.info(
-            "Correction intercept: action=%s type overridden → %s by %s",
-            action_id, _new_type, body.operator_id,
+            "Correction intercept: action=%s type overridden %s → %s by %s",
+            action_id, _orig_type, _new_type, body.operator_id,
         )
 
     target_status = ActionStatus.FORCE_APPROVED if force_mode else ActionStatus.APPROVED
@@ -1423,19 +1428,28 @@ async def get_trace_timeline(
             if cid in _seen_corrections:
                 continue
             _seen_corrections.add(cid)
+            original   = doc.get("original_action_type") or "?"
+            override   = doc.get("correct_action")
+            score_val  = doc.get("quality_score")
+            operator   = doc.get("operator_id") or "?"
+            if override and override != original:
+                label = f"Operator overrode AI: Changed '{original}' → '{override}'"
+            else:
+                label = f"Feedback: score={score_val} by {operator}"
             events.append({
                 "event_id":   cid or str(uuid.uuid4()),
                 "trace_id":   trace_id,
                 "node_type":  "OPERATOR_FEEDBACK",
                 "event_type": "OPERATOR_FEEDBACK_SUBMITTED",
                 "timestamp":  _safe_str(doc.get("submitted_at", "")),
-                "label":      f"Feedback: score={doc.get('quality_score')} by {doc.get('operator_id') or '?'}",
+                "label":      label,
                 "detail": {
-                    "quality_score":  doc.get("quality_score"),
-                    "correct_action": doc.get("correct_action"),
-                    "feedback_notes": doc.get("feedback_notes"),
-                    "training_ready": doc.get("training_ready"),
-                    "correction_id":  cid,
+                    "quality_score":        score_val,
+                    "original_action_type": original,
+                    "correct_action":       override,
+                    "feedback_notes":       doc.get("feedback_notes"),
+                    "training_ready":       doc.get("training_ready"),
+                    "correction_id":        cid,
                 },
             })
     except Exception as exc:
@@ -1547,12 +1561,18 @@ async def submit_action_feedback(
     training_ready = body.quality_score <= 2 or bool(body.correct_action)
     correction_doc = correction.model_dump()
     correction_doc["training_ready"] = training_ready
-    await db.operator_corrections.insert_one(correction_doc)
+    # Upsert: one correction row per action — prevents duplicate trace nodes on
+    # multiple submissions. Uses action_id as the natural unique key.
+    await db.operator_corrections.update_one(
+        {"action_id": action_id},
+        {"$set": correction_doc},
+        upsert=True,
+    )
 
-    # Write OPERATOR_FEEDBACK audit event so it surfaces in the Trace timeline.
+    # Upsert audit trail entry so the Trace timeline always shows exactly one
+    # OPERATOR_FEEDBACK node per action regardless of re-submissions.
     import datetime as _dt
     audit_feedback_doc = {
-        "id":              str(uuid.uuid4()),
         "action_id":       action_id,
         "previous_status": action_doc.get("status"),
         "new_status":      "OPERATOR_FEEDBACK",
@@ -1567,7 +1587,11 @@ async def submit_action_feedback(
             "correction_id":  correction.correction_id,
         },
     }
-    await db.action_audit_trail.insert_one(audit_feedback_doc)
+    await db.action_audit_trail.update_one(
+        {"action_id": action_id, "new_status": "OPERATOR_FEEDBACK"},
+        {"$set": audit_feedback_doc},
+        upsert=True,
+    )
 
     # Publish to Kafka (best-effort; non-fatal if Kafka unavailable)
     kafka_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS")

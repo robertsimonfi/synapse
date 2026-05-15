@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState } from "react";
-import { motion, useMotionValue, useTransform, useSpring } from "framer-motion";
+import { motion, useMotionValue, useTransform } from "framer-motion";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import toast from "react-hot-toast";
 import { clsx } from "clsx";
@@ -78,11 +78,11 @@ export function ActionCard({
 
   const isAngry = sentimentLabel === "ANGRY";
 
-  // Subtle 3-D tilt — ±5° with slow spring for NOC enterprise float
+  // Subtle 3-D tilt — ±2° max, tween easeOut for professional NOC feel
   const rawX = useMotionValue(0);
   const rawY = useMotionValue(0);
-  const rotateX = useSpring(useTransform(rawY, [-1, 1], [5, -5]), { stiffness: 60, damping: 18 });
-  const rotateY = useSpring(useTransform(rawX, [-1, 1], [-5, 5]), { stiffness: 60, damping: 18 });
+  const rotateX = useTransform(rawY, [-1, 1], [2, -2]);
+  const rotateY = useTransform(rawX, [-1, 1], [-2, 2]);
 
   useEffect(() => {
     if (triggerShake || isAngry) {
@@ -142,6 +142,7 @@ export function ActionCard({
       ref={cardRef}
       layout
       style={{ rotateX, rotateY, transformPerspective: 1200 }}
+      transition={{ type: "tween", ease: "easeOut", duration: 0.5 }}
       onMouseMove={handleMouseMove}
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}

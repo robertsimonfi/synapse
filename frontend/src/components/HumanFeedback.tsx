@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import toast from "react-hot-toast";
@@ -11,6 +11,15 @@ interface Props {
   operatorId: string;
 }
 
+interface SavedFeedback {
+  score: number;
+  correctAction: string;
+  notes: string;
+  operatorId: string;
+}
+
+const SCORE_LABELS = ["", "Wrong", "Poor", "OK", "Good", "Excellent"];
+
 const ACTION_OPTIONS = [
   "retry_provisioning",
   "update_billing",
@@ -22,20 +31,40 @@ const ACTION_OPTIONS = [
   "manual_review",
 ];
 
+function feedbackKey(actionId: string) {
+  return `synapse_feedback_${actionId}`;
+}
+
+function loadSaved(actionId: string): SavedFeedback | null {
+  try {
+    const raw = localStorage.getItem(feedbackKey(actionId));
+    return raw ? (JSON.parse(raw) as SavedFeedback) : null;
+  } catch {
+    return null;
+  }
+}
+
 export function HumanFeedback({ actionId, actionType, operatorId }: Props) {
   const [open, setOpen] = useState(false);
   const [score, setScore] = useState(3);
   const [correctAction, setCorrectAction] = useState("");
   const [notes, setNotes] = useState("");
+  const [saved, setSaved] = useState<SavedFeedback | null>(() => loadSaved(actionId));
   const qc = useQueryClient();
 
+  // Re-check localStorage if actionId changes (e.g. list refresh)
+  useEffect(() => {
+    setSaved(loadSaved(actionId));
+  }, [actionId]);
+
   const mutation = useMutation({
-    mutationFn: (payload: HumanFeedbackPayload) =>
-      submitFeedback(actionId, payload),
+    mutationFn: (payload: HumanFeedbackPayload) => submitFeedback(actionId, payload),
     onSuccess: () => {
-      toast.success("Feedback recorded — thank you!");
+      const record: SavedFeedback = { score, correctAction, notes, operatorId };
+      localStorage.setItem(feedbackKey(actionId), JSON.stringify(record));
+      setSaved(record);
       setOpen(false);
-      setNotes("");
+      toast.success("Feedback recorded — thank you!");
       qc.invalidateQueries({ queryKey: ["actions"] });
     },
     onError: (err: Error) => {
@@ -52,6 +81,41 @@ export function HumanFeedback({ actionId, actionType, operatorId }: Props) {
     });
   };
 
+  // ── Read-only summary (locked after first submission) ─────────────────────
+  if (saved) {
+    return (
+      <div className="mt-2 rounded-lg bg-amber-950/20 border border-amber-800/30 px-3 py-2 flex items-start gap-2">
+        <span className="text-amber-400 text-sm shrink-0">★</span>
+        <div className="min-w-0">
+          <p className="text-xs text-amber-300/80 font-semibold leading-none mb-1">
+            Feedback submitted
+          </p>
+          <p className="text-xs text-gray-400 leading-relaxed">
+            Score:{" "}
+            <span className="text-amber-300 font-bold">
+              {saved.score} / 5 — {SCORE_LABELS[saved.score]}
+            </span>
+            {saved.correctAction && (
+              <>
+                {" "}· Override:{" "}
+                <span className="text-orange-300 font-semibold">
+                  {saved.correctAction}
+                </span>
+              </>
+            )}
+            {saved.notes && (
+              <>
+                {" "}· <span className="italic text-gray-500">{saved.notes}</span>
+              </>
+            )}
+          </p>
+          <p className="text-[10px] text-gray-600 mt-0.5 font-mono">— {saved.operatorId}</p>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Input form ─────────────────────────────────────────────────────────────
   return (
     <div className="mt-2">
       <button
@@ -94,7 +158,7 @@ export function HumanFeedback({ actionId, actionType, operatorId }: Props) {
                     </button>
                   ))}
                   <span className="text-xs text-gray-500 self-center ml-1">
-                    {["", "Wrong", "Poor", "OK", "Good", "Excellent"][score]}
+                    {SCORE_LABELS[score]}
                   </span>
                 </div>
               </div>
