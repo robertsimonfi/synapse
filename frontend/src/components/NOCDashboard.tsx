@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
 import toast from "react-hot-toast";
@@ -76,11 +76,13 @@ function StatusBar({
   opcoId,
   depths,
   systemStatus,
+  angryCount,
 }: {
   connected: boolean;
   opcoId: string;
   depths: Record<string, number> | undefined;
   systemStatus: Record<string, unknown> | undefined;
+  angryCount: number;
 }) {
   const stale =
     (systemStatus?.circuit_breaker as Record<string, unknown> | undefined)
@@ -116,11 +118,19 @@ function StatusBar({
         </>
       )}
 
-      {stale && (
-        <span className="ml-auto px-2 py-0.5 bg-red-500/12 text-red-400 rounded-full font-bold border border-red-500/25 animate-pulse text-[10px] tracking-wider">
-          SYSTEM_STALE
-        </span>
-      )}
+      <div className="ml-auto flex items-center gap-2">
+        {angryCount > 0 && (
+          <span className="flex items-center gap-1.5 px-2 py-0.5 bg-red-500/15 text-red-400 rounded-full font-bold border border-red-500/30 animate-pulse text-[10px] tracking-wider">
+            <span className="w-1 h-1 rounded-full bg-red-400 inline-block" />
+            {angryCount} ANGRY CUSTOMER{angryCount > 1 ? "S" : ""}
+          </span>
+        )}
+        {stale && (
+          <span className="px-2 py-0.5 bg-red-500/12 text-red-400 rounded-full font-bold border border-red-500/25 animate-pulse text-[10px] tracking-wider">
+            SYSTEM_STALE
+          </span>
+        )}
+      </div>
     </div>
   );
 }
@@ -196,6 +206,20 @@ export function NOCDashboard({ onLogout }: { onLogout?: () => void }) {
   );
 
   const { connected } = useWebSocket({ opcoId, onEvent: handleWsEvent });
+
+  const angryCount = useMemo(
+    () => [...sentimentMap.values()].filter((s) => s.label === "ANGRY").length,
+    [sentimentMap],
+  );
+
+  const sortedActions = useMemo(() => {
+    if (!actions) return [];
+    return [...actions].sort((a, b) => {
+      const aAngry = sentimentMap.get(a.correlation_id)?.label === "ANGRY" ? -1 : 0;
+      const bAngry = sentimentMap.get(b.correlation_id)?.label === "ANGRY" ? -1 : 0;
+      return aAngry - bAngry;
+    });
+  }, [actions, sentimentMap]);
 
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-[#0f0a1e]">
@@ -282,6 +306,7 @@ export function NOCDashboard({ onLogout }: { onLogout?: () => void }) {
           opcoId={opcoId}
           depths={depths as Record<string, number>}
           systemStatus={systemStatus}
+          angryCount={angryCount}
         />
 
         {/* Tab strip */}
@@ -347,7 +372,7 @@ export function NOCDashboard({ onLogout }: { onLogout?: () => void }) {
             <DLQPanel operatorId={OPERATOR_ID} />
           ) : (
             <AnimatePresence mode="wait">
-              {!actions || actions.length === 0 ? (
+              {sortedActions.length === 0 ? (
                 <motion.div
                   key="empty"
                   initial={{ opacity: 0, y: 10 }}
@@ -368,7 +393,7 @@ export function NOCDashboard({ onLogout }: { onLogout?: () => void }) {
                   className="grid grid-cols-1 xl:grid-cols-2 gap-4"
                 >
                   <AnimatePresence>
-                    {actions.map((action, i) => {
+                    {sortedActions.map((action, i) => {
                       const sentiment = sentimentMap.get(action.correlation_id);
                       return (
                         <motion.div

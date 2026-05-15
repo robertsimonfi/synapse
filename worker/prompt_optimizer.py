@@ -179,7 +179,40 @@ async def apply_suggestion(suggestion_id: str, operator_id: str, db=None) -> boo
     return True
 
 
+async def _broadcast_suggestion_ready(count: int) -> None:
+    """Notify the NOC dashboard that new prompt suggestions are pending review."""
+    try:
+        from api.websocket_manager import manager as ws_manager, noc_event
+        await ws_manager.broadcast(
+            "ALL",
+            noc_event("suggestion_ready", "ALL", suggestion_count=count),
+        )
+    except Exception as exc:
+        logger.debug("WS broadcast skipped (not co-located with API): %s", exc)
+
+
+_POLL_INTERVAL_SECS = int(os.getenv("OPTIMIZER_POLL_INTERVAL_SECS", str(4 * 3600)))
+
+
+async def run() -> None:
+    """Long-running optimizer loop — runs immediately on start, then every 4 hours."""
+    logger.info(
+        "Prompt optimizer worker starting — poll interval %ds", _POLL_INTERVAL_SECS
+    )
+    while True:
+        try:
+            count = await run_optimizer()
+            if count:
+                logger.info(
+                    "prompt_optimizer: %d new suggestion(s) ready for operator review",
+                    count,
+                )
+                await _broadcast_suggestion_ready(count)
+        except Exception:
+            logger.exception("prompt_optimizer: run_optimizer cycle failed")
+        await asyncio.sleep(_POLL_INTERVAL_SECS)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    count = asyncio.run(run_optimizer())
-    print(f"prompt_optimizer: {count} new suggestion(s) created")
+    asyncio.run(run())

@@ -194,15 +194,14 @@ async def _broadcast_angry_alert(
 async def run() -> None:
     logger.info("Sentiment worker starting — consuming %s", TOPIC_CUSTOMER_FEEDBACK)
     consumer = await create_consumer(
-        topics=[TOPIC_CUSTOMER_FEEDBACK],
+        TOPIC_CUSTOMER_FEEDBACK,
         group_id=GROUP_SENTIMENT,
     )
 
-    async with consumer:
+    try:
         async for msg in consumer:
             try:
-                raw = json.loads(msg.value.decode("utf-8"))
-                feedback = CustomerFeedbackEvent(**raw)
+                feedback = CustomerFeedbackEvent(**msg.value)
 
                 # Phase 15: use the ML backend when SENTIMENT_BACKEND != keyword
                 _backend = os.getenv("SENTIMENT_BACKEND", "keyword").lower()
@@ -236,10 +235,12 @@ async def run() -> None:
                 if label == "ANGRY":
                     await _broadcast_angry_alert(feedback, score)
 
-                await consumer.commit()
-
             except Exception:
                 logger.exception("Error processing feedback message — skipping")
+            finally:
+                await consumer.commit()
+    finally:
+        await consumer.stop()
 
 
 if __name__ == "__main__":

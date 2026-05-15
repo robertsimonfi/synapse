@@ -166,6 +166,17 @@ export function ActionCard({
         }}
       />
 
+      {/* Priority 1 escalation banner — only shown for ANGRY sentiment */}
+      {isAngry && (
+        <>
+          <div className="absolute top-0 left-0 right-0 h-0.5 bg-gradient-to-r from-red-600 via-red-400 to-red-600 rounded-t-2xl" />
+          <div className="flex items-center gap-1.5 px-2.5 py-1 bg-red-500/12 border border-red-500/30 rounded-xl text-red-400 text-[10px] font-bold uppercase tracking-widest relative">
+            <span className="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse inline-block shrink-0" />
+            Priority 1 — Angry Customer Escalation
+          </div>
+        </>
+      )}
+
       {/* Header */}
       <div className="flex items-start justify-between gap-2 relative">
         <div className="flex items-center gap-2.5 min-w-0">
