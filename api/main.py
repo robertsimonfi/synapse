@@ -210,6 +210,11 @@ class ResolveRequest(BaseModel):
     severity:              str             = Field("MEDIUM", description="CRITICAL, HIGH, MEDIUM, LOW")
     free_text:             Optional[str]   = Field(None, description="Any additional operator context")
     opco_id:               str             = Field("DEFAULT", description="OpCo for multi-tenancy isolation")
+    # Phase 2/3 — Chatbot risk routing flags.
+    # When hitl_required=False and the Risk Engine scored this action as LOW risk,
+    # Core will FORCE_APPROVE the created proposals immediately (< 10 s e2e latency).
+    hitl_required:         Optional[bool]  = Field(None,  description="False = auto-approve low-risk chatbot action")
+    priority:              Optional[str]   = Field(None,  description="URGENT = chatbot task with live customer waiting")
 
     @field_validator("opco_id")
     @classmethod
@@ -230,6 +235,44 @@ class ResolveRequest(BaseModel):
                 "severity": "HIGH",
                 "free_text": "Third retry attempt — still failing on HLR-East cluster",
                 "opco_id": "UK_REGION",
+            }
+        }
+    }
+
+
+class ChatMessageRequest(BaseModel):
+    """Request body for POST /chat/message (Phase 2/3 chatbot ingestion)."""
+    customer_id:          Optional[int]   = Field(None, description="Integer CRM customer ID")
+    chatbot_customer_id:  Optional[str]   = Field(None, description="String chatbot session ID for WS routing")
+    message:              str             = Field(...,  description="Raw customer message text")
+    channel:              str             = Field("CHATBOT", description="CHATBOT | SMS | EMAIL | WHATSAPP")
+    intent_label:         Optional[str]   = Field(None, description="Pre-classified intent from chatbot gateway")
+    domain:               Optional[str]   = Field(None, description="BSS / OSS / BILLING / NETWORK")
+    severity:             Optional[str]   = Field("MEDIUM", description="CRITICAL | HIGH | MEDIUM | LOW")
+    confidence:           Optional[float] = Field(None, description="Intent classification confidence 0–1")
+    error_code:           Optional[str]   = Field(None, description="Structured error code if known")
+    free_text:            Optional[str]   = Field(None, description="Additional operator context")
+    opco_id:              str             = Field("DEFAULT", description="OpCo for multi-tenancy isolation")
+
+    @field_validator("opco_id")
+    @classmethod
+    def validate_opco(cls, v: str) -> str:
+        if v not in VALID_OPCO_IDS:
+            raise ValueError(f"opco_id must be one of: {sorted(VALID_OPCO_IDS)}")
+        return v
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "customer_id":    7,
+                "chatbot_customer_id": "demo-customer-1",
+                "message":        "I am furious — you charged me twice this month!",
+                "channel":        "CHATBOT",
+                "intent_label":   "BILLING_DISPUTE",
+                "domain":         "BILLING",
+                "severity":       "HIGH",
+                "confidence":     0.95,
+                "opco_id":        "UK_REGION",
             }
         }
     }
@@ -486,9 +529,14 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
     # Persist action proposals to MongoDB for HITL review
     proposal_ids: list[str] = []
     if _mongo_enabled and resolution.action_proposals:
-        from db.mongo import create_action
-        from models.action import ActionProposal
+        from db.mongo import create_action, transition_action
+        from models.action import ActionProposal, ActionStatus
         from observability.metrics import actions_pending_total
+
+        # Phase 2/3: auto-approve when the chatbot Risk Engine pre-cleared the action.
+        # hitl_required=False means the gateway already scored this as LOW risk.
+        _auto_approve = request.hitl_required is False
+        _priority_tag = request.priority or ""
 
         _PROV_TYPES = {"REPROVISION", "reprovision", "retry_provisioning"}
         for raw in resolution.action_proposals:
@@ -496,6 +544,10 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
             merged_payload = dict(raw.get("action_payload", {}))
             if request.chatbot_customer_id:
                 merged_payload["chatbot_customer_id"] = request.chatbot_customer_id
+
+            # Carry the priority tag into the payload for NOC dashboard ordering.
+            if _priority_tag:
+                merged_payload["priority"] = _priority_tag
 
             # Enrich MSISDN from SQLite for provisioning-type actions so that
             # the outbox PROV_RESYNC command carries a real phone number.
@@ -526,6 +578,32 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
             await create_action(proposal)
             proposal_ids.append(proposal.id)
             actions_pending_total.labels(action_type=proposal.action_type).inc()
+
+            # Phase 3: auto-approve — FORCE_APPROVE immediately so the executor
+            # picks it up in the next poll cycle without waiting for a NOC operator.
+            if _auto_approve:
+                try:
+                    await transition_action(
+                        proposal.id,
+                        proposal.version,
+                        ActionStatus.FORCE_APPROVED,
+                        actor="risk_engine:auto",
+                        extra_updates={
+                            "approved_by":          "risk_engine:auto",
+                            "approval_method":      "AUTO_APPROVED",
+                            "force_approval_reason": (
+                                f"Risk Engine auto-approved — score<30, hitl_required=False "
+                                f"(correlation={correlation_id})"
+                            ),
+                            "safety_checks_bypassed": False,
+                        },
+                    )
+                    logger.info(
+                        "Auto-approved action %s type=%s correlation=%s",
+                        proposal.id, proposal.action_type, correlation_id,
+                    )
+                except Exception as _ae:
+                    logger.warning("Auto-approve transition failed for %s: %s", proposal.id, _ae)
 
     classification = resolution.classification or {}
     critique       = resolution.critique or {}
@@ -564,6 +642,288 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
         critic_violations=resolution.critic_violations or None,
         policy_violations=resolution.policy_violations or None,
     )
+
+
+@app.post("/chat/message", tags=["Agent"])
+async def chat_message(request: ChatMessageRequest, _: str = Security(require_api_key)):
+    """
+    Phase 2/3 — Chatbot Smart Ingestion endpoint.
+
+    Designed for the Synapse Chatbot Gateway (and any other channel that sends
+    a raw customer message).  Performs three actions before handing off to the
+    resolution agent:
+
+    1. **360-View Hydration** — loads the customer's ODS / SQLite context so
+       the agent has fresh account data before reasoning starts.
+    2. **Sentiment Scoring** — scores the raw message text with the rule-based
+       Sentiment Engine.  If the customer is ANGRY the severity is bumped to
+       HIGH, the task is tagged PRIORITY=URGENT, and an immediate
+       ``sentiment_alert`` is broadcast to the NOC WebSocket.
+    3. **Risk Routing** — the Risk Engine scores the intent label supplied by
+       the caller.  Score < 30 AND high confidence → ``hitl_required=False``
+       so the resolver will FORCE_APPROVE proposals automatically.
+       Score ≥ 30 → PENDING for human NOC review.
+
+    The endpoint delegates the actual AI resolution to ``POST /resolve``.
+    """
+    from agent.risk_engine import evaluate as risk_evaluate
+    from worker.sentiment import _score_text as score_sentiment
+
+    # ── 1. Hydrate customer 360 context ───────────────────────────────────────
+    customer_context: dict = {}
+    if request.customer_id is not None:
+        try:
+            # Reuse the existing context endpoint logic directly in-process.
+            import sqlite3 as _sqlite
+            import os as _os
+
+            if _mongo_enabled:
+                from db.ods import async_get_subscriber
+                ods = await async_get_subscriber(request.customer_id)
+                if ods:
+                    customer_context = {
+                        "profile":       ods.get("profile", {}),
+                        "subscriptions": ods.get("subscriptions", []),
+                        "billing":       ods.get("billing", {}),
+                        "segment":       (ods.get("profile") or {}).get("segment", "General"),
+                        "source":        "mongodb_ods",
+                    }
+
+            if not customer_context:
+                sqlite_path = _os.getenv("SQLITE_PATH", "telco_dev.db")
+                if _os.path.exists(sqlite_path):
+                    def _sqlite_ctx(cid: int) -> dict:
+                        conn = _sqlite.connect(sqlite_path)
+                        conn.row_factory = _sqlite.Row
+                        try:
+                            row = conn.execute(
+                                "SELECT FIRST_NAME, LAST_NAME, STATUS, SEGMENT, "
+                                "ACCOUNT_TYPE, CREDIT_SCORE "
+                                "FROM CUSTOMER WHERE CUSTOMER_ID=?", (cid,)
+                            ).fetchone()
+                            return dict(row) if row else {}
+                        finally:
+                            conn.close()
+                    customer_context = await asyncio.to_thread(
+                        _sqlite_ctx, request.customer_id
+                    )
+                    if customer_context:
+                        customer_context["source"] = "sqlite_baseline"
+        except Exception as _ctx_err:
+            logger.warning(
+                "[CHAT] Context hydration failed for customer_id=%s: %s",
+                request.customer_id, _ctx_err,
+            )
+
+    logger.info(
+        "[CHAT] customer_id=%s context_source=%s",
+        request.customer_id, customer_context.get("source", "none"),
+    )
+
+    # ── 2. Sentiment scoring ───────────────────────────────────────────────────
+    sentiment_score, sentiment_label = score_sentiment(request.message)
+    is_angry   = sentiment_label == "ANGRY"
+    noc_alerted = False
+
+    # Determine effective severity — angry customers get bumped to HIGH.
+    effective_severity = "HIGH" if is_angry else (request.severity or "MEDIUM")
+    effective_priority = "URGENT" if is_angry else None
+
+    if is_angry:
+        logger.warning(
+            "[CHAT] ANGRY sentiment detected — customer_id=%s score=%.3f → escalating to NOC",
+            request.customer_id, sentiment_score,
+        )
+        # Broadcast immediate NOC alert so on-call operators see this before
+        # the AI analysis even completes.
+        try:
+            await ws_manager.broadcast(
+                request.opco_id,
+                noc_event(
+                    "sentiment_alert",
+                    request.opco_id,
+                    customer_id=request.customer_id,
+                    chatbot_customer_id=request.chatbot_customer_id,
+                    sentiment_score=sentiment_score,
+                    sentiment_label="ANGRY",
+                    channel=request.channel,
+                    priority="URGENT",
+                    message_preview=request.message[:120],
+                ),
+            )
+            noc_alerted = True
+        except Exception as _ws_err:
+            logger.warning("[CHAT] NOC sentiment_alert broadcast failed: %s", _ws_err)
+
+    # ── 3. Risk scoring ────────────────────────────────────────────────────────
+    # The caller supplies the intent_label it already extracted (e.g. "REFUND").
+    # Fall back to the domain when no explicit intent is given.
+    intent_for_risk = request.intent_label or request.domain or "GENERAL_INQUIRY"
+    risk = risk_evaluate(
+        intent_label=intent_for_risk,
+        domain=request.domain or "",
+        severity=effective_severity,
+        confidence=request.confidence or 1.0,
+    )
+
+    logger.info(
+        "[CHAT] risk_engine: intent=%s score=%d level=%s auto_approve=%s hitl=%s",
+        intent_for_risk, risk.score, risk.level.value, risk.auto_approve, risk.hitl_required,
+    )
+
+    # ── 4. Delegate to the Core resolve pipeline ───────────────────────────────
+    correlation_id = str(uuid.uuid4())
+
+    # Enrich free_text with sentiment, risk, and 360 context hints so the
+    # agent's system prompt has maximum signal.
+    context_hints = ""
+    segment = customer_context.get("segment") or (
+        (customer_context.get("profile") or {}).get("segment")
+    )
+    if segment:
+        context_hints += f" customer_segment={segment}"
+
+    free_text_enriched = (
+        f"channel={request.channel} "
+        f"intent={intent_for_risk} "
+        f"sentiment={sentiment_label}({sentiment_score:.2f}) "
+        f"risk_score={risk.score} "
+        f"hitl_required={risk.hitl_required}"
+        f"{context_hints}"
+    )
+    if request.free_text:
+        free_text_enriched = request.free_text + " | " + free_text_enriched
+
+    resolve_req = ResolveRequest(
+        customer_id=request.customer_id,
+        chatbot_customer_id=request.chatbot_customer_id,
+        error_code=request.error_code or "",
+        error_message=request.message,
+        domain=request.domain or "",
+        severity=effective_severity,
+        free_text=free_text_enriched,
+        opco_id=request.opco_id,
+        hitl_required=risk.hitl_required,
+        priority=effective_priority,
+    )
+
+    fallout_input = FalloutInput(
+        customer_id=request.customer_id,
+        error_code=resolve_req.error_code,
+        error_message=resolve_req.error_message,
+        domain=resolve_req.domain,
+        severity=resolve_req.severity,
+        free_text=resolve_req.free_text or "",
+    )
+
+    try:
+        resolution = await asyncio.to_thread(run_agent, fallout_input, correlation_id)
+    except Exception as _agent_err:
+        raise HTTPException(status_code=500, detail=f"Agent error: {_agent_err}")
+
+    # Persist proposals (reuse same HITL logic as /resolve).
+    proposal_ids: list[str] = []
+    if _mongo_enabled and resolution.action_proposals:
+        from db.mongo import create_action, transition_action
+        from models.action import ActionProposal, ActionStatus
+        from observability.metrics import actions_pending_total
+
+        _PROV_TYPES = {"REPROVISION", "reprovision", "retry_provisioning"}
+        for raw in resolution.action_proposals:
+            merged_payload = dict(raw.get("action_payload", {}))
+            if request.chatbot_customer_id:
+                merged_payload["chatbot_customer_id"] = request.chatbot_customer_id
+            if effective_priority:
+                merged_payload["priority"] = effective_priority
+            # Attach risk metadata to every action payload for audit/NOC display.
+            merged_payload.update(risk.as_dict())
+
+            if raw.get("action_type") in _PROV_TYPES:
+                msisdn = merged_payload.get("msisdn")
+                if (not msisdn or msisdn == "unknown") and request.customer_id:
+                    try:
+                        from worker.drift import get_primary_msisdn
+                        resolved_msisdn = await asyncio.to_thread(
+                            get_primary_msisdn, request.customer_id
+                        )
+                        if resolved_msisdn:
+                            merged_payload["msisdn"] = resolved_msisdn
+                    except Exception:
+                        pass
+
+            proposal = ActionProposal(
+                correlation_id=correlation_id,
+                customer_id=str(request.customer_id) if request.customer_id else None,
+                action_type=raw.get("action_type", "unknown"),
+                action_description=raw.get("action_description", ""),
+                action_payload=merged_payload,
+                predicted_before_state=raw.get("predicted_before_state", {}),
+                predicted_after_state=raw.get("predicted_after_state", {}),
+                chain_of_thought=resolution.chain_of_thought,
+            )
+            await create_action(proposal)
+            proposal_ids.append(proposal.id)
+            actions_pending_total.labels(action_type=proposal.action_type).inc()
+
+            if risk.auto_approve:
+                try:
+                    await transition_action(
+                        proposal.id,
+                        proposal.version,
+                        ActionStatus.FORCE_APPROVED,
+                        actor="risk_engine:auto",
+                        extra_updates={
+                            "approved_by":           "risk_engine:auto",
+                            "approval_method":       "AUTO_APPROVED",
+                            "force_approval_reason": (
+                                f"Risk Engine auto-approved — score={risk.score}, "
+                                f"level={risk.level.value}, hitl_required=False "
+                                f"(correlation={correlation_id})"
+                            ),
+                            "safety_checks_bypassed": False,
+                        },
+                    )
+                    logger.info(
+                        "[CHAT] Auto-approved action %s type=%s score=%d",
+                        proposal.id, proposal.action_type, risk.score,
+                    )
+                except Exception as _ae:
+                    logger.warning(
+                        "[CHAT] Auto-approve failed for %s: %s", proposal.id, _ae
+                    )
+
+    # ── 5. Broadcast NOC resolution event ─────────────────────────────────────
+    classification = resolution.classification or {}
+    await ws_manager.broadcast(
+        request.opco_id,
+        noc_event(
+            "resolution_proposed",
+            request.opco_id,
+            correlation_id=correlation_id,
+            error_code=resolve_req.error_code,
+            domain=classification.get("domain", resolve_req.domain),
+            severity=effective_severity,
+            confidence=resolution.confidence,
+            action_count=len(proposal_ids),
+            channel=request.channel,
+            auto_approved=risk.auto_approve,
+            priority=effective_priority,
+        ),
+    )
+
+    return {
+        "correlation_id":  correlation_id,
+        "trace_id":        correlation_id,
+        "risk_score":      risk.score,
+        "risk_level":      risk.level.value,
+        "hitl_required":   risk.hitl_required,
+        "auto_approve":    risk.auto_approve,
+        "sentiment_label": sentiment_label,
+        "sentiment_score": sentiment_score,
+        "noc_escalated":   noc_alerted,
+        "action_proposal_ids": proposal_ids,
+        "confidence":      resolution.confidence,
+    }
 
 
 @app.post("/customer-360", response_model=Customer360Response, tags=["Agent"])
