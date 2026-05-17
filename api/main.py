@@ -215,6 +215,10 @@ class ResolveRequest(BaseModel):
     # Core will FORCE_APPROVE the created proposals immediately (< 10 s e2e latency).
     hitl_required:         Optional[bool]  = Field(None,  description="False = auto-approve low-risk chatbot action")
     priority:              Optional[str]   = Field(None,  description="URGENT = chatbot task with live customer waiting")
+    # Chatbot gateway pre-computed fields — used by Core's risk engine to verify
+    # the routing decision without re-deriving from error_code alone.
+    intent_label:          Optional[str]   = Field(None,  description="Human-readable intent from chatbot classifier")
+    sentiment_label:       Optional[str]   = Field(None,  description="ANGRY | NEGATIVE | NEUTRAL | POSITIVE")
 
     @field_validator("opco_id")
     @classmethod
@@ -533,9 +537,30 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
         from models.action import ActionProposal, ActionStatus
         from observability.metrics import actions_pending_total
 
-        # Phase 2/3: auto-approve when the chatbot Risk Engine pre-cleared the action.
-        # hitl_required=False means the gateway already scored this as LOW risk.
-        _auto_approve = request.hitl_required is False
+        # Phase 2/3: auto-approve decision is a two-layer check.
+        # 1. Trust the gateway's pre-computed hitl_required flag.
+        # 2. If the gateway also supplied intent_label + sentiment_label, run Core's
+        #    own weighted risk engine and escalate to HITL if EITHER side says so.
+        #    This ensures profanity-forced ANGRY sentiment is never silently
+        #    auto-approved even when the raw hitl_required flag was miscalculated.
+        _gateway_auto = request.hitl_required is False
+        if request.intent_label:
+            from agent.risk_engine import evaluate as _risk_eval
+            _core_risk = _risk_eval(
+                intent_label=request.intent_label,
+                domain=request.domain or "",
+                severity=request.severity or "MEDIUM",
+                sentiment_label=request.sentiment_label or "NEUTRAL",
+            )
+            logger.info(
+                "[RESOLVE] Core risk re-check: intent=%s sentiment=%s score=%d hitl=%s",
+                request.intent_label, request.sentiment_label,
+                _core_risk.score, _core_risk.hitl_required,
+            )
+            # If Core's engine says HITL required, override the gateway flag.
+            _auto_approve = _gateway_auto and not _core_risk.hitl_required
+        else:
+            _auto_approve = _gateway_auto
         _priority_tag = request.priority or ""
 
         _PROV_TYPES = {"REPROVISION", "reprovision", "retry_provisioning"}
