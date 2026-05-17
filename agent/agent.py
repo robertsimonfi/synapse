@@ -184,9 +184,9 @@ def _mock_resolution(fallout_input: FalloutInput) -> FalloutResolution:
     The mock always proposes one concrete action so the full HITL pipeline fires:
       MongoDB (PENDING) → Operator Portal → Executor → Relay → Oracle Adapter → SQLite
     """
-    error_code = fallout_input.error_code or "UNKNOWN"
-    customer_id = fallout_input.customer_id or 0
-    order_id = fallout_input.order_id or 99999
+    error_code  = fallout_input.error_code or "UNKNOWN"
+    customer_id = fallout_input.customer_id if fallout_input.customer_id is not None else "N/A"
+    order_id    = fallout_input.order_id or 99999
 
     return FalloutResolution(
         classification={

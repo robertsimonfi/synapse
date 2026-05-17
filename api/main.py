@@ -514,10 +514,17 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
 
     correlation_id = str(uuid.uuid4())
 
+    # Resolve customer_id: prefer the integer field; fall back to the chatbot
+    # session string when the gateway sends a non-numeric ID (e.g. "demo-customer-1")
+    # that _try_int() couldn't coerce.  Without this, _mock_resolution shows "Customer 0".
+    _resolved_cid = request.customer_id
+    if _resolved_cid is None and request.chatbot_customer_id:
+        _resolved_cid = _try_int(request.chatbot_customer_id)
+
     fallout_input = FalloutInput(
         order_id=request.order_id,
         order_number=request.order_number,
-        customer_id=request.customer_id,
+        customer_id=_resolved_cid,
         error_code=request.error_code,
         error_message=request.error_message,
         domain=request.domain,
@@ -617,8 +624,8 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
                             "approved_by":          "risk_engine:auto",
                             "approval_method":      "AUTO_APPROVED",
                             "force_approval_reason": (
-                                f"Risk Engine auto-approved — score<30, hitl_required=False "
-                                f"(correlation={correlation_id})"
+                                f"Risk Engine auto-approved — score={_core_risk.score if request.intent_label else 'N/A'}, "
+                                f"hitl_required=False (correlation={correlation_id})"
                             ),
                             "safety_checks_bypassed": False,
                         },
@@ -627,6 +634,37 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
                         "Auto-approved action %s type=%s correlation=%s",
                         proposal.id, proposal.action_type, correlation_id,
                     )
+                    # Notify the chatbot gateway so the customer UI exits auto_processing.
+                    # Without this callback the React frontend hangs forever waiting for
+                    # a TASK_COMPLETED WebSocket event that never arrives.
+                    _cb_cid     = merged_payload.get("chatbot_customer_id")
+                    _cb_enabled = os.getenv("CHATBOT_GATEWAY_ENABLED", "false").lower() == "true"
+                    if _cb_cid and _cb_enabled:
+                        _cb_url   = os.getenv("CHATBOT_GATEWAY_URL", "http://synapse-chatbot-gateway:8001")
+                        _cb_label = proposal.action_type.replace("_", " ").title()
+                        try:
+                            import httpx as _httpx_r
+                            async with _httpx_r.AsyncClient(timeout=3.0) as _cb_client:
+                                _cb_resp = await _cb_client.post(
+                                    f"{_cb_url}/internal/action-update",
+                                    json={
+                                        "customer_id": _cb_cid,
+                                        "action_id":   proposal.id,
+                                        "status":      "COMPLETED",
+                                        "summary": (
+                                            f"Your {_cb_label} request has been processed automatically."
+                                        ),
+                                    },
+                                    headers={"X-Internal-Service-Key": os.getenv("INTERNAL_SERVICE_KEY", "")},
+                                )
+                            logger.info(
+                                "Auto-approve callback sent session=%s action=%s status_code=%s",
+                                _cb_cid, proposal.id, _cb_resp.status_code,
+                            )
+                        except Exception as _cbe:
+                            logger.warning(
+                                "Auto-approve callback failed session=%s: %s", _cb_cid, _cbe
+                            )
                 except Exception as _ae:
                     logger.warning("Auto-approve transition failed for %s: %s", proposal.id, _ae)
 
