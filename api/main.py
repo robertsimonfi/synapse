@@ -1314,7 +1314,7 @@ async def approve_action(
         try:
             import httpx
             async with httpx.AsyncClient(timeout=3.0) as _client:
-                await _client.post(
+                _cb_resp = await _client.post(
                     f"{chatbot_url}/internal/action-update",
                     json={
                         "customer_id": chatbot_cid,
@@ -1327,7 +1327,10 @@ async def approve_action(
                     },
                     headers={"X-Internal-Service-Key": os.getenv("INTERNAL_SERVICE_KEY", "")},
                 )
-            logger.info("Chatbot notified for session %s action=%s", chatbot_cid, action_id)
+            logger.info(
+                "Chatbot notified for session %s action=%s status_code=%s",
+                chatbot_cid, action_id, _cb_resp.status_code,
+            )
         except Exception as _exc:
             logger.warning("Chatbot notification failed for session %s: %s", chatbot_cid, _exc)
     elif chatbot_cid and not chatbot_enabled:
@@ -1422,7 +1425,7 @@ async def force_approve_action(
         try:
             import httpx as _httpx
             async with _httpx.AsyncClient(timeout=3.0) as _client:
-                await _client.post(
+                _cb_resp = await _client.post(
                     f"{chatbot_url}/internal/action-update",
                     json={
                         "customer_id": chatbot_cid,
@@ -1436,8 +1439,8 @@ async def force_approve_action(
                     headers={"X-Internal-Service-Key": os.getenv("INTERNAL_SERVICE_KEY", "")},
                 )
             logger.info(
-                "Chatbot notified (force-approve) for session=%s action=%s",
-                chatbot_cid, action_id,
+                "Chatbot notified (force-approve) session=%s action=%s status_code=%s",
+                chatbot_cid, action_id, _cb_resp.status_code,
             )
         except Exception as _fexc:
             logger.warning(
