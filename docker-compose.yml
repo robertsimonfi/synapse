@@ -123,7 +123,7 @@ services:
       # to the customer UI when a NOC operator approves or rejects an action.
       # The gateway service name on synapse-net is 'gateway' (port 8001).
       CHATBOT_GATEWAY_ENABLED: "true"
-      CHATBOT_GATEWAY_URL: "http://gateway:8001"
+      CHATBOT_GATEWAY_URL: "http://synapse-chatbot-gateway:8001"
     volumes:
       - telco_data:/data
     networks:

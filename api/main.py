@@ -547,7 +547,10 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
     # We inject a synthetic "escalate" proposal so a MongoDB document materialises,
     # the NOC card appears for the operator, and the HITL approve/reject callback
     # can fire and release the customer's chat lock.
-    if request.hitl_required and not resolution.action_proposals:
+    _is_chatbot_handoff = (request.error_code == "CHATBOT_HANDOFF")
+    if request.hitl_required and (not resolution.action_proposals or _is_chatbot_handoff):
+        if _is_chatbot_handoff:
+            resolution.action_proposals = []
         _intent  = request.intent_label   or "GENERAL_INQUIRY"
         _sent    = request.sentiment_label or "ANGRY"
         _raw_msg = request.error_message or ""
