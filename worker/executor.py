@@ -139,6 +139,18 @@ async def _h_default(a: ActionProposal) -> dict:
     return {"result": "no_handler", "action_type": a.action_type}
 
 
+def _safe_int(value) -> int | None:
+    """Coerce value to int; return None on failure.
+
+    Prevents ValueError when customer_id / order_id arrive as non-numeric
+    strings (e.g. 'demo-customer-1') from the chatbot gateway in dev mode.
+    """
+    try:
+        return int(value) if value is not None else None
+    except (ValueError, TypeError):
+        return None
+
+
 _HANDLERS: dict[str, Handler] = {
     "retry_provisioning":  _h_retry_provisioning,
     "REPROVISION":         _h_reprovision,
@@ -236,7 +248,7 @@ def _outbox_params(action: ActionProposal) -> tuple[str, str, dict, dict] | None
     elif action.action_type == "cancel_order":
         return (
             "ORDER_HEADER", "UPDATE",
-            {"order_id": int(action.order_id) if action.order_id else p.get("order_id")},
+            {"order_id": _safe_int(action.order_id) or p.get("order_id")},
             {"status": "CANCELLED"},
         )
     elif action.action_type == "retry_provisioning":
@@ -261,8 +273,8 @@ def _outbox_params(action: ActionProposal) -> tuple[str, str, dict, dict] | None
         return (
             "INCIDENT_TICKET", "INSERT",
             {
-                "customer_id": int(action.customer_id) if action.customer_id else None,
-                "order_id":    int(action.order_id)    if action.order_id    else None,
+                "customer_id": _safe_int(action.customer_id),
+                "order_id":    _safe_int(action.order_id),
                 "fallout_id":  p.get("fallout_id"),
             },
             {
@@ -435,10 +447,15 @@ async def _execute_action(action: ActionProposal) -> None:
                     raise RuntimeError(f"Post-write verification failed: {verify_reason}")
 
                 # ── Phase 9: Write to outbox → Relay → Kafka → Oracle Adapter ────────
-                outbox_p = _outbox_params(action)
-                if outbox_p:
-                    table_name, operation, where_clause, set_values = outbox_p
-                    try:
+                # The entire outbox block is wrapped in its own guard so that:
+                #   • _outbox_params() raising (e.g. non-numeric customer_id in
+                #     SQLite dev mode) never propagates to the outer retry loop.
+                #   • A null WHERE-clause constraint from the dev SQLite stub
+                #     does not block the EXECUTED transition or callback delivery.
+                try:
+                    outbox_p = _outbox_params(action)
+                    if outbox_p:
+                        table_name, operation, where_clause, set_values = outbox_p
                         await create_outbox_entry(
                             action_id=action.id,
                             correlation_id=action.correlation_id,
@@ -451,11 +468,11 @@ async def _execute_action(action: ActionProposal) -> None:
                                 "updated_date"
                             ),
                         )
-                    except Exception as outbox_exc:
-                        logger.error(
-                            "Outbox write failed for action %s: %s — execution marked EXECUTED anyway",
-                            action.id, outbox_exc,
-                        )
+                except Exception as outbox_exc:
+                    logger.error(
+                        "Outbox write failed for action %s: %s — execution marked EXECUTED anyway",
+                        action.id, outbox_exc,
+                    )
 
                 await transition_action(
                     action.id, current_version, ActionStatus.EXECUTED,

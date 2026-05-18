@@ -6,6 +6,12 @@ The router calls Claude Haiku (fast + cheap) and returns a RoutingDecision
 that the main agent uses to:
   - Filter the active tool set to the expert's relevant subset
   - Inject a domain-specific system-prompt addendum
+
+Compound-sentence handling: if the free text contains signals from multiple
+domains the Hard Overwrite Hierarchy is applied both in the prompt and by a
+Python-level post-processor:
+
+    BILLING > PROVISIONING > RETENTION > GENERAL
 """
 
 import json
@@ -28,6 +34,35 @@ class RoutingDecision:
     domain: ExpertDomain
     confidence: float
     reasoning: str
+
+
+# Hard Overwrite Hierarchy — highest priority first.
+_DOMAIN_PRIORITY: list[ExpertDomain] = [
+    ExpertDomain.BILLING,
+    ExpertDomain.PROVISIONING,
+    ExpertDomain.RETENTION,
+    ExpertDomain.GENERAL,
+]
+
+# Keyword signals used by the Python-level hierarchy enforcer.
+# Intentionally broad substring matches (no word boundaries needed — we lower-case
+# the whole text before checking).
+_DOMAIN_SIGNALS: dict[ExpertDomain, list[str]] = {
+    ExpertDomain.BILLING: [
+        "overcharg", "bill", "invoice", "refund", "credit", "payment",
+        "charg", "fee", "cost", "£", "$", "€", "money", "debit",
+        "overdue", "balance", "receipt", "transaction",
+    ],
+    ExpertDomain.PROVISIONING: [
+        "connect", "network", "signal", "activat", "provision",
+        "sim", "internet", "data", "coverage", "outage", "hlr",
+        "ocs", "epc", "ims", "service down", "no service",
+    ],
+    ExpertDomain.RETENTION: [
+        "cancel", "leave", "quit", "churn", "discount", "loyal",
+        "better deal", "competitor", "switch provider",
+    ],
+}
 
 
 # Per-expert configuration: which tools and what system-prompt addendum.
@@ -107,7 +142,11 @@ class IntentRouter:
         error_message: str,
         free_text: str,
     ) -> RoutingDecision:
-        """Return a RoutingDecision for the given fallout context."""
+        """Return a RoutingDecision for the given fallout context.
+
+        For compound sentences the Hard Overwrite Hierarchy is applied both
+        inside the LLM prompt and by _apply_domain_hierarchy() afterwards.
+        """
         prompt = (
             "Classify this telco support request into exactly one domain.\n\n"
             f"Error Code: {error_code or 'N/A'}\n"
@@ -121,14 +160,51 @@ class IntentRouter:
             "- BILLING: payment failures, invoice disputes, credit limits, charge adjustments, refunds\n"
             "- PROVISIONING: activation failures, SIM issues, HLR/OCS/EPC/IMS errors, network provisioning\n"
             "- RETENTION: churn signals, discount requests, plan changes, customer satisfaction complaints\n"
-            "- GENERAL: clearly multi-domain or insufficient signal"
+            "- GENERAL: clearly multi-domain or insufficient signal\n\n"
+            "COMPOUND SENTENCE RULE — Hard Overwrite Hierarchy:\n"
+            "If the message contains signals from multiple domains apply this strict priority:\n"
+            "  BILLING > PROVISIONING > RETENTION > GENERAL\n"
+            "Examples:\n"
+            "  'Update my address but I was overcharged £60' → BILLING (financial dispute wins)\n"
+            "  'Cancel my plan, my internet is also down'   → PROVISIONING (service failure > churn)\n"
+            "  'I want a better deal, my bill is too high'  → BILLING (monetary dispute wins)\n"
+            "Never return GENERAL if a more specific domain signal is present."
         )
         response = self._client.messages.create(
             model=self._model,
             max_tokens=256,
             messages=[{"role": "user", "content": prompt}],
         )
-        return self._parse(response.content[0].text)
+        decision = self._parse(response.content[0].text)
+        # Second layer: Python-level hierarchy enforcement on raw text signals.
+        return self._apply_domain_hierarchy(free_text or "", decision)
+
+    def _apply_domain_hierarchy(
+        self, text: str, decision: RoutingDecision
+    ) -> RoutingDecision:
+        """Enforce BILLING > PROVISIONING > RETENTION > GENERAL on raw text.
+
+        Upgrades the domain when a higher-priority signal is detected in the
+        free text, regardless of what the LLM returned.  Never downgrades.
+        """
+        text_lower = text.lower()
+        current_rank = _DOMAIN_PRIORITY.index(decision.domain)
+
+        for candidate in _DOMAIN_PRIORITY[:current_rank]:
+            signals = _DOMAIN_SIGNALS.get(candidate, [])
+            if any(sig in text_lower for sig in signals):
+                return RoutingDecision(
+                    domain=candidate,
+                    confidence=decision.confidence,
+                    reasoning=(
+                        f"[HIERARCHY_OVERRIDE] {candidate.value} signals detected "
+                        f"in compound sentence — overrides {decision.domain.value}. "
+                        f"Original reasoning: {decision.reasoning}"
+                    ),
+                )
+
+        # No higher-priority signals found — return unchanged.
+        return decision
 
     def _parse(self, text: str) -> RoutingDecision:
         try:

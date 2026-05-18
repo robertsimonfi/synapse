@@ -614,6 +614,10 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
             # Phase 3: auto-approve — FORCE_APPROVE immediately so the executor
             # picks it up in the next poll cycle without waiting for a NOC operator.
             if _auto_approve:
+                # ── 3a. State transition (best-effort) ────────────────────────
+                # Isolated so a transient MongoDB / SQLite stub error never
+                # prevents the callback from reaching the chatbot gateway.
+                _transition_ok = False
                 try:
                     await transition_action(
                         proposal.id,
@@ -634,39 +638,53 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
                         "Auto-approved action %s type=%s correlation=%s",
                         proposal.id, proposal.action_type, correlation_id,
                     )
-                    # Notify the chatbot gateway so the customer UI exits auto_processing.
-                    # Without this callback the React frontend hangs forever waiting for
-                    # a TASK_COMPLETED WebSocket event that never arrives.
-                    _cb_cid     = merged_payload.get("chatbot_customer_id")
-                    _cb_enabled = os.getenv("CHATBOT_GATEWAY_ENABLED", "false").lower() == "true"
-                    if _cb_cid and _cb_enabled:
-                        _cb_url   = os.getenv("CHATBOT_GATEWAY_URL", "http://synapse-chatbot-gateway:8001")
-                        _cb_label = proposal.action_type.replace("_", " ").title()
-                        try:
-                            import httpx as _httpx_r
-                            async with _httpx_r.AsyncClient(timeout=3.0) as _cb_client:
-                                _cb_resp = await _cb_client.post(
-                                    f"{_cb_url}/internal/action-update",
-                                    json={
-                                        "customer_id": _cb_cid,
-                                        "action_id":   proposal.id,
-                                        "status":      "COMPLETED",
-                                        "summary": (
-                                            f"Your {_cb_label} request has been processed automatically."
-                                        ),
-                                    },
-                                    headers={"X-Internal-Service-Key": os.getenv("INTERNAL_SERVICE_KEY", "")},
-                                )
-                            logger.info(
-                                "Auto-approve callback sent session=%s action=%s status_code=%s",
-                                _cb_cid, proposal.id, _cb_resp.status_code,
-                            )
-                        except Exception as _cbe:
-                            logger.warning(
-                                "Auto-approve callback failed session=%s: %s", _cb_cid, _cbe
-                            )
+                    _transition_ok = True
                 except Exception as _ae:
-                    logger.warning("Auto-approve transition failed for %s: %s", proposal.id, _ae)
+                    logger.warning(
+                        "Auto-approve transition failed for %s: %s — "
+                        "callback will still be delivered to gateway",
+                        proposal.id, _ae,
+                    )
+
+                # ── 3b. Deterministic callback — fires regardless of transition ──
+                # The gateway MUST receive this so the customer UI can exit the
+                # "Specialist Reviewing…" state.  A failed state transition is
+                # logged above; the callback is never silently dropped.
+                _cb_cid     = merged_payload.get("chatbot_customer_id")
+                _cb_enabled = os.getenv("CHATBOT_GATEWAY_ENABLED", "false").lower() == "true"
+                if _cb_cid and _cb_enabled:
+                    _cb_url   = os.getenv("CHATBOT_GATEWAY_URL", "http://synapse-chatbot-gateway:8001")
+                    _cb_label = proposal.action_type.replace("_", " ").title()
+                    try:
+                        import httpx as _httpx_r
+                        async with _httpx_r.AsyncClient(timeout=3.0) as _cb_client:
+                            _cb_resp = await _cb_client.post(
+                                f"{_cb_url}/internal/action-update",
+                                json={
+                                    "customer_id": _cb_cid,
+                                    "action_id":   proposal.id,
+                                    "status":      "COMPLETED",
+                                    "summary": (
+                                        f"Your {_cb_label} request has been processed automatically."
+                                    ),
+                                },
+                                headers={"X-Internal-Service-Key": os.getenv("INTERNAL_SERVICE_KEY", "")},
+                            )
+                        logger.info(
+                            "Auto-approve callback sent session=%s action=%s "
+                            "status_code=%s transition_ok=%s",
+                            _cb_cid, proposal.id, _cb_resp.status_code, _transition_ok,
+                        )
+                    except Exception as _cbe:
+                        logger.warning(
+                            "Auto-approve callback failed session=%s: %s", _cb_cid, _cbe
+                        )
+                elif _cb_cid and not _cb_enabled:
+                    logger.info(
+                        "[MOCK-CHATBOT] auto-approve session=%s action=%s "
+                        "(set CHATBOT_GATEWAY_ENABLED=true to enable live callbacks)",
+                        _cb_cid, proposal.id,
+                    )
 
     classification = resolution.classification or {}
     critique       = resolution.critique or {}
