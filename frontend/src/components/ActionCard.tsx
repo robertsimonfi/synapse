@@ -223,25 +223,71 @@ export function ActionCard({
         <span>Expires <span className="text-gray-400">{fmtDate(action.expires_at)}</span></span>
       </div>
 
-      {/* State diff */}
-      <div className="grid grid-cols-2 gap-2 text-xs relative">
-        <div className="bg-black/35 rounded-xl p-2.5 border border-white/4">
-          <p className="text-gray-600 mb-1.5 font-semibold uppercase tracking-widest text-[9px]">
-            Before
-          </p>
-          <pre className="text-gray-400 whitespace-pre-wrap break-all leading-relaxed">
-            {JSON.stringify(action.predicted_before_state, null, 2)}
-          </pre>
+      {/* State diff — Conversational Escalation variant vs. generic action diff */}
+      {action.action_type === "escalate" &&
+      typeof action.action_payload?.last_customer_message === "string" &&
+      action.action_payload.last_customer_message ? (
+        /* ── Conversational Escalation Panel ─────────────────────────────── */
+        <div className="flex flex-col gap-2 text-xs relative">
+          {/* Verbatim customer message */}
+          <div className="bg-red-950/40 rounded-xl p-2.5 border border-red-500/20">
+            <p className="text-red-400/70 mb-1.5 font-semibold uppercase tracking-widest text-[9px]">
+              Customer Message
+            </p>
+            <p className="text-gray-200 italic leading-relaxed">
+              &ldquo;{action.action_payload.last_customer_message as string}&rdquo;
+            </p>
+          </div>
+          {/* Intent + sentiment chips */}
+          <div className="bg-black/35 rounded-xl p-2.5 border border-white/4">
+            <p className="text-gray-600 mb-2 font-semibold uppercase tracking-widest text-[9px]">
+              Escalation Context
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {action.action_payload.intent && (
+                <span className="px-2 py-0.5 bg-purple-500/10 border border-purple-500/20 rounded-full text-purple-300 text-[10px]">
+                  Intent: {String(action.action_payload.intent).replace(/_/g, " ")}
+                </span>
+              )}
+              {action.action_payload.sentiment && (
+                <span
+                  className={clsx(
+                    "px-2 py-0.5 border rounded-full text-[10px]",
+                    action.action_payload.sentiment === "ANGRY"
+                      ? "bg-red-500/10 border-red-500/20 text-red-300"
+                      : "bg-amber-500/10 border-amber-500/20 text-amber-300",
+                  )}
+                >
+                  Sentiment: {String(action.action_payload.sentiment)}
+                </span>
+              )}
+              <span className="px-2 py-0.5 bg-orange-500/10 border border-orange-500/20 rounded-full text-orange-300 text-[10px]">
+                No automated action — human required
+              </span>
+            </div>
+          </div>
         </div>
-        <div className="bg-black/35 rounded-xl p-2.5 border border-white/4">
-          <p className="text-gray-600 mb-1.5 font-semibold uppercase tracking-widest text-[9px]">
-            After
-          </p>
-          <pre className="text-emerald-400 whitespace-pre-wrap break-all leading-relaxed">
-            {JSON.stringify(action.predicted_after_state, null, 2)}
-          </pre>
+      ) : (
+        /* ── Generic state diff for all other action types ─────────────── */
+        <div className="grid grid-cols-2 gap-2 text-xs relative">
+          <div className="bg-black/35 rounded-xl p-2.5 border border-white/4">
+            <p className="text-gray-600 mb-1.5 font-semibold uppercase tracking-widest text-[9px]">
+              Before
+            </p>
+            <pre className="text-gray-400 whitespace-pre-wrap break-all leading-relaxed">
+              {JSON.stringify(action.predicted_before_state, null, 2)}
+            </pre>
+          </div>
+          <div className="bg-black/35 rounded-xl p-2.5 border border-white/4">
+            <p className="text-gray-600 mb-1.5 font-semibold uppercase tracking-widest text-[9px]">
+              After
+            </p>
+            <pre className="text-emerald-400 whitespace-pre-wrap break-all leading-relaxed">
+              {JSON.stringify(action.predicted_after_state, null, 2)}
+            </pre>
+          </div>
         </div>
-      </div>
+      )}
 
       {/* AI thought + feedback */}
       <div className="relative">
@@ -298,9 +344,18 @@ export function ActionCard({
               <button
                 onClick={() => approveMutation.mutate()}
                 disabled={approveMutation.isPending}
-                className="flex-1 py-2 bg-gradient-to-r from-emerald-600 to-green-600 hover:from-emerald-500 hover:to-green-500 text-white text-sm font-semibold rounded-xl transition-all duration-200 disabled:opacity-40 shadow-md shadow-emerald-900/25"
+                className={clsx(
+                  "flex-1 py-2 text-white text-sm font-semibold rounded-xl transition-all duration-200 disabled:opacity-40 shadow-md",
+                  action.action_type === "escalate"
+                    ? "bg-gradient-to-r from-purple-700 to-violet-700 hover:from-purple-600 hover:to-violet-600 shadow-purple-900/30"
+                    : "bg-gradient-to-r from-emerald-600 to-green-600 hover:from-emerald-500 hover:to-green-500 shadow-emerald-900/25",
+                )}
               >
-                {approveMutation.isPending ? "Approving…" : "✓ Approve"}
+                {approveMutation.isPending
+                  ? "Approving…"
+                  : action.action_type === "escalate"
+                  ? "↗ Transfer to Specialist"
+                  : "✓ Approve"}
               </button>
               <button
                 onClick={() => setShowReject(true)}

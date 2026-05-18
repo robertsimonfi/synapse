@@ -537,6 +537,53 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Agent error: {e}")
 
+    # ── Ghost-HITL Safety Net ─────────────────────────────────────────────────
+    # When the gateway flagged hitl_required=True (ANGRY sentiment, profanity, or
+    # operator override) but the agent produced no concrete action proposals because
+    # the turn was read-only/conversational (e.g. "Get me a manager about my bill"),
+    # the NOC dashboard would show nothing and the customer UI would freeze
+    # permanently — a "Ghost HITL" deadlock.
+    #
+    # We inject a synthetic "escalate" proposal so a MongoDB document materialises,
+    # the NOC card appears for the operator, and the HITL approve/reject callback
+    # can fire and release the customer's chat lock.
+    if request.hitl_required and not resolution.action_proposals:
+        _intent  = request.intent_label   or "GENERAL_INQUIRY"
+        _sent    = request.sentiment_label or "ANGRY"
+        _raw_msg = request.error_message or ""
+        resolution.action_proposals = [{
+            "action_type": "escalate",
+            "action_description": (
+                f"Conversational escalation — "
+                f"{_intent.replace('_', ' ').title()} with {_sent} sentiment. "
+                "Customer requires direct human specialist assistance. "
+                "No automated action is safe for this turn."
+            ),
+            "action_payload": {
+                "reason": (
+                    f"HITL escalation triggered for {_intent} (sentiment={_sent}). "
+                    "No automated resolution proposed — human specialist required."
+                ),
+                "last_customer_message": _raw_msg,
+                "intent":            _intent,
+                "sentiment":         _sent,
+                "escalation_source": "ghost_hitl_safety_net",
+            },
+            "predicted_before_state": {"specialist_assigned": "false"},
+            "predicted_after_state":  {"specialist_assigned": "true"},
+        }]
+        if not resolution.manager_brief:
+            resolution.manager_brief = (
+                f"[Conversational Escalation] {_sent} customer requesting specialist "
+                f"contact for {_intent.replace('_', ' ').lower()} — "
+                "no automated action proposed."
+            )
+        logger.info(
+            "[GHOST_HITL] Injected synthetic escalate proposal "
+            "cid=%s intent=%s sentiment=%s",
+            request.chatbot_customer_id or request.customer_id, _intent, _sent,
+        )
+
     # Persist action proposals to MongoDB for HITL review
     proposal_ids: list[str] = []
     if _mongo_enabled and resolution.action_proposals:
