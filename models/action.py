@@ -125,6 +125,11 @@ class ActionProposal(BaseModel):
     # Phase 17: region/OpCo this action belongs to (used for RBAC approval checks)
     opco_id: str = "DEFAULT"
 
+    # Chatbot session routing — the original string customer ID (e.g. "demo-customer-1")
+    # preserved across the integer-coercion boundary so approve/reject callbacks reach
+    # the correct WebSocket channel regardless of what customer_id was stored as.
+    chatbot_customer_id: str | None = None
+
 
 class AuditEvent(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))

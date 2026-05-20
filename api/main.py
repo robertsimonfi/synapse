@@ -650,6 +650,10 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
                 correlation_id=correlation_id,
                 order_id=str(request.order_id) if request.order_id else None,
                 customer_id=str(request.customer_id) if request.customer_id else None,
+                # Top-level field mirrors action_payload["chatbot_customer_id"] so
+                # approve/reject callbacks can reach the WebSocket channel without
+                # digging into an opaque dict that may differ per action type.
+                chatbot_customer_id=request.chatbot_customer_id or None,
                 action_type=raw.get("action_type", "unknown"),
                 action_description=raw.get("action_description", ""),
                 action_payload=merged_payload,
@@ -1022,6 +1026,7 @@ async def chat_message(request: ChatMessageRequest, _: str = Security(require_ap
             proposal = ActionProposal(
                 correlation_id=correlation_id,
                 customer_id=str(request.customer_id) if request.customer_id else None,
+                chatbot_customer_id=request.chatbot_customer_id or None,
                 action_type=raw.get("action_type", "unknown"),
                 action_description=raw.get("action_description", ""),
                 action_payload=merged_payload,
@@ -1437,11 +1442,22 @@ async def approve_action(
     # Phase 5.1: notify chatbot gateway so the customer UI resolves from HITL wait.
     # Guard: only attempt if CHATBOT_GATEWAY_ENABLED=true (avoids [Errno -2] DNS
     # errors in local dev where synapse-chatbot-gateway is not running).
-    chatbot_cid     = (action.action_payload or {}).get("chatbot_customer_id")
+    # Routing priority: top-level field (always the original string ID) → action_payload
+    # fallback (retained for documents created before this field was introduced).
+    chatbot_cid = (
+        action.chatbot_customer_id
+        or (action.action_payload or {}).get("chatbot_customer_id")
+    )
     chatbot_enabled = os.getenv("CHATBOT_GATEWAY_ENABLED", "false").lower() == "true"
     if chatbot_cid and chatbot_enabled:
-        chatbot_url  = os.getenv("CHATBOT_GATEWAY_URL", "http://synapse-chatbot-gateway:8001")
-        action_label = action.action_type.replace("_", " ").title()
+        chatbot_url    = os.getenv("CHATBOT_GATEWAY_URL", "http://synapse-chatbot-gateway:8001")
+        _is_escalation = action.action_type == "escalate"
+        _cb_summary    = (
+            "A specialist has joined your session. Your case is being reviewed as a priority."
+            if _is_escalation else
+            f"Your {action.action_type.replace('_', ' ').title()} request has been reviewed "
+            "and approved by our specialist team."
+        )
         try:
             import httpx
             async with httpx.AsyncClient(timeout=3.0) as _client:
@@ -1451,19 +1467,20 @@ async def approve_action(
                         "customer_id": chatbot_cid,
                         "action_id":   action_id,
                         "status":      "APPROVED",
-                        "summary":     (
-                            f"Your {action_label} request has been reviewed and approved "
-                            "by our specialist team."
-                        ),
+                        "summary":     _cb_summary,
                     },
                     headers={"X-Internal-Service-Key": os.getenv("INTERNAL_SERVICE_KEY", "")},
                 )
+                _cb_resp.raise_for_status()
             logger.info(
-                "Chatbot notified for session %s action=%s status_code=%s",
-                chatbot_cid, action_id, _cb_resp.status_code,
+                "[E2E-DIAGNOSTIC] Webhook hit gateway. Response: %s session=%s action=%s",
+                _cb_resp.status_code, chatbot_cid, action_id,
             )
         except Exception as _exc:
-            logger.warning("Chatbot notification failed for session %s: %s", chatbot_cid, _exc)
+            logger.error(
+                "[E2E-DIAGNOSTIC] CRITICAL Webhook Drop: %s session=%s action=%s",
+                str(_exc), chatbot_cid, action_id,
+            )
     elif chatbot_cid and not chatbot_enabled:
         logger.info(
             "[MOCK-CHATBOT] action=%s session=%s status=APPROVED "
@@ -1548,7 +1565,10 @@ async def force_approve_action(
     )
 
     # Notify chatbot gateway so the customer UI exits waiting_specialist state.
-    chatbot_cid     = (action.action_payload or {}).get("chatbot_customer_id")
+    chatbot_cid = (
+        action.chatbot_customer_id
+        or (action.action_payload or {}).get("chatbot_customer_id")
+    )
     chatbot_enabled = os.getenv("CHATBOT_GATEWAY_ENABLED", "false").lower() == "true"
     if chatbot_cid and chatbot_enabled:
         chatbot_url  = os.getenv("CHATBOT_GATEWAY_URL", "http://synapse-chatbot-gateway:8001")
@@ -1623,6 +1643,50 @@ async def reject_action(
         "Action %s REJECTED by %s — reason: %s",
         action_id, body.operator_id, body.reason,
     )
+
+    # Notify chatbot gateway so the customer UI exits waiting_specialist state.
+    # Without this callback a rejected escalation silently deadlocks the customer UI.
+    chatbot_cid = (
+        action.chatbot_customer_id
+        or (action.action_payload or {}).get("chatbot_customer_id")
+    )
+    chatbot_enabled = os.getenv("CHATBOT_GATEWAY_ENABLED", "false").lower() == "true"
+    if chatbot_cid and chatbot_enabled:
+        chatbot_url = os.getenv("CHATBOT_GATEWAY_URL", "http://synapse-chatbot-gateway:8001")
+        try:
+            import httpx as _httpx_rej
+            async with _httpx_rej.AsyncClient(timeout=3.0) as _client:
+                _cb_resp = await _client.post(
+                    f"{chatbot_url}/internal/action-update",
+                    json={
+                        "customer_id": chatbot_cid,
+                        "action_id":   action_id,
+                        "status":      "REJECTED",
+                        "summary": (
+                            "Your request could not be actioned at this time. "
+                            "A specialist has noted your case — please contact us "
+                            "if you need further assistance."
+                        ),
+                    },
+                    headers={"X-Internal-Service-Key": os.getenv("INTERNAL_SERVICE_KEY", "")},
+                )
+                _cb_resp.raise_for_status()
+            logger.info(
+                "[E2E-DIAGNOSTIC] Webhook hit gateway (reject). Response: %s session=%s action=%s",
+                _cb_resp.status_code, chatbot_cid, action_id,
+            )
+        except Exception as _exc:
+            logger.error(
+                "[E2E-DIAGNOSTIC] CRITICAL Webhook Drop (reject): %s session=%s action=%s",
+                str(_exc), chatbot_cid, action_id,
+            )
+    elif chatbot_cid and not chatbot_enabled:
+        logger.info(
+            "[MOCK-CHATBOT] action=%s session=%s status=REJECTED "
+            "(set CHATBOT_GATEWAY_ENABLED=true to enable live callbacks)",
+            action_id, chatbot_cid,
+        )
+
     return _action_to_out(updated)
 
 
