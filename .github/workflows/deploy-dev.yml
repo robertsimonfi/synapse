@@ -5,8 +5,8 @@ on:
     branches: [ main, develop ]
 
 env:
-  ACR_NAME: acrtelcoagent18683
-  RESOURCE_GROUP: rg-telco-agent
+  ACR_NAME: acrsynapse18683
+  RESOURCE_GROUP: rg-synapse
   CLUSTER_NAME: aks-synapse
   NAMESPACE: telco-agent-dev
 
@@ -26,8 +26,8 @@ jobs:
       - name: Build and push image to ACR
         run: |
           az acr login --name $ACR_NAME
-          docker build -t $ACR_NAME.azurecr.io/telco-agent:${{ github.sha }} .
-          docker push $ACR_NAME.azurecr.io/telco-agent:${{ github.sha }}
+          docker build -t acrsynapse18683.azurecr.io/telco-agent:${{ github.sha }} .
+          docker push acrsynapse18683.azurecr.io/telco-agent:${{ github.sha }}
 
       - name: Set AKS cluster context
         uses: azure/aks-set-context@v4
@@ -38,6 +38,6 @@ jobs:
       - name: Roll out updated image
         run: |
           kubectl set image deployment/telco-agent \
-            api=$ACR_NAME.azurecr.io/telco-agent:${{ github.sha }} \
+            api=acrsynapse18683.azurecr.io/telco-agent:${{ github.sha }} \
             -n $NAMESPACE
           kubectl rollout status deployment/telco-agent -n $NAMESPACE --timeout=120s

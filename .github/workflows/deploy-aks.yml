@@ -20,9 +20,9 @@ name: Deploy to AKS
 #   TELCO-AGENT-API-KEYS      — comma-separated X-API-Key values (different per env)
 
 env:
-  ACR_NAME: acrtelcoagent18683
-  ACR_LOGIN_SERVER: acrtelcoagent18683.azurecr.io
-  RESOURCE_GROUP: rg-telco-agent
+  ACR_NAME: acrsynapse18683
+  ACR_LOGIN_SERVER: acrsynapse18683.azurecr.io
+  RESOURCE_GROUP: rg-synapse
 
 on:
   workflow_dispatch:
