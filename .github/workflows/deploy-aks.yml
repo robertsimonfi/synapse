@@ -14,8 +14,6 @@ env:
   RESOURCE_GROUP: rg-synapse
 
 on:
-  push:
-    branches: [main, develop]
   workflow_dispatch:
     inputs:
       environment:

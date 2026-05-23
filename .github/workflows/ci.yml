@@ -94,12 +94,11 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const sha = context.sha.substring(0, 7);
             await github.rest.actions.createWorkflowDispatch({
               owner:       context.repo.owner,
               repo:        context.repo.repo,
               workflow_id: 'deploy-aks.yml',
               ref:         'main',
-              inputs: { environment: 'dev', image_tag: `sha-${sha}` }
+              inputs: { environment: 'dev', image_tag: 'latest' }
             });
-            core.info(`Triggered deploy-aks.yml for environment=dev, image_tag=sha-${sha}`);
+            core.info('Triggered deploy-aks.yml for environment=dev, image_tag=latest');
