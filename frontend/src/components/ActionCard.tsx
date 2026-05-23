@@ -244,12 +244,12 @@ export function ActionCard({
               Escalation Context
             </p>
             <div className="flex flex-wrap gap-1.5">
-              {action.action_payload.intent && (
+              {!!action.action_payload.intent && (
                 <span className="px-2 py-0.5 bg-purple-500/10 border border-purple-500/20 rounded-full text-purple-300 text-[10px]">
                   Intent: {String(action.action_payload.intent).replace(/_/g, " ")}
                 </span>
               )}
-              {action.action_payload.sentiment && (
+              {!!action.action_payload.sentiment && (
                 <span
                   className={clsx(
                     "px-2 py-0.5 border rounded-full text-[10px]",
