@@ -13,7 +13,7 @@
 #
 # Non-sensitive infrastructure coordinates are hardcoded in the env: block below.
 #
-# Secrets are NO LONGER managed here. They live in Azure Key Vault (kv-synapse)
+# Secrets are NO LONGER managed here. They live in Azure Key Vault (kv-synapse18683)
 # and are synced into the synapse-secrets K8s Secret by the CSI Secret Store
 # driver using Workload Identity. Ensure the following AKV secrets exist:
 #   ANTHROPIC-API-KEY         — Anthropic API key
