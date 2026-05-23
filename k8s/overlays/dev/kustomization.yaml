@@ -12,6 +12,7 @@ resources:
 #   kustomize edit set image synapse=<acr>.azurecr.io/synapse:sha-<commit>
 images:
   - name: synapse
+    newName: acrsynapse18683.azurecr.io/synapse
     newTag: dev-latest
 
 patches:
