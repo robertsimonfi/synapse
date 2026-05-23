@@ -7,18 +7,22 @@ name: Deploy to AKS
 # Prod is gated by the GitHub Environment "prod" — set required reviewers
 # under: Settings → Environments → prod → Required reviewers.
 #
-# Required GitHub secrets (all created by infra/azure-setup.sh):
-#   AZURE_CREDENTIALS         — service-principal JSON (--sdk-auth output)
-#   AZURE_RESOURCE_GROUP      — e.g. rg-telco-agent
-#   AKS_CLUSTER_NAME          — e.g. aks-telco-agent
-#   ACR_NAME                  — e.g. acrtelcoagent42
-#   ACR_LOGIN_SERVER          — e.g. acrtelcoagent42.azurecr.io
+# Required GitHub secrets:
+#   AZURE_CREDENTIALS  — service-principal JSON (--sdk-auth output)
+#   CLUSTER_NAME       — AKS cluster name (e.g. aks-synapse)
+#
+# Non-sensitive infrastructure coordinates are hardcoded in the env: block below.
 #
 # Secrets are NO LONGER managed here. They live in Azure Key Vault (kv-telco-agent)
 # and are synced into the telco-agent-secrets K8s Secret by the CSI Secret Store
 # driver using Workload Identity. Ensure the following AKV secrets exist:
 #   ANTHROPIC-API-KEY         — Anthropic API key
 #   TELCO-AGENT-API-KEYS      — comma-separated X-API-Key values (different per env)
+
+env:
+  ACR_NAME: acrtelcoagent18683
+  ACR_LOGIN_SERVER: acrtelcoagent18683.azurecr.io
+  RESOURCE_GROUP: rg-telco-agent
 
 on:
   workflow_dispatch:
@@ -55,27 +59,27 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           
           # 2. Log into Azure Container Registry
-          az acr login --name "${{ secrets.ACR_NAME }}"
+          az acr login --name "${{ env.ACR_NAME }}"
           
           # 3. Pull the image from GitHub
           docker pull ghcr.io/${{ github.repository }}:${{ inputs.image_tag }}
           
           # 4. Retag the image for Azure
-          docker tag ghcr.io/${{ github.repository }}:${{ inputs.image_tag }} ${{ secrets.ACR_LOGIN_SERVER }}/telco-agent:${{ inputs.image_tag }}
-          
+          docker tag ghcr.io/${{ github.repository }}:${{ inputs.image_tag }} ${{ env.ACR_LOGIN_SERVER }}/telco-agent:${{ inputs.image_tag }}
+
           # 5. Push the image into Azure
-          docker push ${{ secrets.ACR_LOGIN_SERVER }}/telco-agent:${{ inputs.image_tag }}
+          docker push ${{ env.ACR_LOGIN_SERVER }}/telco-agent:${{ inputs.image_tag }}
           
       - name: Get AKS credentials
         uses: azure/aks-set-context@v4
         with:
-          resource-group: ${{ secrets.AZURE_RESOURCE_GROUP }}
-          cluster-name:   ${{ secrets.AKS_CLUSTER_NAME }}
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name:   ${{ secrets.CLUSTER_NAME }}
 
       - name: Render manifests (pin image)
         env:
           NS:           telco-agent-${{ inputs.environment }}
-          IMAGE_REF:    ${{ secrets.ACR_LOGIN_SERVER }}/telco-agent:${{ inputs.image_tag }}
+          IMAGE_REF:    ${{ env.ACR_LOGIN_SERVER }}/telco-agent:${{ inputs.image_tag }}
           OVERLAY_DIR:  k8s/overlays/${{ inputs.environment }}
         run: |
           # Pin the deployed image to the exact tag we just imported.
