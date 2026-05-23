@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-# Full Workload Identity + AKV wiring for the Telco Agent.
+﻿#!/usr/bin/env bash
+# Full Workload Identity + AKV wiring for Synapse.
 #
 # Run from the repo root with your Anthropic key in the environment:
 #   set ANTHROPIC_API_KEY=sk-ant-...
@@ -9,15 +9,15 @@
 set -euo pipefail
 
 # ──── CONFIG ──────────────────────────────────────────────────────────────────
-RG="rg-telco-agent"
-KV="kv-telco-agent"
-AKS="aks-telco-agent"
+RG="rg-synapse"
+KV="kv-synapse18683"
+AKS="aks-synapse"
 LOCATION="westeurope"
-MI_DEV="mi-telco-agent-dev"
-MI_PROD="mi-telco-agent-prod"
-NS_DEV="telco-agent-dev"
-NS_PROD="telco-agent-prod"
-SA_NAME="telco-agent-workload"
+MI_DEV="mi-synapse-dev"
+MI_PROD="mi-synapse-prod"
+NS_DEV="synapse-dev"
+NS_PROD="synapse-prod"
+SA_NAME="synapse-workload"
 DEV_API_KEY="G_jdt1aom16o_bGSdV9MT6zCKPY47xzmff5guB_GJ5k"
 PROD_API_KEY="x0IwfTX5LKjk2Rmy8gRgJgqyd1eAniMB_MMi5PSC4e4"
 
@@ -68,9 +68,9 @@ echo ""
 echo "▶ Wiring federated identity credentials..."
 
 for env_name in dev prod; do
-  MI_NAME="mi-telco-agent-${env_name}"
-  CRED_NAME="telco-agent-${env_name}-aks"
-  NS="telco-agent-${env_name}"
+  MI_NAME="mi-synapse-${env_name}"
+  CRED_NAME="synapse-${env_name}-aks"
+  NS="synapse-${env_name}"
   az identity federated-credential delete \
     --name "$CRED_NAME" --identity-name "$MI_NAME" --resource-group "$RG" \
     --yes -o none 2>/dev/null || true
@@ -145,9 +145,9 @@ if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
 fi
 
 az keyvault secret set --vault-name "$KV" --name "ANTHROPIC-API-KEY"          --value "$ANTHROPIC_API_KEY" -o none
-az keyvault secret set --vault-name "$KV" --name "TELCO-AGENT-API-KEYS-DEV"   --value "$DEV_API_KEY"       -o none
-az keyvault secret set --vault-name "$KV" --name "TELCO-AGENT-API-KEYS-PROD"  --value "$PROD_API_KEY"      -o none
-echo "  ✓ ANTHROPIC-API-KEY, TELCO-AGENT-API-KEYS-DEV, TELCO-AGENT-API-KEYS-PROD"
+az keyvault secret set --vault-name "$KV" --name "SYNAPSE-API-KEYS-DEV"   --value "$DEV_API_KEY"       -o none
+az keyvault secret set --vault-name "$KV" --name "SYNAPSE-API-KEYS-PROD"  --value "$PROD_API_KEY"      -o none
+echo "  ✓ ANTHROPIC-API-KEY, SYNAPSE-API-KEYS-DEV, SYNAPSE-API-KEYS-PROD"
 
 # ── 7. Patch PLACEHOLDER values in overlay YAML files ─────────────────────────
 echo ""

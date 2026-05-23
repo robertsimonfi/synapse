@@ -1,4 +1,4 @@
-"""
+﻿"""
 Oracle High-Availability Pool — Phase 13 Circuit Breaker for Oracle.
 
 Manages two Oracle connection endpoints:
@@ -141,7 +141,7 @@ class OracleHAPool:
     def _connect(self, dsn: str):
         import oracledb  # noqa: PLC0415
         return oracledb.connect(
-            user=os.getenv("ORA_USER",     "telco_agent"),
+            user=os.getenv("ORA_USER",     "synapse"),
             password=os.getenv("ORA_PASSWORD", ""),
             dsn=dsn,
         )

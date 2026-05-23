@@ -1,4 +1,4 @@
-"""
+﻿"""
 Internal Critic — a fast pre-submission self-correction step.
 
 After the main agent loop produces a resolution, the Critic (Claude Haiku)
@@ -19,7 +19,7 @@ import anthropic
 
 
 BEST_PRACTICES = """\
-TELCO AGENT BEST PRACTICES
+SYNAPSE BEST PRACTICES
 ===========================
 1. PROPORTIONALITY: Credit/refund amounts must match the verified overcharge or service
    failure value — never exceed it.

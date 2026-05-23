@@ -1,4 +1,4 @@
-# Synapse — Phase 9 full local-dev stack.
+﻿# Synapse — Phase 9 full local-dev stack.
 #
 # Architecture:
 #   kafka           — Kafka 3.7 (KRaft mode, no ZooKeeper)
@@ -101,7 +101,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: telco-agent:local
+    image: synapse:local
     container_name: synapse-api
     ports:
       - "8000:8000"
@@ -147,7 +147,7 @@ services:
     restart: unless-stopped
 
   thinker:
-    image: telco-agent:local
+    image: synapse:local
     container_name: synapse-thinker
     command: ["python", "-m", "worker.thinker"]
     env_file:
@@ -172,7 +172,7 @@ services:
     restart: unless-stopped
 
   executor:
-    image: telco-agent:local
+    image: synapse:local
     container_name: synapse-executor
     command: ["python", "-m", "worker.executor"]
     environment:
@@ -188,7 +188,7 @@ services:
     restart: unless-stopped
 
   watchdog:
-    image: telco-agent:local
+    image: synapse:local
     container_name: synapse-watchdog
     command: ["python", "-m", "worker.watchdog"]
     environment:
@@ -207,7 +207,7 @@ services:
     restart: unless-stopped
 
   hydrator:
-    image: telco-agent:local
+    image: synapse:local
     container_name: synapse-hydrator
     command: ["python", "-m", "worker.hydrator"]
     environment:
@@ -231,7 +231,7 @@ services:
     restart: unless-stopped
 
   relay:
-    image: telco-agent:local
+    image: synapse:local
     container_name: synapse-relay
     command: ["python", "-m", "worker.relay"]
     environment:
@@ -248,7 +248,7 @@ services:
     restart: unless-stopped
 
   oracle_adapter:
-    image: telco-agent:local
+    image: synapse:local
     container_name: synapse-oracle-adapter
     command: ["python", "-m", "worker.oracle_adapter"]
     environment:
@@ -268,7 +268,7 @@ services:
     restart: unless-stopped
 
   prefetch:
-    image: telco-agent:local
+    image: synapse:local
     container_name: synapse-prefetch
     command: ["python", "-m", "worker.prefetch"]
     environment:
@@ -287,7 +287,7 @@ services:
     restart: unless-stopped
 
   canary:
-    image: telco-agent:local
+    image: synapse:local
     container_name: synapse-canary
     command: ["python", "-m", "worker.canary"]
     environment:
@@ -305,7 +305,7 @@ services:
     restart: unless-stopped
 
   sentiment:
-    image: telco-agent:local
+    image: synapse:local
     container_name: synapse-sentiment
     command: ["python", "-m", "worker.sentiment"]
     environment:
@@ -320,7 +320,7 @@ services:
     restart: unless-stopped
 
   prompt-optimizer:
-    image: telco-agent:local
+    image: synapse:local
     container_name: synapse-prompt-optimizer
     command: ["python", "-m", "worker.prompt_optimizer"]
     env_file:
@@ -342,7 +342,7 @@ services:
     restart: unless-stopped
 
   archiver:
-    image: telco-agent:local
+    image: synapse:local
     container_name: synapse-archiver
     command: ["python", "-m", "worker.archiver"]
     environment:
@@ -383,7 +383,7 @@ services:
   # ── Streamlit portal (fallback) ──────────────────────────────────────────────
 
   ui:
-    image: telco-agent:local
+    image: synapse:local
     container_name: synapse-ui
     command:
       - "streamlit"

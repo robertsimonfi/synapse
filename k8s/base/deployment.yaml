@@ -44,11 +44,11 @@ spec:
                 secretKeyRef:
                   name: synapse-secrets
                   key: ANTHROPIC_API_KEY
-            - name: TELCO_AGENT_API_KEYS
+            - name: SYNAPSE_API_KEYS
               valueFrom:
                 secretKeyRef:
                   name: synapse-secrets
-                  key: TELCO_AGENT_API_KEYS
+                  key: SYNAPSE_API_KEYS
           volumeMounts:
             - name: data
               mountPath: /data

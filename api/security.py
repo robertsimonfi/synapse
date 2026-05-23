@@ -1,4 +1,4 @@
-"""
+﻿"""
 API security for the Telco Fallout Agent.
 
 Phase 1-14: X-API-Key header authentication (retained for backward compat).
@@ -20,7 +20,7 @@ Rate limiting:
   WebSocket connections pass token as ?token=<JWT> query param.
 
 Environment variables:
-  TELCO_AGENT_API_KEYS          — comma-separated static API keys (legacy)
+  SYNAPSE_API_KEYS          — comma-separated static API keys (legacy)
   JWT_SECRET_KEY                — HS256 signing secret (required in prod)
   JWT_ALGORITHM                 — default "HS256"
   ACCESS_TOKEN_EXPIRE_MINUTES   — default 60
@@ -52,13 +52,13 @@ logger = logging.getLogger(__name__)
 # ── Legacy API-key auth (Phase 1-14) ──────────────────────────────────────────
 
 API_KEY_HEADER  = "X-API-Key"
-_RAW            = os.getenv("TELCO_AGENT_API_KEYS", "")
+_RAW            = os.getenv("SYNAPSE_API_KEYS", "")
 ALLOWED_KEYS: set[str] = {k.strip() for k in _RAW.split(",") if k.strip()}
 _api_key_scheme = APIKeyHeader(name=API_KEY_HEADER, auto_error=False)
 
 
 _DEV_FALLBACK_KEY = os.getenv("DEV_API_KEY", "synapse-dev-key")
-# When ENV=development and TELCO_AGENT_API_KEYS is not set, accept the
+# When ENV=development and SYNAPSE_API_KEYS is not set, accept the
 # DEV_API_KEY so local curl testing works without editing the .env.
 _IS_DEVELOPMENT = os.getenv("ENV", "development").lower() in ("development", "dev", "local")
 
@@ -66,7 +66,7 @@ _IS_DEVELOPMENT = os.getenv("ENV", "development").lower() in ("development", "de
 def require_api_key(api_key: str | None = Security(_api_key_scheme)) -> str:
     """FastAPI dependency — X-API-Key header (machine-to-machine).
 
-    In development (ENV=development, default) an empty TELCO_AGENT_API_KEYS
+    In development (ENV=development, default) an empty SYNAPSE_API_KEYS
     is not fatal: the DEV_API_KEY env var (default 'synapse-dev-key') is
     accepted instead so local curl tests work without a full .env setup.
 
@@ -77,12 +77,12 @@ def require_api_key(api_key: str | None = Security(_api_key_scheme)) -> str:
     effective_keys = ALLOWED_KEYS or ({_DEV_FALLBACK_KEY} if _IS_DEVELOPMENT else set())
 
     if not effective_keys:
-        logger.warning("api-key: rejected — TELCO_AGENT_API_KEYS not configured and ENV != development")
+        logger.warning("api-key: rejected — SYNAPSE_API_KEYS not configured and ENV != development")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
                 "API key auth is not configured. "
-                "Set TELCO_AGENT_API_KEYS in the environment."
+                "Set SYNAPSE_API_KEYS in the environment."
             ),
         )
     if api_key is None:

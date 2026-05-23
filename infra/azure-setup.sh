@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-# One-shot Azure infrastructure setup for the Telco Agent.
+﻿#!/usr/bin/env bash
+# One-shot Azure infrastructure setup for Synapse.
 # Creates: resource group, ACR, AKS cluster (with ACR pull access),
 # NGINX ingress controller, and a service principal for GitHub Actions deploys.
 #
@@ -12,12 +12,12 @@ set -euo pipefail
 
 # ──── EDIT THESE BEFORE FIRST RUN ─────────────────────────────────────────────
 LOCATION="${LOCATION:-westeurope}"
-RG="${RG:-rg-telco-agent}"
-ACR_NAME="${ACR_NAME:-acrtelcoagent18683}"      # <-- Hardcoded to your existing ACR
-AKS_NAME="${AKS_NAME:-aks-telco-agent}"
+RG="${RG:-rg-synapse}"
+ACR_NAME="${ACR_NAME:-acrsynapse18683}"      
+AKS_NAME="${AKS_NAME:-aks-synapse}"
 NODE_SIZE="${NODE_SIZE:-Standard_B2s_v2}"       # <-- Updated to v2 VM size
 NODE_COUNT="${NODE_COUNT:-2}"
-SP_NAME="${SP_NAME:-sp-telco-agent-github}"
+SP_NAME="${SP_NAME:-sp-synapse-github}"
 # ──────────────────────────────────────────────────────────────────────────────
 
 echo "Using:"
