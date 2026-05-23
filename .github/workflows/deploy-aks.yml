@@ -1,23 +1,12 @@
-﻿name: Deploy to AKS
+name: Deploy to AKS
 
 # Triggered:
-#   - Automatically by ci.yml after a successful build (environment=dev)
-#   - Manually for prod (or any env) via workflow_dispatch
-#
-# Prod is gated by the GitHub Environment "prod" — set required reviewers
-# under: Settings → Environments → prod → Required reviewers.
+#   - Automatically on push to main/develop → deploys latest to dev
+#   - Manually via workflow_dispatch → any env + tag (prod requires approval)
 #
 # Required GitHub secrets:
-#   AZURE_CREDENTIALS  — service-principal JSON (--sdk-auth output)
-#   CLUSTER_NAME       — AKS cluster name (e.g. aks-synapse)
-#
-# Non-sensitive infrastructure coordinates are hardcoded in the env: block below.
-#
-# Secrets are NO LONGER managed here. They live in Azure Key Vault (kv-synapse18683)
-# and are synced into the synapse-secrets K8s Secret by the CSI Secret Store
-# driver using Workload Identity. Ensure the following AKV secrets exist:
-#   ANTHROPIC-API-KEY         — Anthropic API key
-#   TELCO-AGENT-API-KEYS  — comma-separated X-API-Key values (different per env)
+#   AZURE_CREDENTIALS  — service-principal JSON
+#   CLUSTER_NAME       — AKS cluster name (aks-synapse)
 
 env:
   ACR_NAME: acrsynapse18683
@@ -25,6 +14,8 @@ env:
   RESOURCE_GROUP: rg-synapse
 
 on:
+  push:
+    branches: [main, develop]
   workflow_dispatch:
     inputs:
       environment:
@@ -34,15 +25,19 @@ on:
         options: [dev, prod]
         default: dev
       image_tag:
-        description: "Image tag from GHCR (e.g. sha-abc1234, latest)"
+        description: "Image tag to build and deploy"
         required: true
         default: latest
 
 jobs:
   deploy:
-    name: Deploy ${{ inputs.image_tag }} to ${{ inputs.environment }}
+    name: Deploy ${{ inputs.image_tag || 'latest' }} to ${{ inputs.environment || 'dev' }}
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}    # ← prod environment requires manual approval
+    # On push: targets dev (no approval needed). On manual: targets selected env.
+    environment: ${{ inputs.environment || 'dev' }}
+    env:
+      DEPLOY_ENV: ${{ inputs.environment || 'dev' }}
+      IMAGE_TAG:  ${{ inputs.image_tag  || 'latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -51,25 +46,12 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # Server-side copy from GHCR → ACR. No rebuild, no local pull.
-      # `--force` lets us re-import if a tag already exists.
-      - name: Import image GHCR → ACR (Docker natively)
+      - name: Build & push image to ACR
         run: |
-          # 1. Log into GitHub Container Registry
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          
-          # 2. Log into Azure Container Registry
           az acr login --name "${{ env.ACR_NAME }}"
-          
-          # 3. Pull the image from GitHub
-          docker pull ghcr.io/${{ github.repository }}:${{ inputs.image_tag }}
-          
-          # 4. Retag the image for Azure
-          docker tag ghcr.io/${{ github.repository }}:${{ inputs.image_tag }} ${{ env.ACR_LOGIN_SERVER }}/synapse:${{ inputs.image_tag }}
+          docker build -t "${{ env.ACR_LOGIN_SERVER }}/synapse:${{ env.IMAGE_TAG }}" .
+          docker push "${{ env.ACR_LOGIN_SERVER }}/synapse:${{ env.IMAGE_TAG }}"
 
-          # 5. Push the image into Azure
-          docker push ${{ env.ACR_LOGIN_SERVER }}/synapse:${{ inputs.image_tag }}
-          
       - name: Get AKS credentials
         uses: azure/aks-set-context@v4
         with:
@@ -77,40 +59,25 @@ jobs:
           cluster-name:   ${{ secrets.CLUSTER_NAME }}
 
       - name: Render manifests (pin image)
-        env:
-          NS:           synapse-${{ inputs.environment }}
-          IMAGE_REF:    ${{ env.ACR_LOGIN_SERVER }}/synapse:${{ inputs.image_tag }}
-          OVERLAY_DIR:  k8s/overlays/${{ inputs.environment }}
         run: |
-          # Pin the deployed image to the exact tag we just imported.
-          (cd "${OVERLAY_DIR}" && \
-            kustomize edit set image "synapse=${IMAGE_REF}")
-
-          # Render & show what will be applied (handy in run logs).
+          OVERLAY_DIR="k8s/overlays/${{ env.DEPLOY_ENV }}"
+          IMAGE_REF="${{ env.ACR_LOGIN_SERVER }}/synapse:${{ env.IMAGE_TAG }}"
+          (cd "${OVERLAY_DIR}" && kustomize edit set image "synapse=${IMAGE_REF}")
           kubectl kustomize "${OVERLAY_DIR}" > /tmp/manifests.yaml
           echo "── Rendered manifests ──"
           grep -E '^(apiVersion|kind|  name:|  namespace:|  - host:|        image:)' /tmp/manifests.yaml || true
-
-      - name: Ensure namespace exists
-        env:
-          NS: synapse-${{ inputs.environment }}
-        run: |
-          kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
 
       - name: Apply manifests
         run: kubectl apply -f /tmp/manifests.yaml
 
       - name: Wait for rollout
-        env:
-          NS: synapse-${{ inputs.environment }}
         run: |
-          kubectl -n "${NS}" rollout status deployment/synapse --timeout=5m
+          kubectl -n "synapse-${{ env.DEPLOY_ENV }}" \
+            rollout status deployment/synapse --timeout=5m
 
       - name: Show endpoint
-        env:
-          ENV: ${{ inputs.environment }}
         run: |
-          URL="https://${ENV}.42-ds.net"
+          URL="https://${{ env.DEPLOY_ENV }}.42-ds.net"
           echo ""
           echo "✓ Deployed to: ${URL}"
           echo "  Health:      ${URL}/health"
