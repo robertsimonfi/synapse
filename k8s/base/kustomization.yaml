@@ -9,12 +9,19 @@ resources:
   - deployment.yaml
   - service.yaml
   - ingress.yaml
+  - frontend-deployment.yaml
+  - frontend-service.yaml
+  - frontend-ingress.yaml
 
 # Both overlays override the image fully (registry + tag) at deploy time:
-#   kustomize edit set image synapse=<acr>.azurecr.io/synapse:sha-<commit>
+#   kustomize edit set image synapse=<acr>.azurecr.io/synapse:<tag>
+#   kustomize edit set image synapse-noc=<acr>.azurecr.io/synapse-noc:<tag>
 images:
   - name: synapse
     newTag: placeholder
+  - name: synapse-noc
+    newName: acrsynapse18683.azurecr.io/synapse-noc
+    newTag: latest
 
 # Common labels stamped on every resource.
 labels:

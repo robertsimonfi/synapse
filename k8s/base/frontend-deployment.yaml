@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: synapse-noc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: synapse-noc
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: synapse-noc
+    spec:
+      # nginx master process requires root to bind port 80.
+      containers:
+        - name: frontend
+          image: synapse-noc    # replaced by overlay/CI
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 80
+          env:
+            # Points nginx proxy at the core API service within the same namespace.
+            - name: CORE_HOST
+              value: "synapse"
+            - name: CORE_PORT
+              value: "80"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"

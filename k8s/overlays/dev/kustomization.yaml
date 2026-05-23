@@ -28,6 +28,10 @@ patches:
     target:
       kind: Ingress
       name: synapse
+  - path: frontend-ingress-patch.yaml
+    target:
+      kind: Ingress
+      name: synapse-noc
 
 labels:
   - includeSelectors: false

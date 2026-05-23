@@ -44,11 +44,21 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Build & push image to ACR
+      - name: Log in to ACR
+        run: az acr login --name "${{ env.ACR_NAME }}"
+
+      - name: Build & push core image
         run: |
-          az acr login --name "${{ env.ACR_NAME }}"
           docker build -t "${{ env.ACR_LOGIN_SERVER }}/synapse:${{ env.IMAGE_TAG }}" .
           docker push "${{ env.ACR_LOGIN_SERVER }}/synapse:${{ env.IMAGE_TAG }}"
+
+      - name: Build & push NOC dashboard image
+        run: |
+          docker build \
+            -f frontend/Dockerfile \
+            -t "${{ env.ACR_LOGIN_SERVER }}/synapse-noc:${{ env.IMAGE_TAG }}" \
+            ./frontend
+          docker push "${{ env.ACR_LOGIN_SERVER }}/synapse-noc:${{ env.IMAGE_TAG }}"
 
       - name: Get AKS credentials
         uses: azure/aks-set-context@v4
@@ -60,7 +70,10 @@ jobs:
         run: |
           OVERLAY_DIR="k8s/overlays/${{ env.DEPLOY_ENV }}"
           IMAGE_REF="${{ env.ACR_LOGIN_SERVER }}/synapse:${{ env.IMAGE_TAG }}"
-          (cd "${OVERLAY_DIR}" && kustomize edit set image "synapse=${IMAGE_REF}")
+          NOC_REF="${{ env.ACR_LOGIN_SERVER }}/synapse-noc:${{ env.IMAGE_TAG }}"
+          (cd "${OVERLAY_DIR}" && \
+            kustomize edit set image "synapse=${IMAGE_REF}" && \
+            kustomize edit set image "synapse-noc=${NOC_REF}")
           kubectl kustomize "${OVERLAY_DIR}" > /tmp/manifests.yaml
           echo "── Rendered manifests ──"
           grep -E '^(apiVersion|kind|  name:|  namespace:|  - host:|        image:)' /tmp/manifests.yaml || true
