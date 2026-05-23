@@ -54,5 +54,8 @@ data/
 frontend/node_modules/ 
 frontend/package-lock.json 
  
-# Claude Code workspace 
+# Claude Code workspace
 .claude/
+
+# Local planning/design documents
+*.md

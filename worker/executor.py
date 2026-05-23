@@ -365,6 +365,78 @@ async def _post_write_verify(action: ActionProposal) -> tuple[bool, str]:
     return True, "ok"
 
 
+# ── Phase 5.1: Post-execution hydration callback ──────────────────────────────
+
+async def _notify_gateway_executed(action: ActionProposal, result: dict) -> None:
+    """Push the executed result down to the customer chat UI.
+
+    Fires once an action reaches EXECUTED. The chatbot gateway forwards this as
+    a second ``TASK_COMPLETED`` event — this one carrying a ``payload`` — so the
+    chat window can replace its "Specialist Reviewing…" / approval card with the
+    real outcome data instead of leaving the customer on a stale message.
+
+    No-op unless the action originated from the chatbot gateway
+    (``chatbot_customer_id`` is set) and ``CHATBOT_GATEWAY_ENABLED=true``.
+    Network failures are swallowed — hydration must never block the pipeline.
+    """
+    chatbot_cid = (
+        action.chatbot_customer_id
+        or (action.action_payload or {}).get("chatbot_customer_id")
+    )
+    if not chatbot_cid:
+        return  # NOC-originated action with no live customer chat session
+
+    if os.getenv("CHATBOT_GATEWAY_ENABLED", "false").lower() != "true":
+        logger.info(
+            "[MOCK-CHATBOT] executed action=%s session=%s — hydration callback "
+            "skipped (set CHATBOT_GATEWAY_ENABLED=true to enable)",
+            action.id, chatbot_cid,
+        )
+        return
+
+    chatbot_url = os.getenv("CHATBOT_GATEWAY_URL", "http://synapse-chatbot-gateway:8001")
+    label   = action.action_type.replace("_", " ").title()
+    summary = f"Your {label} request has been completed."
+    # Surface a human-readable reference when the handler returned one.
+    for _ref_key in ("ticket_id", "subscription_id", "order_id", "account", "msisdn"):
+        if result.get(_ref_key):
+            summary += f" Reference: {result[_ref_key]}."
+            break
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.post(
+                f"{chatbot_url}/internal/action-update",
+                json={
+                    "customer_id":    chatbot_cid,
+                    "action_id":      action.id,
+                    # correlation_id is the operational trace anchor — it is
+                    # carried on every customer-facing frame for audit tracing.
+                    "correlation_id": action.correlation_id,
+                    "status":         "EXECUTED",
+                    "summary":        summary,
+                    # `payload` is the discriminator the chat UI uses to tell a
+                    # hydration event apart from the earlier approval event.
+                    "payload": {
+                        "result":      result,
+                        "action_type": action.action_type,
+                    },
+                },
+                headers={"X-Internal-Service-Key": os.getenv("INTERNAL_SERVICE_KEY", "")},
+            )
+            resp.raise_for_status()
+        logger.info(
+            "[E2E-DIAGNOSTIC] Hydration callback delivered. status=%s session=%s action=%s",
+            resp.status_code, chatbot_cid, action.id,
+        )
+    except Exception as exc:
+        logger.error(
+            "[E2E-DIAGNOSTIC] Hydration callback drop: %s session=%s action=%s",
+            exc, chatbot_cid, action.id,
+        )
+
+
 # ── Execution logic ────────────────────────────────────────────────────────────
 
 async def _execute_action(action: ActionProposal) -> None:
@@ -484,6 +556,10 @@ async def _execute_action(action: ActionProposal) -> None:
                     "HITL_APPROVED_EXECUTION action=%s type=%s latency=%.2fs",
                     action.id, action.action_type, latency,
                 )
+
+                # Phase 5.1 — hydrate the customer chat UI with the executed
+                # result so the chatbot exits its "Specialist Reviewing…" state.
+                await _notify_gateway_executed(action, result)
 
                 # Phase 7 — post-action engagement dispatch (non-blocking)
                 try:

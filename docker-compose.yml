@@ -124,6 +124,10 @@ services:
       # The gateway service name on synapse-net is 'gateway' (port 8001).
       CHATBOT_GATEWAY_ENABLED: "true"
       CHATBOT_GATEWAY_URL: "http://synapse-chatbot-gateway:8001"
+      # Machine-to-machine auth for the callback above. The gateway rejects the
+      # request with HTTP 401 unless this matches its own INTERNAL_SERVICE_KEY,
+      # which silently strands the customer UI on "Specialist Reviewing…".
+      INTERNAL_SERVICE_KEY: ${INTERNAL_SERVICE_KEY:-dev-local-key-synapse}
     volumes:
       - telco_data:/data
     networks:

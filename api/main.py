@@ -219,6 +219,10 @@ class ResolveRequest(BaseModel):
     # the routing decision without re-deriving from error_code alone.
     intent_label:          Optional[str]   = Field(None,  description="Human-readable intent from chatbot classifier")
     sentiment_label:       Optional[str]   = Field(None,  description="ANGRY | NEGATIVE | NEUTRAL | POSITIVE")
+    # Trace anchor minted upstream by the chatbot gateway. When present, Core
+    # adopts it as the correlation_id so one id spans gateway → Core → executor
+    # → customer WebSocket, satisfying end-to-end audit traceability.
+    trace_id:              Optional[str]   = Field(None,  description="Upstream trace anchor; reused as correlation_id when provided")
 
     @field_validator("opco_id")
     @classmethod
@@ -512,7 +516,10 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
             detail="Provide at least one of: order_id, order_number, or error_code",
         )
 
-    correlation_id = str(uuid.uuid4())
+    # Reuse the gateway's trace anchor when supplied so the entire distributed
+    # flow shares one correlation_id; otherwise mint a fresh one (NOC-originated
+    # submissions and direct API callers do not provide a trace_id).
+    correlation_id = request.trace_id or str(uuid.uuid4())
 
     # Resolve customer_id: prefer the integer field; fall back to the chatbot
     # session string when the gateway sends a non-numeric ID (e.g. "demo-customer-1")
@@ -715,9 +722,10 @@ async def resolve_fallout(request: ResolveRequest, _: str = Security(require_api
                             _cb_resp = await _cb_client.post(
                                 f"{_cb_url}/internal/action-update",
                                 json={
-                                    "customer_id": _cb_cid,
-                                    "action_id":   proposal.id,
-                                    "status":      "COMPLETED",
+                                    "customer_id":    _cb_cid,
+                                    "action_id":      proposal.id,
+                                    "correlation_id": correlation_id,
+                                    "status":         "COMPLETED",
                                     "summary": (
                                         f"Your {_cb_label} request has been processed automatically."
                                     ),
@@ -1464,10 +1472,11 @@ async def approve_action(
                 _cb_resp = await _client.post(
                     f"{chatbot_url}/internal/action-update",
                     json={
-                        "customer_id": chatbot_cid,
-                        "action_id":   action_id,
-                        "status":      "APPROVED",
-                        "summary":     _cb_summary,
+                        "customer_id":    chatbot_cid,
+                        "action_id":      action_id,
+                        "correlation_id": action.correlation_id,
+                        "status":         "APPROVED",
+                        "summary":        _cb_summary,
                     },
                     headers={"X-Internal-Service-Key": os.getenv("INTERNAL_SERVICE_KEY", "")},
                 )
@@ -1579,9 +1588,10 @@ async def force_approve_action(
                 _cb_resp = await _client.post(
                     f"{chatbot_url}/internal/action-update",
                     json={
-                        "customer_id": chatbot_cid,
-                        "action_id":   action_id,
-                        "status":      "FORCE_APPROVED",
+                        "customer_id":    chatbot_cid,
+                        "action_id":      action_id,
+                        "correlation_id": action.correlation_id,
+                        "status":         "FORCE_APPROVED",
                         "summary": (
                             f"Your {action_label} request has been escalated and approved "
                             "by our specialist team."
@@ -1659,9 +1669,10 @@ async def reject_action(
                 _cb_resp = await _client.post(
                     f"{chatbot_url}/internal/action-update",
                     json={
-                        "customer_id": chatbot_cid,
-                        "action_id":   action_id,
-                        "status":      "REJECTED",
+                        "customer_id":    chatbot_cid,
+                        "action_id":      action_id,
+                        "correlation_id": action.correlation_id,
+                        "status":         "REJECTED",
                         "summary": (
                             "Your request could not be actioned at this time. "
                             "A specialist has noted your case — please contact us "
