@@ -1,7 +1,7 @@
-apiVersion: v1
+﻿apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: telco-agent-config
+  name: synapse-config
 data:
   # Defaults for both envs. Overlay-specific values (e.g. CLAUDE_MODEL,
   # log levels) can be overridden via overlays/{dev,prod}/configmap-patch.yaml.

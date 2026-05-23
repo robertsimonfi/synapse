@@ -1,9 +1,9 @@
-# Smaller resource footprint for dev — fits comfortably on a single
+﻿# Smaller resource footprint for dev — fits comfortably on a single
 # Standard_B2s node (2 vCPU / 4 GiB) shared with prod.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: telco-agent
+  name: synapse
 spec:
   template:
     spec:

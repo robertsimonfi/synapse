@@ -1,7 +1,7 @@
-apiVersion: kustomize.config.k8s.io/v1beta1
+﻿apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: telco-agent-dev
+namespace: synapse-dev
 
 resources:
   - ../../base
@@ -9,27 +9,27 @@ resources:
   - secret-provider.yaml
 
 # Image is set at deploy time by the workflow:
-#   kustomize edit set image telco-agent=<acr>.azurecr.io/telco-agent:sha-<commit>
+#   kustomize edit set image synapse=<acr>.azurecr.io/synapse:sha-<commit>
 images:
-  - name: telco-agent
+  - name: synapse
     newTag: dev-latest
 
 patches:
   - path: deployment-patch.yaml
     target:
       kind: Deployment
-      name: telco-agent
+      name: synapse
   - path: pvc-patch.yaml
     target:
       kind: PersistentVolumeClaim
-      name: telco-agent-data
+      name: synapse-data
   - path: ingress-patch.yaml
     target:
       kind: Ingress
-      name: telco-agent
+      name: synapse
 
 labels:
   - includeSelectors: false
     pairs:
-      app.kubernetes.io/instance: telco-agent-dev
+      app.kubernetes.io/instance: synapse-dev
       env: dev

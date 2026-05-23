@@ -1,4 +1,4 @@
-name: Deploy Synapse Core to Azure AKS Dev
+﻿name: Deploy Synapse Core to Azure AKS Dev
 
 on:
   push:
@@ -8,7 +8,7 @@ env:
   ACR_NAME: acrsynapse18683
   RESOURCE_GROUP: rg-synapse
   CLUSTER_NAME: aks-synapse
-  NAMESPACE: telco-agent-dev
+  NAMESPACE: synapse-dev
 
 jobs:
   build-and-deploy:
@@ -26,8 +26,8 @@ jobs:
       - name: Build and push image to ACR
         run: |
           az acr login --name $ACR_NAME
-          docker build -t acrsynapse18683.azurecr.io/telco-agent:${{ github.sha }} .
-          docker push acrsynapse18683.azurecr.io/telco-agent:${{ github.sha }}
+          docker build -t acrsynapse18683.azurecr.io/synapse:${{ github.sha }} .
+          docker push acrsynapse18683.azurecr.io/synapse:${{ github.sha }}
 
       - name: Set AKS cluster context
         uses: azure/aks-set-context@v4
@@ -41,7 +41,7 @@ jobs:
 
       - name: Roll out updated image
         run: |
-          kubectl set image deployment/telco-agent \
-            api=acrsynapse18683.azurecr.io/telco-agent:${{ github.sha }} \
+          kubectl set image deployment/synapse \
+            api=acrsynapse18683.azurecr.io/synapse:${{ github.sha }} \
             -n $NAMESPACE
-          kubectl rollout status deployment/telco-agent -n $NAMESPACE --timeout=120s
+          kubectl rollout status deployment/synapse -n $NAMESPACE --timeout=120s

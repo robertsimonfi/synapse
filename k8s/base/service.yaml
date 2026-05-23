@@ -1,11 +1,11 @@
-apiVersion: v1
+﻿apiVersion: v1
 kind: Service
 metadata:
-  name: telco-agent
+  name: synapse
 spec:
   type: ClusterIP            # Exposed externally via the Ingress, not directly.
   selector:
-    app.kubernetes.io/name: telco-agent
+    app.kubernetes.io/name: synapse
   ports:
     - name: http
       port: 80

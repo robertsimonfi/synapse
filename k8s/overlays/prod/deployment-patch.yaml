@@ -1,8 +1,8 @@
-# Roomier resource footprint for prod.
+﻿# Roomier resource footprint for prod.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: telco-agent
+  name: synapse
 spec:
   template:
     spec:

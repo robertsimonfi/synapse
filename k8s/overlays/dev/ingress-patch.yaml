@@ -1,11 +1,11 @@
-# Real domain + auto-HTTPS via cert-manager + Let's Encrypt.
+﻿# Real domain + auto-HTTPS via cert-manager + Let's Encrypt.
 # - cert-manager.io/cluster-issuer triggers cert-manager to fetch a cert
 #   for the listed hosts via the HTTP-01 challenge through this ingress.
 # - ssl-redirect=true tells NGINX to 308 plain HTTP → HTTPS.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: telco-agent
+  name: synapse
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
@@ -13,7 +13,7 @@ spec:
   tls:
     - hosts:
         - dev.42-ds.net
-      secretName: telco-agent-dev-tls
+      secretName: synapse-dev-tls
   rules:
     - host: dev.42-ds.net
       http:
@@ -22,6 +22,6 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: telco-agent
+                name: synapse
                 port:
                   number: 80

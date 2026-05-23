@@ -1,4 +1,4 @@
-name: Deploy to AKS
+﻿name: Deploy to AKS
 
 # Triggered:
 #   - Automatically by ci.yml after a successful build (environment=dev)
@@ -14,10 +14,10 @@ name: Deploy to AKS
 # Non-sensitive infrastructure coordinates are hardcoded in the env: block below.
 #
 # Secrets are NO LONGER managed here. They live in Azure Key Vault (kv-telco-agent)
-# and are synced into the telco-agent-secrets K8s Secret by the CSI Secret Store
+# and are synced into the synapse-secrets K8s Secret by the CSI Secret Store
 # driver using Workload Identity. Ensure the following AKV secrets exist:
 #   ANTHROPIC-API-KEY         — Anthropic API key
-#   TELCO-AGENT-API-KEYS      — comma-separated X-API-Key values (different per env)
+#   TELCO-AGENT-API-KEYS  — comma-separated X-API-Key values (different per env)
 
 env:
   ACR_NAME: acrsynapse18683
@@ -65,10 +65,10 @@ jobs:
           docker pull ghcr.io/${{ github.repository }}:${{ inputs.image_tag }}
           
           # 4. Retag the image for Azure
-          docker tag ghcr.io/${{ github.repository }}:${{ inputs.image_tag }} ${{ env.ACR_LOGIN_SERVER }}/telco-agent:${{ inputs.image_tag }}
+          docker tag ghcr.io/${{ github.repository }}:${{ inputs.image_tag }} ${{ env.ACR_LOGIN_SERVER }}/synapse:${{ inputs.image_tag }}
 
           # 5. Push the image into Azure
-          docker push ${{ env.ACR_LOGIN_SERVER }}/telco-agent:${{ inputs.image_tag }}
+          docker push ${{ env.ACR_LOGIN_SERVER }}/synapse:${{ inputs.image_tag }}
           
       - name: Get AKS credentials
         uses: azure/aks-set-context@v4
@@ -78,13 +78,13 @@ jobs:
 
       - name: Render manifests (pin image)
         env:
-          NS:           telco-agent-${{ inputs.environment }}
-          IMAGE_REF:    ${{ env.ACR_LOGIN_SERVER }}/telco-agent:${{ inputs.image_tag }}
+          NS:           synapse-${{ inputs.environment }}
+          IMAGE_REF:    ${{ env.ACR_LOGIN_SERVER }}/synapse:${{ inputs.image_tag }}
           OVERLAY_DIR:  k8s/overlays/${{ inputs.environment }}
         run: |
           # Pin the deployed image to the exact tag we just imported.
           (cd "${OVERLAY_DIR}" && \
-            kustomize edit set image "telco-agent=${IMAGE_REF}")
+            kustomize edit set image "synapse=${IMAGE_REF}")
 
           # Render & show what will be applied (handy in run logs).
           kubectl kustomize "${OVERLAY_DIR}" > /tmp/manifests.yaml
@@ -93,7 +93,7 @@ jobs:
 
       - name: Ensure namespace exists
         env:
-          NS: telco-agent-${{ inputs.environment }}
+          NS: synapse-${{ inputs.environment }}
         run: |
           kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
 
@@ -102,9 +102,9 @@ jobs:
 
       - name: Wait for rollout
         env:
-          NS: telco-agent-${{ inputs.environment }}
+          NS: synapse-${{ inputs.environment }}
         run: |
-          kubectl -n "${NS}" rollout status deployment/telco-agent --timeout=5m
+          kubectl -n "${NS}" rollout status deployment/synapse --timeout=5m
 
       - name: Show endpoint
         env:

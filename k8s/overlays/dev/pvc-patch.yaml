@@ -1,7 +1,7 @@
-apiVersion: v1
+﻿apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: telco-agent-data
+  name: synapse-data
 spec:
   resources:
     requests:

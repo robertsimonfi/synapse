@@ -1,7 +1,7 @@
-apiVersion: networking.k8s.io/v1
+﻿apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: telco-agent
+  name: synapse
   annotations:
     nginx.ingress.kubernetes.io/proxy-body-size: "2m"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
@@ -19,6 +19,6 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: telco-agent
+                name: synapse
                 port:
                   number: 80
