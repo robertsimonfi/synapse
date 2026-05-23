@@ -49,6 +49,11 @@ spec:
                 secretKeyRef:
                   name: synapse-secrets
                   key: SYNAPSE_API_KEYS
+            - name: CHATBOT_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: synapse-secrets
+                  key: CHATBOT_JWT_SECRET
           volumeMounts:
             - name: data
               mountPath: /data
