@@ -35,6 +35,10 @@ jobs:
           resource-group: ${{ env.RESOURCE_GROUP }}
           cluster-name: ${{ env.CLUSTER_NAME }}
 
+      - name: Ensure namespace exists
+        run: |
+          kubectl get ns $NAMESPACE >/dev/null 2>&1 || kubectl create ns $NAMESPACE
+
       - name: Roll out updated image
         run: |
           kubectl set image deployment/telco-agent \
