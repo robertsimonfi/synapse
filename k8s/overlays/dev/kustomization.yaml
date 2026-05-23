@@ -13,7 +13,7 @@ resources:
 images:
   - name: synapse
     newName: acrsynapse18683.azurecr.io/synapse
-    newTag: dev-latest
+    newTag: sha-ea1d0cb  # overwritten by CI on each deploy
 
 patches:
   - path: deployment-patch.yaml
