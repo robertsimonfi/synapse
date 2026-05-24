@@ -81,6 +81,26 @@ jobs:
       - name: Apply manifests
         run: kubectl apply -f /tmp/manifests.yaml
 
+      # Sync AKV → k8s Secret before rollout so the pod always starts with
+      # the correct env vars. The Secrets Store CSI driver has a race condition
+      # with Recreate deployments (old pod dies, new pod's env vars are resolved
+      # from the k8s Secret before the CSI driver finishes writing fresh AKV
+      # values). This step removes that dependency entirely.
+      - name: Sync AKV secrets → k8s Secret
+        run: |
+          NS="synapse-${{ env.DEPLOY_ENV }}"
+          AKV="kv-synapse18683"
+
+          SYNAPSE_API_KEYS=$(az keyvault secret show \
+            --vault-name "${AKV}" \
+            --name "SYNAPSE-API-KEYS-DEV" \
+            --query value -o tsv)
+
+          kubectl patch secret synapse-secrets -n "${NS}" --type='json' -p="[
+            {\"op\":\"replace\",\"path\":\"/data/SYNAPSE_API_KEYS\",
+             \"value\":\"$(echo -n "${SYNAPSE_API_KEYS}" | base64 -w 0)\"}
+          ]" 2>/dev/null || echo "Secret not yet initialised — CSI driver will create it on first mount"
+
       - name: Force rollout (picks up new :latest image)
         run: |
           kubectl -n "synapse-${{ env.DEPLOY_ENV }}" rollout restart deployment/synapse
