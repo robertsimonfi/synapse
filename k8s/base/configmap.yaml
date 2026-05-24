@@ -14,3 +14,7 @@ data:
   CLAUDE_MODEL: "claude-opus-4-6"
   API_HOST: "0.0.0.0"
   API_PORT: "8000"
+  # Chatbot gateway callbacks — enables HITL round-trip and live WebSocket updates.
+  # Cross-namespace DNS: <service>.<namespace>.svc.cluster.local
+  CHATBOT_GATEWAY_ENABLED: "true"
+  CHATBOT_GATEWAY_URL: "http://synapse-chatbot-gateway.synapse-chatbot-dev.svc.cluster.local:8001"
