@@ -81,6 +81,11 @@ jobs:
       - name: Apply manifests
         run: kubectl apply -f /tmp/manifests.yaml
 
+      - name: Force rollout (picks up new :latest image)
+        run: |
+          kubectl -n "synapse-${{ env.DEPLOY_ENV }}" rollout restart deployment/synapse
+          kubectl -n "synapse-${{ env.DEPLOY_ENV }}" rollout restart deployment/synapse-noc || true
+
       - name: Wait for rollout
         run: |
           kubectl -n "synapse-${{ env.DEPLOY_ENV }}" \
