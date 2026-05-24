@@ -1284,7 +1284,7 @@ async def get_customer_context(
 # ── HITL action management endpoints ──────────────────────────────────────────
 
 @app.get("/actions/depths", tags=["HITL"])
-async def get_queue_depths(_: str = Security(require_api_key)):
+async def get_queue_depths(_: Optional[OperatorInfo] = Depends(require_any_auth)):
     """Return the count of actions in each status (for dashboard metrics)."""
     _require_mongo()
     from db.mongo import get_queue_depths
@@ -1295,7 +1295,7 @@ async def get_queue_depths(_: str = Security(require_api_key)):
 async def list_actions_endpoint(
     status: Optional[str] = None,
     limit: int = 100,
-    _: str = Security(require_api_key),
+    _: Optional[OperatorInfo] = Depends(require_any_auth),
 ):
     """
     List action proposals. Filter by ?status=PENDING|APPROVED|REJECTED|EXECUTING|EXECUTED|FAILED|EXPIRED.
@@ -1316,7 +1316,7 @@ async def list_actions_endpoint(
 
 
 @app.get("/actions/{action_id}", response_model=ActionOut, tags=["HITL"])
-async def get_action_endpoint(action_id: str, _: str = Security(require_api_key)):
+async def get_action_endpoint(action_id: str, _: Optional[OperatorInfo] = Depends(require_any_auth)):
     """Retrieve a single action proposal with its full state and diff payload."""
     _require_mongo()
     from db.mongo import get_action
@@ -1702,7 +1702,7 @@ async def reject_action(
 
 
 @app.get("/actions/{action_id}/audit", response_model=list[AuditOut], tags=["HITL"])
-async def get_audit_trail_endpoint(action_id: str, _: str = Security(require_api_key)):
+async def get_audit_trail_endpoint(action_id: str, _: Optional[OperatorInfo] = Depends(require_any_auth)):
     """Return the full chronological audit trail for a single action."""
     _require_mongo()
     from db.mongo import get_audit_trail
@@ -1762,7 +1762,7 @@ async def list_engagements_endpoint(
     action_id:   Optional[str] = None,
     customer_id: Optional[str] = None,
     limit:       int = 100,
-    _: str = Security(require_api_key),
+    _: Optional[OperatorInfo] = Depends(require_any_auth),
 ):
     """List engagement log entries, optionally filtered by action or customer."""
     _require_mongo()
@@ -1837,7 +1837,7 @@ async def customer_reply_webhook(request: CustomerReplyRequest):
 async def list_dlq_events_endpoint(
     status: str = "OPEN",
     limit: int = 100,
-    _: str = Security(require_api_key),
+    _: Optional[OperatorInfo] = Depends(require_any_auth),
 ):
     """
     List Dead Letter Queue events.
@@ -1852,7 +1852,7 @@ async def list_dlq_events_endpoint(
 async def acknowledge_dlq_event_endpoint(
     outbox_id: str,
     body: ApproveRequest,
-    _: str = Security(require_api_key),
+    _: Optional[OperatorInfo] = Depends(require_any_auth),
 ):
     """Mark a DLQ event as acknowledged by an operator."""
     _require_mongo()
