@@ -12,6 +12,7 @@ resources:
   - frontend-deployment.yaml
   - frontend-service.yaml
   - frontend-ingress.yaml
+  - mongodb.yaml
 
 # Both overlays override the image fully (registry + tag) at deploy time:
 #   kustomize edit set image synapse=<acr>.azurecr.io/synapse:<tag>

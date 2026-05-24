@@ -1,4 +1,4 @@
-﻿apiVersion: v1
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: synapse-config
@@ -14,6 +14,8 @@ data:
   CLAUDE_MODEL: "claude-opus-4-6"
   API_HOST: "0.0.0.0"
   API_PORT: "8000"
+  # MongoDB — in-cluster instance for action management (HITL queue, DLQ, engagements).
+  MONGODB_URI: "mongodb://synapse-mongodb:27017/synapse"
   # Chatbot gateway callbacks — enables HITL round-trip and live WebSocket updates.
   # Cross-namespace DNS: <service>.<namespace>.svc.cluster.local
   CHATBOT_GATEWAY_ENABLED: "true"
