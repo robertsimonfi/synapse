@@ -176,6 +176,28 @@ Resolution JSON format:
 }}"""
 
 
+def _is_billing_intent(fallout_input: FalloutInput) -> bool:
+    """Return True when the incoming fallout should use the billing mock scenario.
+
+    Checks (in priority order):
+      1. domain field == "BILLING"  (most reliable — set explicitly by the router)
+      2. Billing keywords in error_code, error_message, or free_text (which
+         includes the 'intent=...' tag injected by the chatbot gateway).
+    """
+    if (fallout_input.domain or "").upper() == "BILLING":
+        return True
+    _BILLING_KEYWORDS = {
+        "billing", "refund", "dispute", "invoice", "credit",
+        "overcharge", "charge", "ledger", "payment",
+    }
+    _combined = " ".join([
+        fallout_input.error_code    or "",
+        fallout_input.error_message or "",
+        fallout_input.free_text     or "",
+    ]).lower()
+    return any(kw in _combined for kw in _BILLING_KEYWORDS)
+
+
 def _mock_resolution(fallout_input: FalloutInput) -> FalloutResolution:
     """
     Return a realistic-looking hardcoded resolution without calling the Anthropic API.
@@ -183,7 +205,124 @@ def _mock_resolution(fallout_input: FalloutInput) -> FalloutResolution:
 
     The mock always proposes one concrete action so the full HITL pipeline fires:
       MongoDB (PENDING) → Operator Portal → Executor → Relay → Oracle Adapter → SQLite
+
+    Domain routing:
+      BILLING / refund / dispute  →  _mock_billing_resolution()
+      Everything else             →  provisioning scenario (original behaviour)
     """
+    if _is_billing_intent(fallout_input):
+        return _mock_billing_resolution(fallout_input)
+    return _mock_provisioning_resolution(fallout_input)
+
+
+def _mock_billing_resolution(fallout_input: FalloutInput) -> FalloutResolution:
+    """Billing ledger reconciliation scenario for executive demo (BILLING domain)."""
+    error_code  = fallout_input.error_code or "BILL_DISPUTE"
+    customer_id = fallout_input.customer_id if fallout_input.customer_id is not None else "N/A"
+
+    return FalloutResolution(
+        classification={
+            "domain":     "BILLING",
+            "issue_type": "BillingLedgerDisputeReconciliation",
+            "severity":   fallout_input.severity or "HIGH",
+        },
+        root_cause=(
+            f"[MOCK] Subscriber {customer_id} submitted a financial dispute regarding a "
+            "duplicate invoice run on their Flex 50 subscription. A cross-reference of the "
+            "Oracle CRM billing history logs confirms a double-posting event on 1 May 2026 "
+            "matching recurring service charge ID. The ledger shows a current balance of "
+            "£45.99 against a correctly expected balance of £23.49 after single-charge "
+            "reconciliation."
+        ),
+        recommended_actions=[
+            f"Issue a credit memo of £22.50 to customer {customer_id} to reconcile the "
+            "duplicate monthly recurring charge",
+            "Cross-reference all invoice records to confirm the double-posting was a "
+            "single-event anomaly and not a systemic billing engine fault",
+            "Notify customer of pending credit via in-app account message once approved",
+        ],
+        runbook_references=["billing_issues.txt"],
+        confidence="HIGH",
+        raw_reasoning="[MOCK MODE — no Claude API call was made]",
+        action_proposals=[
+            {
+                # "update_billing" matches the executor handler registry AND
+                # _outbox_params() so the full HITL pipeline fires:
+                #   Executor → MongoDB outbox → Relay → Kafka legacy.commands.writeback
+                #   → Oracle Adapter → SQLite BILLING_ACCOUNT update
+                "action_type": "update_billing",
+                "action_description": (
+                    f"Issue ledger credit memo to account to resolve duplicate monthly "
+                    "recurring charge over-billing dispute."
+                ),
+                "action_payload": {
+                    "customer_id":    customer_id,
+                    "error_code":     error_code,
+                    "credit_amount":  22.50,
+                    "credit_reason":  (
+                        "Duplicate monthly recurring charge — double-posting event "
+                        "1 May 2026"
+                    ),
+                    "account_id":     f"BILLING-{customer_id}",
+                },
+                "predicted_before_state": {
+                    "current_balance": 45.99,
+                    "pending_credit":  0.00,
+                },
+                "predicted_after_state": {
+                    "current_balance": 23.49,
+                    "pending_credit":  22.50,
+                },
+            }
+        ],
+        critique={"quality": "good", "issues": [], "lesson": None},
+        routing_domain="BILLING",
+        routing_confidence=0.99,
+        critic_violations=[],
+        policy_violations=[],
+        token_usage={"input_tokens": 0, "output_tokens": 0},
+        manager_brief=(
+            f"[MOCK] Customer {customer_id} disputing a duplicate £45.99 charge; ledger "
+            "confirms double-posting on 1 May 2026. Policy cap requires management sign-off "
+            "for credits above £20.00. Recommend £22.50 credit memo pending operator approval."
+        ),
+        chain_of_thought={
+            "observation": (
+                f"Account has a current ledger balance of £45.99. Invoices show twin "
+                "transaction records matching the recurring service charge ID for customer "
+                f"{customer_id}."
+            ),
+            "constraint_check": (
+                "Customer is in domain BILLING. Policy engine blocks automated clearing "
+                "(Rule: ENTERPRISE_ESCALATION active) because dispute involves core ledger "
+                "mutations. Executive governance threshold prevents automated payouts "
+                "exceeding £20.00 without formal management approval."
+            ),
+            "strategy": (
+                "Applying 'Ledger Rectification Protocol' (Runbook: billing_issues.txt). "
+                "Generate a pending credit entry linked directly to the tokenized billing "
+                "handle, deferring write-back until operator sign-off is confirmed."
+            ),
+            "recommendation": (
+                f"Apply a manual billing override worth £22.50 to customer {customer_id}. "
+                "Expected outcome: current_balance updates from £45.99 → £23.49, "
+                "pending_credit updates from £0.00 → £22.50."
+            ),
+            "natural_language_summary": (
+                f"Subscriber {customer_id} submitted a financial dispute regarding a "
+                "duplicate invoice run on their Flex 50 subscription. A cross-reference "
+                "of the Oracle CRM billing history logs confirms a double-posting event on "
+                "1 May 2026. Executive governance threshold prevents automated payouts "
+                "exceeding £20.00 without formal management approval. I am recommending a "
+                "partial account credit of £22.50 to reconcile the ledger while parking "
+                "execution on immediate operator sign-off."
+            ),
+        },
+    )
+
+
+def _mock_provisioning_resolution(fallout_input: FalloutInput) -> FalloutResolution:
+    """Network provisioning split-state scenario (original behaviour — unchanged)."""
     error_code  = fallout_input.error_code or "UNKNOWN"
     customer_id = fallout_input.customer_id if fallout_input.customer_id is not None else "N/A"
     order_id    = fallout_input.order_id or 99999
