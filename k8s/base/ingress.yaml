@@ -1,10 +1,16 @@
-﻿apiVersion: networking.k8s.io/v1
+apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: synapse
   annotations:
     nginx.ingress.kubernetes.io/proxy-body-size: "2m"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    # Core /resolve drives the 9-step agent loop (Claude Opus tool-use, up to
+    # 10 iterations, plus critic + memory + policy). End-to-end can hit 30–90 s
+    # on AKS. 60 s was the original default — promoted to 300 s to match the
+    # chatbot gateway httpx client and inner nginx so the public path stops 504-ing.
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout:    "300"
+    nginx.ingress.kubernetes.io/proxy-read-timeout:    "300"
 spec:
   ingressClassName: nginx
   rules:
